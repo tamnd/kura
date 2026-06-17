@@ -1,0 +1,27 @@
+kura — an offline archive of YouTube.
+
+kura captures a corner of YouTube — a video, a channel, a playlist, a search, or
+a music album — into a self-contained, offline-browsable repository: every video
+as a record, its transcript, comments and chapters, its images localised, and,
+when you ask for it, the video and audio streams themselves, rendered into a
+static site that plays offline and into clean Markdown you can read or grep, with
+the original JSON kept beside each record as the source of truth.
+
+kura builds its reads and its downloads on the engine of ytb-cli
+(https://github.com/tamnd/ytb-cli), which it imports directly: the no-key
+InnerTube transport, the renderer-walking parsers, the normalized
+Video/Channel/Playlist/Comment types, the caption, chapter and SponsorBlock
+sidecars, and above all the pure-Go native download engine (the token-free
+ANDROID_VR client, the goja nsig solver, the ranged concurrent fetcher, and the
+yt-dlp-compatible format selector). It adds only the archive-shaped pieces ytb-cli
+never needed: a repository on disk, a media and stream localiser, and the HTML and
+Markdown renderers.
+
+ytb-cli is original work over YouTube's own InnerTube surface and derives from
+nothing copyleft. It is licensed under the MIT License, and because kura links it,
+kura is licensed under the MIT License too.
+
+  ytb-cli — Copyright (c) 2026 Duc-Tam Nguyen
+  kura    — Copyright (c) 2026 Duc-Tam Nguyen
+
+The full license text is in the file LICENSE.

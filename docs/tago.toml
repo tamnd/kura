@@ -1,0 +1,10 @@
+title       = "kura"
+baseURL     = "https://kura.tamnd.com/"
+description = "kura (蔵, storehouse) builds offline, browsable archives of YouTube content. It captures videos, channels, playlists, and searches through the free ytb-cli engine and writes a self-contained repository of canonical JSON with derived HTML and Markdown views you can read with the network unplugged. No API key."
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/kura"

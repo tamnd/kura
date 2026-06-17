@@ -1,0 +1,12 @@
+/bin/
+/dist/
+/kura-out/
+*.out
+.DS_Store
+coverage.out
+
+# Built docs site (tago output) and its cache
+/docs/public/
+/docs/public-pages/
+/docs/public-cf/
+**/.tago-cache.db
