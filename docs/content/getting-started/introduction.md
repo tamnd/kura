@@ -41,6 +41,6 @@ Because the views are derived, they are disposable. `kura render <repo>` rebuild
 
 ## The shape of an archive
 
-A capture lands in a self-contained repository at `<out>/youtube/<root>`, where `<out>` defaults to `$HOME/data/kura` (or `$KURA_OUT`). The root is the channel `@handle`, the playlist id, the video id, or a slugified search query. Move the folder anywhere and it still opens. See [repository layout](/reference/repository-layout/) for the full tree.
+A capture lands in a self-contained repository at `<out>/youtube/<root>`, where `<out>` defaults to `$HOME/data/kura` (or `$KURA_OUT`). The root is the canonical, case-stable target identity: a channel keeps its `@handle`, while a video, playlist, and search are prefixed by kind and lowercased (`video-dqw4w9wgxcq`, `playlist-plxxxx`, `search-lofi-mix`). Move the folder anywhere and it still opens. See [repository layout](/reference/repository-layout/) for the full tree.
 
 Next: [install kura](/getting-started/installation/).

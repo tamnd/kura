@@ -11,7 +11,8 @@ kura [command] [flags]
 The commands: `archive` captures a target into a repository, `add` (alias
 `update`) re-captures an existing one incrementally, `render` rebuilds the views
 from stored JSON, `serve` previews a repository over HTTP, `info` summarises one,
-plus `version` and `completion`. Run `kura <command> --help` for the canonical,
+and `completion` writes a shell completion script. `kura --version` prints the
+build version, commit, and date. Run `kura <command> --help` for the canonical,
 up-to-date list.
 
 ## Global flags
