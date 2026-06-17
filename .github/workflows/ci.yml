@@ -115,5 +115,11 @@ jobs:
       - name: go-licenses check
         run: |
           go install github.com/google/go-licenses@latest
+          # modernc.org/mathutil (a transitive dep of the pure-Go sqlite the
+          # engine pulls in) is BSD-3-Clause, but the go-licenses classifier
+          # cannot read modernc's license text and reports it as unknown.
+          # Ignore the one module the classifier chokes on. kura itself is MIT,
+          # so AGPL is intentionally absent from the allow-list.
           go-licenses check ./... \
+            --ignore=modernc.org/mathutil \
             --allowed_licenses=Apache-2.0,MIT,BSD-2-Clause,BSD-3-Clause,ISC,MPL-2.0,Unlicense,BSD-3-Clause-Clear
