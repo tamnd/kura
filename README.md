@@ -1,6 +1,12 @@
 # kura
 
-kura (蔵, "storehouse") builds offline, browsable archives of YouTube content.
+[![ci](https://github.com/tamnd/kura/actions/workflows/ci.yml/badge.svg)](https://github.com/tamnd/kura/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/tamnd/kura)](https://github.com/tamnd/kura/releases/latest)
+[![Go Reference](https://pkg.go.dev/badge/github.com/tamnd/kura.svg)](https://pkg.go.dev/github.com/tamnd/kura)
+[![Go Report Card](https://goreportcard.com/badge/github.com/tamnd/kura)](https://goreportcard.com/report/github.com/tamnd/kura)
+[![License](https://img.shields.io/github/license/tamnd/kura)](./LICENSE)
+
+**kura** (蔵, "storehouse") builds offline, browsable archives of YouTube content.
 
 Point it at a video, a channel, a playlist, a search, or a music album and it
 writes a self-contained repository on disk: every video as a record, its full
@@ -10,6 +16,10 @@ themselves pulled down in pure Go.
 The repository renders into a static HTML site that plays in the browser offline
 and into clean Markdown you can read or grep, with the original JSON kept beside
 every record as the source of truth.
+
+[Install](#install) • [Quick start](#quick-start) • [Depth model](#the-depth-model) • [Repository layout](#the-repository-on-disk) • [Commands](#commands) • [Configuration](#configuration) • [How it works](#how-it-works)
+
+![kura archiving a YouTube video into a self-contained vault, then listing the files on disk and reading the manifest back](docs/static/demo.gif)
 
 A 蔵 is the thick-walled Japanese storehouse where a household keeps what it
 means to last.
@@ -127,8 +137,9 @@ fetches only the streams for videos whose records are already on disk.
 ## The repository on disk
 
 A capture writes one self-contained directory under `<out>/youtube/<root>/`,
-where `<root>` is the channel `@handle`, the playlist id, the video id, or a
-slugified search query.
+where `<root>` is the canonical, case-stable target identity: a channel keeps its
+`@handle`, while a video, playlist, and search are prefixed by kind and lowercased
+(`video-dqw4w9wgxcq`, `playlist-plxxxx`, `search-lofi-mix`).
 Every internal reference is a relative path, so the folder is movable and opens
 with the network unplugged.
 
@@ -174,7 +185,8 @@ render` and no re-fetch.
 | `kura serve <repo>` | Serve a repo over http://localhost for preview and playback |
 | `kura info <repo>` | Manifest summary: counts, depth, date range, size, gaps |
 | `kura completion <shell>` | Shell completion |
-| `kura version` | Build version, commit, date |
+
+`kura --version` prints the build version, commit, and date.
 
 ## Key flags
 

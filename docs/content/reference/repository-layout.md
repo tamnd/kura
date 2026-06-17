@@ -16,14 +16,16 @@ The root is `<out>/youtube/<root>`, where `<out>` is `-o/--out` (default
 
 | Target | Root |
 |--------|------|
-| Channel `@mkbhd` | `@mkbhd` |
-| Video `dQw4w9WgXcQ` | `dQw4w9WgXcQ` |
-| Playlist `PLxxxx` | `PLxxxx` |
+| Channel `@MKBHD` | `@mkbhd` |
+| Video `dQw4w9WgXcQ` | `video-dqw4w9wgxcq` |
+| Playlist `PLxxxx` | `playlist-plxxxx` |
 | Search `lofi mix` | `search-lofi-mix` |
-| Album `<id>` | the album id |
+| Album `<id>` | the lowercased album id |
 
-A channel `@handle` is resolved to its `UC...` id internally and recorded in the
-manifest. Two captures of the same target land in the same repo and merge.
+A channel keeps its `@handle` (lowercased); a video, playlist, and search are
+prefixed by kind and lowercased so the path is unambiguous and case-stable. A
+channel `@handle` is also resolved to its `UC...` id internally and recorded in
+the manifest. Two captures of the same target land in the same repo and merge.
 
 ## The tree
 

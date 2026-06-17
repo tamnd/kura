@@ -66,11 +66,11 @@ Each target writes one self-contained repository under `<out>/youtube/<root>`:
 
 | Target | Root |
 |--------|------|
-| Video `dQw4w9WgXcQ` | `dQw4w9WgXcQ` |
-| Channel `@mkbhd` | `@mkbhd` |
-| Playlist `PLxxxx` | `PLxxxx` |
+| Video `dQw4w9WgXcQ` | `video-dqw4w9wgxcq` |
+| Channel `@MKBHD` | `@mkbhd` |
+| Playlist `PLxxxx` | `playlist-plxxxx` |
 | Search `lofi mix` | `search-lofi-mix` |
-| Album `<id>` | the album id |
+| Album `<id>` | the lowercased album id |
 
 Two captures of the same target land in the same repo and merge. See
 [repository layout](/reference/repository-layout/) for the full tree.
