@@ -1,0 +1,49 @@
+{{define "index"}}{{template "layout" .}}{{end}}
+{{define "watch"}}{{template "layout" .}}{{end}}
+
+{{define "content"}}
+{{if .Single}}
+  {{template "watch-card" .Card}}
+{{else}}
+  {{if .Channel}}{{template "channel-header" .Channel}}{{end}}
+  {{if .Heading}}<header class="lead"><h1>{{.Heading}}</h1>{{if .SubHead}}<div class="sub">{{.SubHead}}</div>{{end}}</header>{{end}}
+  <section class="grid">
+    {{range .Cards}}{{template "grid-card" .}}{{end}}
+  </section>
+{{end}}
+{{end}}
+
+{{define "channel-header"}}
+<header class="channel">
+  {{if .BannerSrc}}<img class="banner" src="{{.BannerSrc}}" alt="banner" loading="lazy">{{end}}
+  <div class="channel-body">
+    {{if .AvatarSrc}}<img class="avatar" src="{{.AvatarSrc}}" alt="{{.Name}} avatar">{{end}}
+    <div class="channel-meta">
+      <h1>{{.Name}}{{if .Verified}} <span class="verified" title="verified">✓</span>{{end}}</h1>
+      {{if .Handle}}<div class="handle">@{{.Handle}}</div>{{end}}
+      <div class="stats">
+        {{if .Subscribers}}<span>{{.Subscribers}}</span>{{end}}
+        {{if .Videos}}<span>{{.Videos}}</span>{{end}}
+      </div>
+      {{if .Description}}<div class="bio">{{.Description}}</div>{{end}}
+    </div>
+  </div>
+</header>
+{{end}}
+
+{{define "grid-card"}}
+<article class="card">
+  <a class="thumb" href="{{.Permalink}}">
+    {{if .ThumbSrc}}<img src="{{.ThumbSrc}}" alt="{{.Title}}" loading="lazy">{{else}}<div class="noimg"></div>{{end}}
+    {{if .Duration}}<span class="dur">{{.Duration}}</span>{{end}}
+    {{if .IsShort}}<span class="badge">Short</span>{{else if .IsLive}}<span class="badge live">Live</span>{{end}}
+  </a>
+  <div class="card-body">
+    <a class="title" href="{{.Permalink}}">{{.Title}}</a>
+    <div class="meta">
+      {{if gt .Views 0}}<span>{{count .Views}} views</span>{{end}}
+      {{if .Stamp}}<span>{{.Stamp}}</span>{{end}}
+    </div>
+  </div>
+</article>
+{{end}}

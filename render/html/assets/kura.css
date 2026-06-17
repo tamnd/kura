@@ -1,0 +1,189 @@
+/* kura — an inert, self-contained YouTube-flavoured stylesheet. System fonts
+   only, no remote fetch, no script. A photograph of the content that, at media
+   depth, also plays. */
+
+:root {
+  --bg: #0f0f0f;
+  --surface: #181818;
+  --surface-2: #212121;
+  --text: #f1f1f1;
+  --muted: #aaa;
+  --line: #303030;
+  --accent: #3ea6ff;
+  --red: #ff4e45;
+  --radius: 12px;
+}
+
+* { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Roboto", -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+  font-size: 15px;
+  line-height: 1.5;
+}
+
+a { color: inherit; text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+.wrap { max-width: 1000px; margin: 0 auto; padding: 0 16px 64px; }
+
+.top {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  padding: 12px 0;
+  margin-bottom: 16px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--line);
+  font-weight: 700;
+  font-size: 18px;
+}
+.top a:hover { text-decoration: none; color: var(--accent); }
+
+/* ---- channel header ---- */
+.channel { margin-bottom: 24px; }
+.channel .banner {
+  display: block;
+  width: 100%;
+  aspect-ratio: 6 / 1;
+  object-fit: cover;
+  border-radius: var(--radius);
+}
+.channel-body { display: flex; gap: 20px; align-items: center; padding: 16px 4px 4px; }
+.channel .avatar { width: 96px; height: 96px; border-radius: 50%; object-fit: cover; flex: none; }
+.channel-meta h1 { margin: 0; font-size: 24px; }
+.channel-meta .handle { color: var(--muted); }
+.channel-meta .stats { color: var(--muted); font-size: 13px; display: flex; gap: 12px; margin-top: 4px; }
+.channel-meta .bio { color: var(--muted); font-size: 13px; margin-top: 8px; max-width: 60ch; white-space: pre-wrap; }
+.verified { color: var(--muted); font-size: 0.7em; vertical-align: middle; }
+
+.lead { margin-bottom: 16px; }
+.lead h1 { margin: 0 0 4px; font-size: 22px; }
+.lead .sub { color: var(--muted); }
+
+/* ---- index grid ---- */
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 16px 16px;
+}
+.card .thumb {
+  position: relative;
+  display: block;
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: var(--surface-2);
+  aspect-ratio: 16 / 9;
+}
+.card .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.card .noimg { width: 100%; height: 100%; background: var(--surface-2); }
+.card .dur {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  background: rgba(0,0,0,.8);
+  color: #fff;
+  font-size: 12px;
+  padding: 1px 4px;
+  border-radius: 4px;
+}
+.card .badge {
+  position: absolute;
+  left: 6px;
+  top: 6px;
+  background: rgba(0,0,0,.8);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+.card .badge.live { background: var(--red); }
+.card-body { padding: 8px 2px; }
+.card .title {
+  font-weight: 500;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.card .title:hover { text-decoration: none; color: #fff; }
+.card .meta { color: var(--muted); font-size: 13px; display: flex; gap: 8px; margin-top: 4px; }
+
+/* ---- watch page ---- */
+.watch { max-width: 760px; margin: 0 auto; }
+.player {
+  position: relative;
+  background: #000;
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.player video { width: 100%; display: block; max-height: 70vh; background: #000; }
+.player .poster { width: 100%; display: block; }
+.player .noimg { width: 100%; aspect-ratio: 16 / 9; background: var(--surface-2); }
+.player audio { width: 100%; display: block; }
+.player .caption {
+  padding: 10px 14px;
+  color: var(--muted);
+  font-size: 13px;
+  background: var(--surface);
+}
+
+.watch .title { font-size: 20px; margin: 16px 0 4px; line-height: 1.3; }
+.metrics { color: var(--muted); font-size: 13px; display: flex; flex-wrap: wrap; gap: 14px; }
+.metrics .src { margin-left: auto; }
+.metrics a:hover { color: var(--accent); }
+
+.byline { display: flex; align-items: center; gap: 12px; margin: 16px 0; }
+.byline .avatar { width: 40px; height: 40px; border-radius: 50%; object-fit: cover; background: var(--surface-2); flex: none; }
+.byline .name { font-weight: 500; }
+
+.desc {
+  background: var(--surface);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  font-size: 14px;
+}
+.body { white-space: pre-wrap; overflow-wrap: anywhere; }
+.body a { color: var(--accent); }
+
+.chapters, .transcript, .comments { margin-top: 24px; }
+.chapters h2, .comments h2 { font-size: 16px; border-bottom: 1px solid var(--line); padding-bottom: 8px; }
+.chapters ol { list-style: none; padding: 0; margin: 0; }
+.chapters li a { display: flex; gap: 10px; padding: 6px 8px; border-radius: 8px; }
+.chapters li a:hover { background: var(--surface); text-decoration: none; }
+.t { color: var(--accent); font-variant-numeric: tabular-nums; font-size: 13px; flex: none; }
+
+.transcript details { background: var(--surface); border-radius: var(--radius); padding: 4px 14px; }
+.transcript summary { cursor: pointer; padding: 10px 0; font-weight: 500; }
+.transcript .lines { max-height: 460px; overflow-y: auto; padding-bottom: 12px; }
+.transcript .lines p { display: flex; gap: 10px; margin: 4px 0; font-size: 14px; }
+
+.comment { display: flex; gap: 12px; padding: 12px 0; border-bottom: 1px solid var(--line); }
+.comment.reply { margin-left: 40px; }
+.comment .avatar { width: 36px; height: 36px; border-radius: 50%; object-fit: cover; background: var(--surface-2); flex: none; }
+.chead { display: flex; align-items: baseline; gap: 8px; font-size: 13px; }
+.chead .name { font-weight: 500; }
+.chead .owner { color: var(--accent); }
+.chead .time { color: var(--muted); }
+.comment .text { font-size: 14px; margin: 4px 0; }
+.cmeta { color: var(--muted); font-size: 12px; display: flex; gap: 14px; }
+
+footer.repo {
+  margin-top: 40px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+@media (max-width: 600px) {
+  .channel-body { flex-direction: column; text-align: center; gap: 12px; }
+  .channel .avatar { width: 72px; height: 72px; }
+  .comment.reply { margin-left: 20px; }
+}

@@ -1,0 +1,72 @@
+{{define "watch-card"}}
+<article class="watch" id="v{{.ID}}">
+  <div class="player">
+    {{if .StreamSrc}}
+      <video controls preload="none"{{if .ThumbSrc}} poster="{{.ThumbSrc}}"{{end}}>
+        <source src="{{.StreamSrc}}" type="video/mp4">
+      </video>
+    {{else if .AudioSrc}}
+      {{if .ThumbSrc}}<img class="poster" src="{{.ThumbSrc}}" alt="{{.Title}}">{{end}}
+      <audio controls preload="none"><source src="{{.AudioSrc}}"></audio>
+    {{else}}
+      {{if .ThumbSrc}}<img class="poster" src="{{.ThumbSrc}}" alt="{{.Title}}">{{else}}<div class="noimg"></div>{{end}}
+      <div class="caption">stream not archived &middot; <a href="{{.URL}}" rel="nofollow noopener">watch on YouTube ↗</a></div>
+    {{end}}
+  </div>
+
+  <h1 class="title">{{.Title}}</h1>
+  <div class="metrics">
+    {{if gt .Views 0}}<span title="views">{{count .Views}} views</span>{{end}}
+    {{if .Stamp}}<span title="published">{{.Stamp}}</span>{{end}}
+    {{if gt .Likes 0}}<span title="likes">♥ {{count .Likes}}</span>{{end}}
+    <span class="src"><a href="{{.URL}}" rel="nofollow noopener">on YouTube ↗</a></span>
+  </div>
+
+  <div class="byline">
+    {{if .AvatarSrc}}<img class="avatar" src="{{.AvatarSrc}}" alt="{{.ChannelName}} avatar">{{else}}<div class="avatar"></div>{{end}}
+    <div class="who">
+      {{if .ChannelRel}}<a class="name" href="{{.ChannelRel}}">{{.ChannelName}}</a>{{else}}<span class="name">{{.ChannelName}}</span>{{end}}
+    </div>
+  </div>
+
+  {{if .HTMLBody}}<div class="desc body">{{.HTMLBody}}</div>{{end}}
+
+  {{if .Chapters}}
+  <section class="chapters">
+    <h2>Chapters</h2>
+    <ol>
+      {{range .Chapters}}<li><a href="{{.Jump}}"><span class="t">{{.Offset}}</span> {{.Title}}</a></li>{{end}}
+    </ol>
+  </section>
+  {{end}}
+
+  {{if .Transcript}}
+  <section class="transcript">
+    <details>
+      <summary>Transcript{{if .TransLang}} ({{.TransLang}}){{end}} &middot; {{len .Transcript}} lines</summary>
+      <div class="lines">
+        {{range .Transcript}}<p><span class="t">{{.Offset}}</span> {{.Text}}</p>{{end}}
+      </div>
+    </details>
+  </section>
+  {{end}}
+
+  {{if .Comments}}
+  <section class="comments">
+    <h2>Comments</h2>
+    {{range .Comments}}{{template "comment" .}}{{end}}
+  </section>
+  {{end}}
+</article>
+{{end}}
+
+{{define "comment"}}
+<div class="comment{{if .IsReply}} reply{{end}}">
+  {{if .AvatarSrc}}<img class="avatar" src="{{.AvatarSrc}}" alt="{{.Author}} avatar" loading="lazy">{{else}}<div class="avatar"></div>{{end}}
+  <div class="cbody">
+    <div class="chead"><span class="name">{{.Author}}</span>{{if .IsOwner}}<span class="owner" title="channel owner">★</span>{{end}}{{if .Stamp}}<span class="time">{{.Stamp}}</span>{{end}}</div>
+    <div class="text body">{{.HTMLBody}}</div>
+    <div class="cmeta">{{if gt .Likes 0}}<span title="likes">♥ {{count .Likes}}</span>{{end}}{{if gt .Replies 0}}<span title="replies">💬 {{.Replies}}</span>{{end}}</div>
+  </div>
+</div>
+{{end}}

@@ -1,0 +1,125 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# Cancel an in-flight run when a branch is pushed again.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Build and test on Linux and macOS with the race detector on. gofmt and vet
+  # run here too so a formatting slip fails fast on both platforms. Every test is
+  # pure Go with no network, so there is nothing to install first.
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -s -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt -s -w:"
+            echo "$unformatted"
+            exit 1
+          fi
+      - name: go vet
+        run: go vet ./...
+      - name: build
+        run: go build ./...
+      - name: test
+        run: go test -race -count=1 -coverprofile=coverage.out ./...
+      - name: coverage summary
+        if: matrix.os == 'ubuntu-latest'
+        run: go tool cover -func=coverage.out | tail -1
+
+  # golangci-lint bundles staticcheck, govet, ineffassign, errcheck, unused and
+  # more, so it is the main quality gate.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: latest
+
+  # Scan the module and its dependencies for known vulnerabilities. golang.org/x/net
+  # is pinned forward in go.mod (as ytb-cli pins it) so the goquery/x/net advisories
+  # are already cleared here.
+  govulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+  # Confirm go.mod and go.sum are tidy: a PR that adds an import without running
+  # go mod tidy fails here instead of breaking a later release.
+  tidy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+      - name: go mod tidy is clean
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+  # kura is MIT because it links the ytb-cli engine, which is MIT (original work
+  # over YouTube's InnerTube surface, deriving from nothing copyleft). The
+  # allow-list is therefore the permissive set only: no copyleft license, AGPL
+  # included, is permitted. A dependency under a license not on this list fails
+  # the job, so a copyleft surprise is caught in CI rather than at release. This
+  # is the one CI difference from tori, whose engine derives from nitter and
+  # whose allow-list additionally permits AGPL-3.0.
+  licenses:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+      - name: go-licenses check
+        run: |
+          go install github.com/google/go-licenses@latest
+          # modernc.org/mathutil (a transitive dep of the pure-Go sqlite the
+          # engine pulls in) is BSD-3-Clause, but the go-licenses classifier
+          # cannot read modernc's license text and reports it as unknown.
+          # Ignore the one module the classifier chokes on. kura itself is MIT,
+          # so AGPL is intentionally absent from the allow-list.
+          go-licenses check ./... \
+            --ignore=modernc.org/mathutil \
+            --allowed_licenses=Apache-2.0,MIT,BSD-2-Clause,BSD-3-Clause,ISC,MPL-2.0,Unlicense,BSD-3-Clause-Clear
