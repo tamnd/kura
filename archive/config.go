@@ -87,12 +87,16 @@ func (o Options) stamp() time.Time {
 	return o.Date.UTC()
 }
 
-// streamOptions builds the media-layer options for one stream download.
-func (o Options) streamOptions() media.StreamOptions {
+// streamOptions builds the media-layer options for one stream download, including
+// the run's resolved external downloader (nil when --tool is unset).
+func (c *capturer) streamOptions() media.StreamOptions {
+	o := c.opts
 	return media.StreamOptions{
 		Depth:   o.Depth,
 		Format:  o.Format,
+		Quality: o.Quality,
 		FFmpeg:  o.FFmpeg,
 		Workers: o.Workers,
+		Tool:    c.tool,
 	}
 }

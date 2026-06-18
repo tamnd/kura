@@ -10,6 +10,7 @@ import (
 
 	"github.com/tamnd/kura/media"
 	"github.com/tamnd/kura/repo"
+	"github.com/tamnd/kura/tool"
 	"github.com/tamnd/ytb-cli/youtube"
 )
 
@@ -45,7 +46,14 @@ func Run(ctx context.Context, c *youtube.Client, t Target, opts Options, log Log
 	}
 	mf.KuraVersion = opts.Version
 
-	cp := &capturer{st: st, client: c, opts: opts, log: log, mf: mf, seen: map[string]bool{}}
+	// Resolve the optional external downloader once. A bad --tool name or a tool
+	// the system lacks is a setup error surfaced before any fetching begins.
+	dl, err := tool.Locate(opts.Tool, opts.FFmpeg)
+	if err != nil {
+		return res, err
+	}
+
+	cp := &capturer{st: st, client: c, opts: opts, log: log, mf: mf, seen: map[string]bool{}, tool: dl}
 
 	// Capture the channel record up front so the header and avatar are available
 	// to every page, and so a channel spine has its identity.
@@ -117,7 +125,7 @@ func (c *capturer) finish(ctx context.Context, t Target, res *Result, all []*you
 			if have[v.VideoID] {
 				continue
 			}
-			sr := media.FetchStream(ctx, c.client, c.st, v, c.opts.streamOptions(), func(f string, a ...any) { say(c.log, f, a...) })
+			sr := media.FetchStream(ctx, c.client, c.st, v, c.streamOptions(), func(f string, a ...any) { say(c.log, f, a...) })
 			switch {
 			case sr.Reused, sr.Downloaded:
 				res.StreamOK++
