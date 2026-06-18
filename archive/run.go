@@ -46,6 +46,18 @@ func Run(ctx context.Context, c *youtube.Client, t Target, opts Options, log Log
 	}
 	mf.KuraVersion = opts.Version
 
+	// Resume: on an existing, completely-captured channel or playlist, page only
+	// the uploads newer than the newest already held (the engine streams
+	// newest-first, so a known id is the incremental boundary). An interrupted
+	// backfill, a disabled --resume, or an explicit --since-id re-walks, with the
+	// on-disk records keeping the already-captured prefix cheap.
+	if opts.Resume && !opts.Force && opts.SinceID == "" && (t.Kind == KindChannel || t.Kind == KindPlaylist) {
+		if prev, ok, _ := repo.LoadState(root); ok && prev != nil && prev.Complete && prev.NewestID != "" {
+			opts.SinceID = prev.NewestID
+			say(log, "resume: incremental update, paging newer than %s", prev.NewestID)
+		}
+	}
+
 	// Resolve the optional external downloader once. A bad --tool name or a tool
 	// the system lacks is a setup error surfaced before any fetching begins.
 	dl, err := tool.Locate(opts.Tool, opts.FFmpeg)
@@ -61,6 +73,10 @@ func Run(ctx context.Context, c *youtube.Client, t Target, opts Options, log Log
 	res.Channel = channel
 
 	err = cp.captureSpine(ctx, t, res)
+	// The capture is complete when the spine streamed to its natural end or reached
+	// its incremental boundary; a budget stop, a cancel, or an error leaves it
+	// partial, so a later resume re-walks to finish.
+	cp.complete = (err == nil && ctx.Err() == nil) || cp.reachedSinceID
 	// A budget stop or a context cancel is not a failure: keep what was written.
 	if err != nil && !errors.Is(err, youtube.ErrStop) && ctx.Err() == nil {
 		// Persist the partial archive, then surface the typed error so the CLI
@@ -171,7 +187,54 @@ func (c *capturer) finish(ctx context.Context, t Target, res *Result, all []*you
 	if res.Gated > 0 {
 		res.Note(fmt.Sprintf("%d surface(s) IP-gated (comments/transcript hidden); a yt-dlp fallback may reach them", res.Gated))
 	}
-	return c.mf.Save(c.st.Dir())
+	if err := c.mf.Save(c.st.Dir()); err != nil {
+		return err
+	}
+	c.saveState(t, all)
+	return nil
+}
+
+// saveState writes the resume cursor: the captured id/time range plus whether the
+// spine was exhausted this run. It is best-effort, since the records on disk are
+// the source of truth and a missing cursor only costs a re-walk.
+func (c *capturer) saveState(t Target, all []*youtube.Video) {
+	newestID, oldestID, newestAt, oldestAt := rangeIDs(all)
+	state := &repo.State{
+		Target:    t.TargetRef(),
+		Depth:     string(c.opts.Depth),
+		Videos:    len(all),
+		NewestID:  newestID,
+		OldestID:  oldestID,
+		NewestAt:  newestAt,
+		OldestAt:  oldestAt,
+		Complete:  c.complete,
+		UpdatedAt: c.opts.stamp().Format(time.RFC3339),
+	}
+	_ = state.Save(c.st.Dir())
+}
+
+// rangeIDs returns the newest and oldest video ids and their published times by
+// publish order, so the resume cursor can name the incremental boundary.
+func rangeIDs(all []*youtube.Video) (newestID, oldestID, newestAt, oldestAt string) {
+	var newest, oldest *youtube.Video
+	for _, v := range all {
+		if v.PublishedAt.IsZero() {
+			continue
+		}
+		if newest == nil || v.PublishedAt.After(newest.PublishedAt) {
+			newest = v
+		}
+		if oldest == nil || v.PublishedAt.Before(oldest.PublishedAt) {
+			oldest = v
+		}
+	}
+	if newest != nil {
+		newestID, newestAt = newest.VideoID, newest.PublishedAt.UTC().Format(time.RFC3339)
+	}
+	if oldest != nil {
+		oldestID, oldestAt = oldest.VideoID, oldest.PublishedAt.UTC().Format(time.RFC3339)
+	}
+	return newestID, oldestID, newestAt, oldestAt
 }
 
 // localStreamIDs returns the set of video ids that already have a local stream of

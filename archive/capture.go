@@ -24,6 +24,13 @@ type capturer struct {
 	seen   map[string]bool
 	count  int         // videos processed (post-dedupe) this run, for the --max budget
 	tool   *tool.YtDlp // resolved external downloader, or nil when --tool is unset
+
+	// reachedSinceID records that paging stopped at the incremental boundary (a
+	// known-archived id), which is a clean, complete stop rather than a partial one.
+	reachedSinceID bool
+	// complete records that the spine was captured exhaustively this run, written
+	// into state.json so a later resume can page only newer uploads.
+	complete bool
 }
 
 // captureChannel fetches and stores the channel record for a channel target so
@@ -173,6 +180,7 @@ func (c *capturer) captureVideo(ctx context.Context, idOrURL string, seed *youtu
 	// An incremental boundary: stop paging once a known-archived id is reached, so
 	// `add --since-id` fetches only what is newer (the engine streams newest-first).
 	if c.opts.SinceID != "" && id == c.opts.SinceID {
+		c.reachedSinceID = true
 		return youtube.ErrStop
 	}
 	c.seen[id] = true

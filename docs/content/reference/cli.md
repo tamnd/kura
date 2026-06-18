@@ -106,7 +106,7 @@ audio`.
 | `--view` | `html` | Views to render: `html`, `md`, or `html,md` (JSON is always written) |
 | `-o, --out` | `$HOME/data/kura` | Output root; the repo lands at `<out>/youtube/<root>` |
 | `--date` | capture time | Fix the capture stamp (RFC3339) for reproducible output |
-| `--resume` | `true` | Continue from held state and resume a half-downloaded stream |
+| `--resume` | `true` | Continue from the held cursor: page only newer uploads, keep finished streams |
 | `--force` | `false` | Ignore held state and recapture from scratch |
 | `--dry-run` | `false` | Print the capture plan without fetching |
 
