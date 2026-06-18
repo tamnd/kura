@@ -17,11 +17,14 @@ affected pages:
 kura add @mkbhd
 ```
 
-Under the hood, an add reads the newest captured upload id from the manifest and
-seeds the uploads reader with it, so it pulls only the gap since your last capture
-and nothing more. The capture summary shows the delta as `(+N new)`. `kura
-archive` on an existing repo does the same incremental fetch; `add` is just the
-clearer name for a re-run.
+Under the hood, an add reads the resume cursor from `state.json` and, when the
+last capture finished exhaustively, seeds the uploads reader with the newest
+captured id, so it pages only the gap since your last capture and stops at the
+boundary. The capture summary shows the delta as `(+N new)`. `kura archive` on an
+existing repo does the same incremental fetch; `add` is just the clearer name for
+a re-run. An interrupted backfill (one whose `state.json` is not yet marked
+complete) re-walks instead, with the records already on disk keeping the
+already-captured prefix cheap, so it picks up where it stopped and finishes.
 
 For a playlist, the merge re-reads the list and adds only video ids not already
 stored. An already-held video is refreshed in place (its counts update via
@@ -48,11 +51,15 @@ That means an interrupted run is never wasted:
 - Hit a rate limit on a long run and kura exits 5 with the partial archive intact.
 
 Either way, run the same command again (or `kura add`) and it continues from what
-is on disk, fetching only the rest. `--resume` is on by default.
+is on disk, fetching only the rest. `--resume` is on by default; pass
+`--resume=false` to ignore the cursor and re-walk the spine from the top.
 
-Distinct to kura, a stream download is resumable too. The ranged fetcher's offset
-state lives in `state.json`, so a capture interrupted mid-stream resumes a
-half-downloaded video from its offset rather than restarting the file.
+Stream files are crash-safe. A download lands in a `.part` sibling and is renamed
+into its final name only once every byte is present, so a run killed mid-download
+never leaves a truncated file that a later run would mistake for complete. The
+unit of resume for a stream is the whole file: an incomplete stream is fetched
+again, while every finished stream is kept and skipped. The resume cursor and the
+capture range live in `state.json` next to the manifest.
 
 ## Forcing a clean recapture
 

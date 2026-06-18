@@ -179,7 +179,7 @@ func fetchStreamNative(ctx context.Context, c *youtube.Client, st *repo.Store, v
 	if one == nil {
 		return miss(repo.StatusStreamOnly, "stream", "empty selection")
 	}
-	if err := downloadStreamTo(ctx, c, st, manifest, one, dst, workers, opts.OnProgress); err != nil {
+	if err := downloadAtomic(ctx, c, st, manifest, one, dst, workers, opts.OnProgress); err != nil {
 		return miss(repo.StatusUnavailable, "stream", err.Error())
 	}
 	return StreamResult{Asset: asset, Downloaded: true}
@@ -221,7 +221,9 @@ func fetchStreamTool(ctx context.Context, st *repo.Store, v *youtube.Video, opts
 }
 
 // fetchMerged downloads the adaptive video and audio tracks to temporary files,
-// muxes them into dst with ffmpeg, then removes the temporaries.
+// muxes them into a .part sibling of dst, then renames it into place so a killed
+// merge never leaves a partial file that a re-run would mistake for complete. The
+// temporaries are removed on the way out.
 func fetchMerged(ctx context.Context, c *youtube.Client, st *repo.Store, m *youtube.StreamManifest, sel youtube.Selection, dst, ffmpeg string, workers int, onProgress func(done, total int64)) error {
 	abs := st.Abs(dst)
 	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
@@ -229,7 +231,8 @@ func fetchMerged(ctx context.Context, c *youtube.Client, st *repo.Store, m *yout
 	}
 	vTmp := abs + ".part-v"
 	aTmp := abs + ".part-a"
-	defer func() { _ = os.Remove(vTmp); _ = os.Remove(aTmp) }()
+	part := abs + ".part"
+	defer func() { _ = os.Remove(vTmp); _ = os.Remove(aTmp); _ = os.Remove(part) }()
 
 	if err := downloadStreamTo(ctx, c, st, m, sel.Video, dst+".part-v", workers, onProgress); err != nil {
 		return err
@@ -237,7 +240,25 @@ func fetchMerged(ctx context.Context, c *youtube.Client, st *repo.Store, m *yout
 	if err := downloadStreamTo(ctx, c, st, m, sel.Audio, dst+".part-a", workers, onProgress); err != nil {
 		return err
 	}
-	return youtube.MergeAV(ctx, ffmpeg, vTmp, aTmp, abs)
+	if err := youtube.MergeAV(ctx, ffmpeg, vTmp, aTmp, part); err != nil {
+		return err
+	}
+	return os.Rename(part, abs)
+}
+
+// downloadAtomic fetches a single stream to a .part sibling of dst and renames it
+// into place only on success. The engine's downloader truncates and seeks into
+// its target, so a process killed mid-download leaves a partial file; writing to
+// a .part and renaming means the final name appears only when the bytes are all
+// there, and a re-run re-downloads the incomplete stream rather than reusing a
+// truncated one.
+func downloadAtomic(ctx context.Context, c *youtube.Client, st *repo.Store, m *youtube.StreamManifest, s *youtube.Stream, dst string, workers int, onProgress func(done, total int64)) error {
+	part := dst + ".part"
+	if err := downloadStreamTo(ctx, c, st, m, s, part, workers, onProgress); err != nil {
+		_ = os.Remove(st.Abs(part))
+		return err
+	}
+	return os.Rename(st.Abs(part), st.Abs(dst))
 }
 
 // downloadStreamTo resolves a single stream's URL and fetches it to a

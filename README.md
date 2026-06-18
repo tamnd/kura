@@ -168,7 +168,7 @@ kura-out/youtube/@mkbhd/
 │   ├── video/   <vid>__<fmt>.mp4    (only at --depth media)
 │   └── audio/   <vid>__<fmt>.m4a    (--depth audio, or -x)
 ├── _assets/kura.css         embedded CSS, no remote fonts, no JS
-└── state.json               capture cursors + download resume + visited state
+└── state.json               resume cursor: captured id/time range + a complete flag
 ```
 
 JSON is the source of truth.
