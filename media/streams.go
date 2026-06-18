@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 
 	"github.com/tamnd/kura/repo"
+	"github.com/tamnd/kura/tool"
 	"github.com/tamnd/ytb-cli/youtube"
 )
 
@@ -41,9 +42,29 @@ type StreamResult struct {
 type StreamOptions struct {
 	Depth      Depth
 	Format     string // explicit -f spec, or "" for the depth default
+	Quality    int    // cap the selected video height when > 0
 	FFmpeg     string // explicit ffmpeg path, or "" to auto-locate
 	Workers    int
+	Tool       *tool.YtDlp // optional external downloader for the hard cases
 	OnProgress func(done, total int64)
+}
+
+// spec is the format selector this capture should use: the explicit -f spec or
+// the depth default, narrowed by the height cap (which never touches an audio
+// capture, since audio has no height).
+func (o StreamOptions) spec() string {
+	s := o.Format
+	if s == "" {
+		if o.Depth == DepthAudio {
+			s = defaultAudioFormat
+		} else {
+			s = defaultVideoFormat
+		}
+	}
+	if o.Depth != DepthAudio {
+		s = capHeight(s, o.Quality)
+	}
+	return s
 }
 
 // FetchStream localises one video's stream through the engine's pure-Go download
@@ -54,6 +75,20 @@ type StreamOptions struct {
 // "video:<id>" or "audio:<id>" key the renderers use to point the player at the
 // local file.
 func FetchStream(ctx context.Context, c *youtube.Client, st *repo.Store, v *youtube.Video, opts StreamOptions, log Logf) StreamResult {
+	res := fetchStreamNative(ctx, c, st, v, opts, log)
+	// A configured tool is a rescue path: when the native engine could not produce
+	// a file (a deciphering failure, a missing rendition, an ffmpeg-less merge),
+	// hand the video to yt-dlp. A reused or freshly downloaded file is left alone.
+	if opts.Tool != nil && !res.Downloaded && !res.Reused {
+		if tr, ok := fetchStreamTool(ctx, st, v, opts, log); ok {
+			return tr
+		}
+	}
+	return res
+}
+
+// fetchStreamNative localises a stream through the engine's pure-Go download path.
+func fetchStreamNative(ctx context.Context, c *youtube.Client, st *repo.Store, v *youtube.Video, opts StreamOptions, log Logf) StreamResult {
 	id := v.VideoID
 	audioOnly := opts.Depth == DepthAudio
 	key, mtype := "video:"+id, "video"
@@ -80,14 +115,7 @@ func FetchStream(ctx context.Context, c *youtube.Client, st *repo.Store, v *yout
 		return miss(repo.StatusStreamOnly, "stream", "live stream, not archivable as a file")
 	}
 
-	spec := opts.Format
-	if spec == "" {
-		if audioOnly {
-			spec = defaultAudioFormat
-		} else {
-			spec = defaultVideoFormat
-		}
-	}
+	spec := opts.spec()
 	sel, err := youtube.SelectFormat(manifest.Streams, spec)
 	if err != nil {
 		return miss(repo.StatusStreamOnly, "stream", "no matching format: "+err.Error())
@@ -155,6 +183,41 @@ func FetchStream(ctx context.Context, c *youtube.Client, st *repo.Store, v *yout
 		return miss(repo.StatusUnavailable, "stream", err.Error())
 	}
 	return StreamResult{Asset: asset, Downloaded: true}
+}
+
+// fetchStreamTool localises a stream by delegating to the configured external
+// downloader (yt-dlp), for the videos the native path could not reach. It writes a
+// deterministic file named with a "ytdlp" token so a re-run reuses it, and reports
+// ok=false (leaving the native gap in place) when the tool also fails.
+func fetchStreamTool(ctx context.Context, st *repo.Store, v *youtube.Video, opts StreamOptions, log Logf) (StreamResult, bool) {
+	id := v.VideoID
+	audioOnly := opts.Depth == DepthAudio
+	key, mtype := "video:"+id, "video"
+	if audioOnly {
+		key, mtype = "audio:"+id, "audio"
+	}
+	source := v.URL
+	if source == "" {
+		source = youtube.NormalizeVideoURL(id)
+	}
+
+	var dst string
+	if audioOnly {
+		dst = repo.AudioMediaPath(id, "ytdlp", "m4a")
+	} else {
+		dst = repo.VideoMediaPath(id, "ytdlp", "mp4")
+	}
+	asset := repo.Asset{Key: key, Type: mtype, Source: source, Path: dst, Status: repo.StatusLocal}
+	if st.Exists(dst) {
+		return StreamResult{Asset: asset, Reused: true}, true
+	}
+
+	logf(log, "stream %s: trying yt-dlp", id)
+	if err := opts.Tool.Download(ctx, source, opts.spec(), st.Abs(dst)); err != nil {
+		logf(log, "stream %s: yt-dlp failed: %s", id, err.Error())
+		return StreamResult{}, false
+	}
+	return StreamResult{Asset: asset, Downloaded: true}, true
 }
 
 // fetchMerged downloads the adaptive video and audio tracks to temporary files,
