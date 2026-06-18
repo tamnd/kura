@@ -168,7 +168,8 @@ self-contained, so this is a convenience over opening `index.html` directly.
 
 kura reads no API key. A flag default can come from the config file or the
 environment. Resolution order, later wins: built-in defaults, then the config
-file, then the environment, then the flag on the command line.
+file, then the environment, then the flag on the command line. The
+[configuration guide](/guides/configuration/) walks through setting these once.
 
 The config file is a plain list of `key = value` lines; blank lines and lines
 starting with `#` or `;` are ignored, and a value may be quoted. kura reads
