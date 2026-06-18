@@ -71,6 +71,25 @@ overwrite; cached media still de-dupes:
 kura add @mkbhd --force
 ```
 
+## The response cache
+
+kura keeps a shared on-disk cache of the InnerTube reads it makes (the metadata,
+channel, and listing calls, never the stream bytes or thumbnails). A repeated
+call within a freshness window is served from disk, so a re-render, a re-run, or
+dev iteration is fast and works offline. The cache is shared across every archive
+because it lives in your user cache directory (`$XDG_CACHE_HOME/kura`, or
+`~/.cache/kura`), not inside a repository, and it is advisory: deleting it only
+costs a re-fetch.
+
+```bash
+kura archive @mkbhd --no-cache     # ignore the cache, always fetch fresh
+```
+
+The freshness window defaults to one hour; set `KURA_CACHE_TTL` (a Go duration
+like `30m` or `6h`) to widen or narrow it, or `--no-cache` to bypass it entirely
+when you need the very latest counts. Stream files are never cached here; their
+de-duplication is the local archive itself.
+
 ## Reproducible output
 
 kura's output is deterministic by design: record paths and media filenames are
