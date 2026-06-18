@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
@@ -62,13 +63,35 @@ func withCode(code int, err error) error {
 // Execute builds the command tree, runs it through fang, and returns a process
 // exit code. cmd/kura/main.go passes a signal-aware context so Ctrl-C cancels the
 // in-flight capture and exits 130.
+//
+// The version string is set on the root command itself (see newRootCmd) so
+// `kura --version` reports the commit and build date alongside the version;
+// WithoutVersion stops fang from overwriting it with a version-only line.
+// renderError replaces fang's default handler, which title-cases the first word
+// of the message (mangling a leading file path) and prints an empty ERROR box
+// for a coded outcome that carries no message.
 func Execute(ctx context.Context) int {
 	root := newRootCmd()
 	err := fang.Execute(ctx, root,
-		fang.WithVersion(Version),
-		fang.WithCommit(Commit),
+		fang.WithoutVersion(),
+		fang.WithErrorHandler(renderError),
 	)
 	return codeFor(ctx, err)
+}
+
+// renderError prints err in fang's ERROR box, but faithfully: it keeps the
+// message verbatim (no title-casing, no forced trailing period) so a leading
+// file path survives, and prints nothing at all when the message is empty, which
+// is how a coded outcome with no human message (a gated capture that still wrote
+// a repository) reaches here.
+func renderError(w io.Writer, styles fang.Styles, err error) {
+	msg := err.Error()
+	if msg == "" {
+		return
+	}
+	_, _ = fmt.Fprintln(w, styles.ErrorHeader.String())
+	_, _ = fmt.Fprintln(w, styles.ErrorText.UnsetTransform().Render(msg))
+	_, _ = fmt.Fprintln(w)
 }
 
 // codeFor maps an error (already rendered by fang) onto an exit code.
@@ -122,12 +145,17 @@ func newRootCmd() *cobra.Command {
 			"searches into self-contained archives: canonical JSON, localised\n" +
 			"thumbnails and streams, inline transcripts, and inert HTML and Markdown\n" +
 			"views that open with the network unplugged.\n\n" +
-			"It reads YouTube through the free InnerTube surface of the ytb-cli engine\n" +
-			"— no API key, no account. Metadata, thumbnails and transcripts come for\n" +
-			"free; --depth media downloads the playable stream via the pure-Go engine\n" +
-			"(ffmpeg only for the final A/V merge).",
+			"It reads YouTube through the free InnerTube surface of the ytb-cli engine,\n" +
+			"with no API key and no account. Metadata, thumbnails and transcripts come\n" +
+			"for free; --depth media downloads the playable stream via the pure-Go\n" +
+			"engine (ffmpeg only for the final A/V merge).",
+		Version:       fmt.Sprintf("%s (commit %s, built %s)", Version, Commit, Date),
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		// Resolve config-file and environment defaults for every fetching command
+		// before it runs, in the precedence flags > env > config file > built-in
+		// default. Lives on the root so each subcommand inherits it.
+		PersistentPreRunE: resolveDefaults,
 	}
 
 	// Access and politeness, shared by every fetching command (delegated to the

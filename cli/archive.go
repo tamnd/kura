@@ -85,7 +85,7 @@ func newArchiveCmd(add bool) *cobra.Command {
 	f.Int("concurrent", 0, "per-stream range concurrency (default: engine default)")
 
 	// Output and rendering.
-	f.String("view", defaultView(), "views to render: html|md|html,md (JSON is always written)")
+	f.String("view", "html", "views to render: html|md|html,md (JSON is always written)")
 	f.StringP("out", "o", defaultOut(), "output root; the repo lands at <out>/youtube/<root>")
 	f.String("date", "", "fix the capture stamp (RFC3339) for reproducible output")
 	f.Bool("resume", true, "continue from an existing repository")
@@ -360,24 +360,14 @@ func short(s string) string {
 	return s
 }
 
-// defaultOut is the output root: $KURA_OUT, else $HOME/data/kura.
+// defaultOut is the built-in output root, $HOME/data/kura. $KURA_OUT and the
+// config file's `out` key override it through resolveDefaults.
 func defaultOut() string {
-	if v := os.Getenv("KURA_OUT"); v != "" {
-		return v
-	}
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
 		return "kura-out"
 	}
 	return filepath.Join(home, "data", "kura")
-}
-
-// defaultView is the default --view: $KURA_VIEW, else html.
-func defaultView() string {
-	if v := os.Getenv("KURA_VIEW"); v != "" {
-		return v
-	}
-	return "html"
 }
 
 func mustString(f interface{ GetString(string) (string, error) }, name string) string {
