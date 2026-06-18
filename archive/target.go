@@ -71,8 +71,12 @@ func ParseTarget(arg string, sel Selector) (Target, error) {
 			return Target{Kind: KindPlaylist, Ref: plid, Display: "Playlist " + plid}, nil
 		}
 	}
-	// A watch URL carries v=; an 11-char token is a bare video id.
-	if id := youtube.ExtractVideoID(arg); id != "" {
+	// A watch URL carries v=; a bare 11-char token is a video id. The engine's
+	// ExtractVideoID is permissive — it echoes any bare string back as an id, so a
+	// vanity name like "mkbhd" would be misread as a video. Gate it: a URL form
+	// goes to the engine, but a bare token must be an exact 11-character id to be a
+	// video, otherwise it falls through to the channel-handle case below.
+	if id := videoID(arg); id != "" {
 		return Target{Kind: KindVideo, Ref: id, Display: "Video " + id}, nil
 	}
 	if plid := youtube.ExtractPlaylistID(arg); plid != "" {
@@ -80,6 +84,37 @@ func ParseTarget(arg string, sel Selector) (Target, error) {
 	}
 	// Fall back to treating the argument as a channel handle.
 	return Target{Kind: KindChannel, Ref: channelRef(arg), Display: channelDisplay(arg)}, nil
+}
+
+// videoID returns the video id for arg, or "" when arg is not a video. A
+// URL-shaped argument (carrying a scheme, path, or query) is handed to the
+// engine's permissive matcher, which understands watch, youtu.be, /shorts/, and
+// /embed/ forms. A bare token must match the exact 11-character YouTube id shape;
+// anything shorter or longer (a vanity channel name) is not a video.
+func videoID(arg string) string {
+	if strings.ContainsAny(arg, ":/?=") || strings.Contains(arg, "youtu") {
+		return youtube.ExtractVideoID(arg)
+	}
+	if isVideoID(arg) {
+		return arg
+	}
+	return ""
+}
+
+// isVideoID reports whether s is exactly an 11-character YouTube video id: the
+// base64url alphabet, no separators.
+func isVideoID(s string) bool {
+	if len(s) != 11 {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'A' && r <= 'Z', r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '_', r == '-':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // looksChannel reports whether an argument is unmistakably a channel reference.

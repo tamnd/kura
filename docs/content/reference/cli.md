@@ -110,8 +110,9 @@ audio`.
 | `--force` | `false` | Ignore held state and recapture from scratch |
 | `--dry-run` | `false` | Print the capture plan without fetching |
 
-The output root also reads the `KURA_OUT` environment variable when `-o/--out` is
-not given.
+The output root, like the other configurable defaults, also reads the config file
+and the `KURA_OUT` environment variable when `-o/--out` is not given. See
+[configuration and environment](#configuration-and-environment).
 
 ## kura add
 
@@ -163,18 +164,48 @@ self-contained, so this is a convenience over opening `index.html` directly.
 |------|---------|---------|
 | `--addr` | `127.0.0.1:8080` | Address to listen on |
 
-## Environment
+## Configuration and environment
 
-kura reads no API key. The output root and a few defaults come from the
-environment, and the optional external tools are shared with the ytb-cli
-toolchain.
+kura reads no API key. A flag default can come from the config file or the
+environment. Resolution order, later wins: built-in defaults, then the config
+file, then the environment, then the flag on the command line.
+
+The config file is a plain list of `key = value` lines; blank lines and lines
+starting with `#` or `;` are ignored, and a value may be quoted. kura reads
+`$KURA_CONFIG` if set, else `$XDG_CONFIG_HOME/kura/config`, else
+`~/.config/kura/config`. A missing file is not an error.
+
+```
+# ~/.config/kura/config
+out   = /vault
+depth = media
+view  = html,md
+rate  = 750ms
+```
+
+Each configurable default has a config-file key, a matching `KURA_*` variable,
+and a flag:
+
+| Key | Variable | Flag | Meaning |
+|-----|----------|------|---------|
+| `out` | `KURA_OUT` | `--out` | Default output root (else `$HOME/data/kura`) |
+| `depth` | `KURA_DEPTH` | `--depth` | Default depth (`meta`, `media`, or `audio`) |
+| `view` | `KURA_VIEW` | `--view` | Default views (`html`, `md`, or `html,md`) |
+| `format` | `KURA_FORMAT` | `--format` | Default format selector |
+| `tool` | `KURA_TOOL` | `--tool` | External downloader (e.g. yt-dlp) |
+| `ffmpeg` | `KURA_FFMPEG` | `--ffmpeg-bin` | Path to ffmpeg for the A/V merge |
+| `rate` | `KURA_RATE` | `--rate` | Minimum delay between requests |
+| `retries` | `KURA_RETRIES` | `--retries` | Retry attempts on a transient failure |
+| `timeout` | `KURA_TIMEOUT` | `--timeout` | Per-request timeout |
+| `workers` | `KURA_WORKERS` | `--workers` | Concurrent request workers |
+| `hl` | `KURA_HL` | `--hl` | Interface language code |
+| `gl` | `KURA_GL` | `--gl` | Content country code |
+| `no_cache` | `KURA_NO_CACHE` | `--no-cache` | Bypass the shared on-disk cache |
+
+The optional external tools are shared with the ytb-cli toolchain:
 
 | Variable | Meaning |
 |----------|---------|
-| `KURA_OUT` | Default output root (overridden by `--out`; else `$HOME/data/kura`) |
-| `KURA_DEPTH` | Default `--depth` (`meta`, `media`, or `audio`) |
-| `KURA_VIEW` | Default `--view` (`html`, `md`, or `html,md`) |
-| `KURA_NO_CACHE` | Set to `1` to bypass the shared cache |
 | `YTB_YT_DLP_BIN` | Path to a yt-dlp binary for `--tool yt-dlp` |
 | `YTB_FFMPEG_BIN` | Path to ffmpeg for the A/V merge (else PATH; else muxed-only) |
 | `NO_COLOR` | Honoured by the styles |

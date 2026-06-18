@@ -11,6 +11,10 @@ func TestParseTargetKinds(t *testing.T) {
 	}{
 		{arg: "dQw4w9WgXcQ", kind: KindVideo, ref: "dQw4w9WgXcQ"},
 		{arg: "https://www.youtube.com/watch?v=dQw4w9WgXcQ", kind: KindVideo, ref: "dQw4w9WgXcQ"},
+		// A bare vanity name is a channel handle, not a video: it is not the exact
+		// 11-character id shape, so the permissive engine matcher must not claim it.
+		{arg: "mkbhd", kind: KindChannel, ref: "mkbhd"},
+		{arg: "lofi", kind: KindChannel, ref: "lofi"},
 		{arg: "@mkbhd", kind: KindChannel, ref: "@mkbhd"},
 		{arg: "UCBJycsmduvYEL83R_U4JriQ", kind: KindChannel, ref: "UCBJycsmduvYEL83R_U4JriQ"},
 		{arg: "https://www.youtube.com/@mkbhd/videos", kind: KindChannel, ref: "@mkbhd"},

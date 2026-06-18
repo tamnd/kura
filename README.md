@@ -216,14 +216,41 @@ Run `kura <command> --help` for the canonical list.
 
 ## Configuration
 
-Resolution order, later wins: built-in defaults, then the config file, then
-environment, then flags.
+A flag default can come from three places. Resolution order, later wins:
+built-in defaults, then the config file, then the environment, then the flag on
+the command line. So `--out` always wins, an unset `--out` takes `$KURA_OUT`, and
+with neither set the config file's `out` key applies, falling back to the
+built-in `$HOME/data/kura`.
+
+The config file is a plain list of `key = value` lines; blank lines and lines
+starting with `#` or `;` are ignored. kura reads `$KURA_CONFIG` if set, else
+`$XDG_CONFIG_HOME/kura/config`, else `~/.config/kura/config`. A missing file is
+not an error.
 
 ```
-KURA_OUT          default output root (overridden by --out; else $HOME/data/kura)
-KURA_DEPTH        default --depth (meta | media | audio)
-KURA_VIEW         default --view (html | md | html,md)
-KURA_NO_CACHE=1   bypass the shared cache
+# ~/.config/kura/config
+out    = /vault
+depth  = media
+view   = html,md
+rate   = 750ms
+```
+
+Every key has a matching `KURA_*` environment variable and a flag:
+
+```
+out      KURA_OUT      --out        default output root (else $HOME/data/kura)
+depth    KURA_DEPTH    --depth      default depth (meta | media | audio)
+view     KURA_VIEW     --view       default views (html | md | html,md)
+format   KURA_FORMAT   --format     default format selector
+tool     KURA_TOOL     --tool       external downloader (e.g. yt-dlp)
+ffmpeg   KURA_FFMPEG   --ffmpeg-bin path to ffmpeg for the A/V merge
+rate     KURA_RATE     --rate       minimum delay between requests
+retries  KURA_RETRIES  --retries    retry attempts on a transient failure
+timeout  KURA_TIMEOUT  --timeout    per-request timeout
+workers  KURA_WORKERS  --workers    concurrent request workers
+hl       KURA_HL       --hl         interface language code
+gl       KURA_GL       --gl         content country code
+no_cache KURA_NO_CACHE --no-cache   bypass the shared on-disk cache
 ```
 
 kura also honours ytb-cli's tool configuration, so a setup that works for `ytb`
