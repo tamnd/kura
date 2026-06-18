@@ -8,18 +8,15 @@ weight: 10
 kura [command] [flags]
 ```
 
-The commands: `archive` captures a target into a repository, `add` (alias
-`update`) re-captures an existing one incrementally, `render` rebuilds the views
-from stored JSON, `serve` previews a repository over HTTP, `info` summarises one,
-and `completion` writes a shell completion script. `kura --version` prints the
-build version, commit, and date. Run `kura <command> --help` for the canonical,
-up-to-date list.
+The commands: `archive` captures a target into a repository, `add` (alias `update`) re-captures an existing one incrementally, `render` rebuilds the views from stored JSON, `serve` previews a repository over HTTP, `info` summarises one, and `completion` writes a shell completion script.
+`kura --version` prints the build version, commit, and date.
+Run `kura <command> --help` for the canonical, up-to-date list.
 
 ## Global flags
 
-These persistent flags apply to every fetching command. They configure the shared
-ytb-cli engine: politeness, locale, and caching. kura holds no API key and needs
-no login.
+These persistent flags apply to every fetching command.
+They configure the shared ytb-cli engine: politeness, locale, and caching.
+kura holds no API key and needs no login.
 
 | Flag | Default | Meaning |
 |------|---------|---------|
@@ -37,11 +34,9 @@ no login.
 kura archive <target>... [flags]
 ```
 
-Captures one or more targets into a repository at `<out>/youtube/<root>`. A target
-is a video id or watch URL, a channel `@handle`, `UC...` id, or vanity path, or a
-`PL...`/`UU...` playlist id; the selector flags below switch to a search, album,
-or transcripts-only capture. Records are written as JSON as they arrive, then
-media is localised and the views rendered.
+Captures one or more targets into a repository at `<out>/youtube/<root>`.
+A target is a video id or watch URL, a channel `@handle`, `UC...` id, or vanity path, or a `PL...`/`UU...` playlist id; the selector flags below switch to a search, album, or transcripts-only capture.
+Records are written as JSON as they arrive, then media is localised and the views rendered.
 
 ### Target selectors
 
@@ -87,8 +82,8 @@ media is localised and the views rendered.
 
 ### Streams
 
-Delegated to the native download engine. Used at `--depth media` or `--depth
-audio`.
+Delegated to the native download engine.
+Used at `--depth media` or `--depth audio`.
 
 | Flag | Default | Meaning |
 |------|---------|---------|
@@ -110,9 +105,8 @@ audio`.
 | `--force` | `false` | Ignore held state and recapture from scratch |
 | `--dry-run` | `false` | Print the capture plan without fetching |
 
-The output root, like the other configurable defaults, also reads the config file
-and the `KURA_OUT` environment variable when `-o/--out` is not given. See
-[configuration and environment](#configuration-and-environment).
+The output root, like the other configurable defaults, also reads the config file and the `KURA_OUT` environment variable when `-o/--out` is not given.
+See [configuration and environment](#configuration-and-environment).
 
 ## kura add
 
@@ -120,11 +114,10 @@ and the `KURA_OUT` environment variable when `-o/--out` is not given. See
 kura add <target>... [flags]
 ```
 
-Alias: `kura update`. The same capture machinery as `kura archive`, but it
-defaults to the incremental path: fetch only what is newer than the newest record
-already on disk, then re-render only the affected pages. It takes every flag `kura
-archive` does. `kura add --depth media` over a meta repo upgrades a catalog to a
-playable vault, fetching only the streams.
+Alias: `kura update`.
+The same capture machinery as `kura archive`, but it defaults to the incremental path: fetch only what is newer than the newest record already on disk, then re-render only the affected pages.
+It takes every flag `kura archive` does.
+`kura add --depth media` over a meta repo upgrades a catalog to a playable vault, fetching only the streams.
 
 ## kura render
 
@@ -132,8 +125,8 @@ playable vault, fetching only the streams.
 kura render <repo> [flags]
 ```
 
-Re-renders the HTML and Markdown views from the stored JSON with no network. This
-adds a view to an archive, or replays a renderer change over an old one.
+Re-renders the HTML and Markdown views from the stored JSON with no network.
+This adds a view to an archive, or replays a renderer change over an old one.
 
 | Flag | Default | Meaning |
 |------|---------|---------|
@@ -146,9 +139,8 @@ adds a view to an archive, or replays a renderer change over an old one.
 kura info <repo>
 ```
 
-Prints a manifest summary: the service and target, the capture depth, video,
-transcript, and media counts, the date range, the capture history, the recorded
-gaps, and the on-disk size. Takes no flags.
+Prints a manifest summary: the service and target, the capture depth, video, transcript, and media counts, the date range, the capture history, the recorded gaps, and the on-disk size.
+Takes no flags.
 
 ## kura serve
 
@@ -156,9 +148,8 @@ gaps, and the on-disk size. Takes no flags.
 kura serve <repo> [flags]
 ```
 
-Runs a local static file server over a repository so links, media, and the
-`<video>` range requests resolve as they would on a host. The archive is already
-self-contained, so this is a convenience over opening `index.html` directly.
+Runs a local static file server over a repository so links, media, and the `<video>` range requests resolve as they would on a host.
+The archive is already self-contained, so this is a convenience over opening `index.html` directly.
 
 | Flag | Default | Meaning |
 |------|---------|---------|
@@ -166,15 +157,14 @@ self-contained, so this is a convenience over opening `index.html` directly.
 
 ## Configuration and environment
 
-kura reads no API key. A flag default can come from the config file or the
-environment. Resolution order, later wins: built-in defaults, then the config
-file, then the environment, then the flag on the command line. The
-[configuration guide](/guides/configuration/) walks through setting these once.
+kura reads no API key.
+A flag default can come from the config file or the environment.
+Resolution order, later wins: built-in defaults, then the config file, then the environment, then the flag on the command line.
+The [configuration guide](/guides/configuration/) walks through setting these once.
 
-The config file is a plain list of `key = value` lines; blank lines and lines
-starting with `#` or `;` are ignored, and a value may be quoted. kura reads
-`$KURA_CONFIG` if set, else `$XDG_CONFIG_HOME/kura/config`, else
-`~/.config/kura/config`. A missing file is not an error.
+The config file is a plain list of `key = value` lines; blank lines and lines starting with `#` or `;` are ignored, and a value may be quoted.
+kura reads `$KURA_CONFIG` if set, else `$XDG_CONFIG_HOME/kura/config`, else `~/.config/kura/config`.
+A missing file is not an error.
 
 ```
 # ~/.config/kura/config
@@ -184,8 +174,7 @@ view  = html,md
 rate  = 750ms
 ```
 
-Each configurable default has a config-file key, a matching `KURA_*` variable,
-and a flag:
+Each configurable default has a config-file key, a matching `KURA_*` variable, and a flag:
 
 | Key | Variable | Flag | Meaning |
 |-----|----------|------|---------|

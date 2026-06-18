@@ -4,15 +4,12 @@ description: "The on-disk shape of a kura archive: the directory tree, what each
 weight: 20
 ---
 
-A capture writes one self-contained repository. Everything it produces, records,
-sidecars, media, views, styling, and the manifest, lives under a single root, and
-every internal reference is a relative path, so the folder is movable and opens
-with no network.
+A capture writes one self-contained repository.
+Everything it produces, records, sidecars, media, views, styling, and the manifest, lives under a single root, and every internal reference is a relative path, so the folder is movable and opens with no network.
 
 ## Where it lands
 
-The root is `<out>/youtube/<root>`, where `<out>` is `-o/--out` (default
-`$HOME/data/kura`, or `$KURA_OUT`) and `<root>` is the canonical target identity:
+The root is `<out>/youtube/<root>`, where `<out>` is `-o/--out` (default `$HOME/data/kura`, or `$KURA_OUT`) and `<root>` is the canonical target identity:
 
 | Target | Root |
 |--------|------|
@@ -22,10 +19,9 @@ The root is `<out>/youtube/<root>`, where `<out>` is `-o/--out` (default
 | Search `lofi mix` | `search-lofi-mix` |
 | Album `<id>` | the lowercased album id |
 
-A channel keeps its `@handle` (lowercased); a video, playlist, and search are
-prefixed by kind and lowercased so the path is unambiguous and case-stable. A
-channel `@handle` is also resolved to its `UC...` id internally and recorded in
-the manifest. Two captures of the same target land in the same repo and merge.
+A channel keeps its `@handle` (lowercased); a video, playlist, and search are prefixed by kind and lowercased so the path is unambiguous and case-stable.
+A channel `@handle` is also resolved to its `UC...` id internally and recorded in the manifest.
+Two captures of the same target land in the same repo and merge.
 
 ## The tree
 
@@ -66,27 +62,20 @@ $HOME/data/kura/youtube/@mkbhd/
 
 Key points:
 
-- **JSON is the source of truth.** Each video is `videos/<id>.json`, written the
-  instant it arrives. The id is the 11-character string used verbatim, so the path
-  is a pure function of the id and a re-capture overwrites the same file. A
-  `.raw.json` sits beside it with the untouched upstream payload, so a parser
-  improvement in ytb-cli can be replayed over an old archive.
-- **Views are derived.** `html/`, `md/`, `index.html`, and `README.md` are all
-  rebuilt from the JSON by the renderer. Delete them and `kura render <repo>`
-  recreates them with no network.
-- **Media is localised and deduped.** Files go under `media/<type>/`, named by the
-  source key plus a short hash of the source URL. Two thumbnails never collide, and
-  one avatar shared across many videos resolves to a single file. Stream files
-  appear only at media or audio depth, and their name encodes the format selection.
-- **Transcripts are stored twice.** Timed `.vtt` is the source; flat `.txt` makes
-  the archive greppable for the spoken word.
+- **JSON is the source of truth.** Each video is `videos/<id>.json`, written the instant it arrives.
+  The id is the 11-character string used verbatim, so the path is a pure function of the id and a re-capture overwrites the same file.
+  A `.raw.json` sits beside it with the untouched upstream payload, so a parser improvement in ytb-cli can be replayed over an old archive.
+- **Views are derived.** `html/`, `md/`, `index.html`, and `README.md` are all rebuilt from the JSON by the renderer.
+  Delete them and `kura render <repo>` recreates them with no network.
+- **Media is localised and deduped.** Files go under `media/<type>/`, named by the source key plus a short hash of the source URL.
+  Two thumbnails never collide, and one avatar shared across many videos resolves to a single file.
+  Stream files appear only at media or audio depth, and their name encodes the format selection.
+- **Transcripts are stored twice.** Timed `.vtt` is the source; flat `.txt` makes the archive greppable for the spoken word.
 
 ## The manifest
 
 `manifest.json` is the first file `kura info`, `kura add`, and `kura render` read.
-Its record-bearing fields are sorted by id so a re-capture of the same content
-writes a byte-identical manifest; the only wall-clock values live in the capture
-entries.
+Its record-bearing fields are sorted by id so a re-capture of the same content writes a byte-identical manifest; the only wall-clock values live in the capture entries.
 
 | Field | Meaning |
 |-------|---------|
@@ -103,7 +92,5 @@ entries.
 | `kura_version` | The kura version that wrote the repo |
 | `schema` | The on-disk layout version, for future migration |
 
-The `gaps` list is the archive being honest about its holes: a hidden comment
-thread, an empty IP-gated transcript, a stream that failed the cipher. A gap
-records exactly what is missing and why, rather than leaving the archive silently
-incomplete.
+The `gaps` list is the archive being honest about its holes: a hidden comment thread, an empty IP-gated transcript, a stream that failed the cipher.
+A gap records exactly what is missing and why, rather than leaving the archive silently incomplete.
