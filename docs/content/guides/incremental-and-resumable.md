@@ -130,3 +130,4 @@ kura serve $HOME/data/kura/youtube/@mkbhd
 
 - The [CLI reference](/reference/cli/) lists every flag.
 - [Repository layout](/reference/repository-layout/) maps what lands on disk.
+- [Configuration](/guides/configuration/) covers tuning the cache and setting defaults.

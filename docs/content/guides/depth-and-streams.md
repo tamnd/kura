@@ -92,3 +92,4 @@ kura archive dQw4w9WgXcQ --depth media --tool yt-dlp
 
 - The greppable transcript corpus: [transcripts and search](/guides/transcripts-and-search/).
 - What lands on disk and what renders: [media and views](/guides/media-and-views/).
+- Set a default depth, format, and tool once: [configuration](/guides/configuration/).
