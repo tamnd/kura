@@ -61,7 +61,7 @@ $HOME/data/kura/youtube/@mkbhd/
 │   └── audio/                  # <vid>__<fmt>.m4a (--depth audio, or -x)
 ├── _assets/
 │   └── kura.css                # the one stylesheet the HTML views share
-└── state.json                  # capture cursors, download resume offsets, visited state
+└── state.json                  # resume cursor: captured id/time range + a complete flag
 ```
 
 Key points:
