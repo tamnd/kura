@@ -257,6 +257,8 @@ kura also honours ytb-cli's tool configuration, so a setup that works for `ytb`
 works for `kura` unchanged:
 
 ```
+KURA_CACHE        cache root (else $XDG_CACHE_HOME/kura, else ~/.cache/kura)
+KURA_CACHE_TTL    response freshness window as a Go duration, e.g. 30m, 6h (default 1h)
 YTB_YT_DLP_BIN    path to a yt-dlp binary for the optional --tool yt-dlp delegation
 YTB_FFMPEG_BIN    path to ffmpeg for the optional A/V merge (else PATH; else muxed-only)
 NO_COLOR          honoured by the styles

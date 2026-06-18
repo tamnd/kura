@@ -207,6 +207,8 @@ The optional external tools are shared with the ytb-cli toolchain:
 
 | Variable | Meaning |
 |----------|---------|
+| `KURA_CACHE` | Cache root (else `$XDG_CACHE_HOME/kura`, else `~/.cache/kura`) |
+| `KURA_CACHE_TTL` | Response freshness window as a Go duration, e.g. `30m`, `6h` (default `1h`) |
 | `YTB_YT_DLP_BIN` | Path to a yt-dlp binary for `--tool yt-dlp` |
 | `YTB_FFMPEG_BIN` | Path to ffmpeg for the A/V merge (else PATH; else muxed-only) |
 | `NO_COLOR` | Honoured by the styles |
