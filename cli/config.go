@@ -23,6 +23,7 @@ var configurable = []struct {
 	{"view", "KURA_VIEW", "view"},
 	{"depth", "KURA_DEPTH", "depth"},
 	{"format", "KURA_FORMAT", "format"},
+	{"quality", "KURA_QUALITY", "quality"},
 	{"tool", "KURA_TOOL", "tool"},
 	{"ffmpeg-bin", "KURA_FFMPEG", "ffmpeg"},
 	{"rate", "KURA_RATE", "rate"},

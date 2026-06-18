@@ -192,6 +192,7 @@ and a flag:
 | `depth` | `KURA_DEPTH` | `--depth` | Default depth (`meta`, `media`, or `audio`) |
 | `view` | `KURA_VIEW` | `--view` | Default views (`html`, `md`, or `html,md`) |
 | `format` | `KURA_FORMAT` | `--format` | Default format selector |
+| `quality` | `KURA_QUALITY` | `--quality` | Cap the video height (e.g. `1080`) |
 | `tool` | `KURA_TOOL` | `--tool` | External downloader (e.g. yt-dlp) |
 | `ffmpeg` | `KURA_FFMPEG` | `--ffmpeg-bin` | Path to ffmpeg for the A/V merge |
 | `rate` | `KURA_RATE` | `--rate` | Minimum delay between requests |

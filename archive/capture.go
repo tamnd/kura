@@ -4,9 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/tamnd/kura/repo"
+	"github.com/tamnd/kura/tool"
 	"github.com/tamnd/ytb-cli/youtube"
 )
 
@@ -18,7 +22,8 @@ type capturer struct {
 	log    Logf
 	mf     *repo.Manifest
 	seen   map[string]bool
-	count  int // videos processed (post-dedupe) this run, for the --max budget
+	count  int         // videos processed (post-dedupe) this run, for the --max budget
+	tool   *tool.YtDlp // resolved external downloader, or nil when --tool is unset
 }
 
 // captureChannel fetches and stores the channel record for a channel target so
@@ -239,17 +244,73 @@ func (c *capturer) captureTranscript(ctx context.Context, id string) {
 	}
 	for _, lang := range langs {
 		_, segs, err := c.client.Transcript(ctx, id, lang)
-		if err != nil {
-			c.mf.AddGap(id, "transcript", err.Error())
-			continue
-		}
-		if len(segs) == 0 {
+		if err != nil || len(segs) == 0 {
+			// The engine got nothing (an IP-gated or empty transcript). A configured
+			// tool is the rescue path before recording a gap.
+			if c.toolTranscript(ctx, id, lang) {
+				continue
+			}
+			if err != nil {
+				c.mf.AddGap(id, "transcript", err.Error())
+			}
 			continue
 		}
 		_ = c.st.WriteText(repo.TranscriptVTT(id, lang), youtube.RenderSubtitles(segs, youtube.SubVTT))
 		_ = c.st.WriteText(repo.TranscriptTXT(id, lang), youtube.RenderSubtitles(segs, youtube.SubText))
 	}
 }
+
+// toolTranscript tries the configured external tool (yt-dlp) for a transcript the
+// engine could not get, storing the .vtt and a flat .txt derived from it. It
+// reports whether a transcript was written.
+func (c *capturer) toolTranscript(ctx context.Context, id, lang string) bool {
+	if c.tool == nil {
+		return false
+	}
+	source := youtube.NormalizeVideoURL(id)
+	vtt, err := c.tool.Subtitles(ctx, source, lang)
+	if err != nil || len(vtt) == 0 {
+		return false
+	}
+	if err := c.st.WriteText(repo.TranscriptVTT(id, lang), string(vtt)); err != nil {
+		return false
+	}
+	_ = c.st.WriteText(repo.TranscriptTXT(id, lang), vttToText(string(vtt)))
+	return true
+}
+
+// vttToText flattens a WebVTT body into greppable plain text: it drops the header,
+// cue numbers, timestamp and setting lines, strips inline tags like <c> and the
+// <00:00:01.000> karaoke marks, and collapses the consecutive duplicate lines that
+// auto-captions roll out, so the .txt reads as prose.
+func vttToText(vtt string) string {
+	var b strings.Builder
+	var prev string
+	for line := range strings.SplitSeq(vtt, "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case line == "", strings.Contains(line, "-->"):
+			continue
+		case strings.HasPrefix(line, "WEBVTT"), strings.HasPrefix(line, "Kind:"), strings.HasPrefix(line, "Language:"), strings.HasPrefix(line, "NOTE"):
+			continue
+		}
+		if _, err := strconv.Atoi(line); err == nil {
+			continue // a bare cue number
+		}
+		line = strings.TrimSpace(vttTag.ReplaceAllString(line, ""))
+		if line == "" || line == prev {
+			continue
+		}
+		b.WriteString(line)
+		b.WriteByte('\n')
+		prev = line
+	}
+	return b.String()
+}
+
+// vttTag matches the inline markup WebVTT cues carry: voice/class spans like
+// <c.colorE5E5E5> and the per-word timestamps <00:00:01.000>.
+var vttTag = regexp.MustCompile(`<[^>]*>`)
 
 // captureComments streams the comment tree into a sidecar. Restricted-Mode
 // hiding is recorded as a gap (exit 4 at the CLI), not an error.
