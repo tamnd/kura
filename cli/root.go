@@ -11,12 +11,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/charmbracelet/fang"
 	"github.com/spf13/cobra"
+	"github.com/tamnd/kura/cache"
 	"github.com/tamnd/ytb-cli/youtube"
 )
 
@@ -205,7 +208,54 @@ func clientFromFlags(cmd *cobra.Command) *youtube.Client {
 	if v, _ := f.GetString("gl"); v != "" {
 		cfg.GL = v
 	}
-	return youtube.NewClient(cfg)
+
+	client := youtube.NewClient(cfg)
+
+	// Wrap the engine's HTTP client with the shared on-disk response cache unless
+	// --no-cache asks for fresh. The cache only holds InnerTube reads (cacheYouTube);
+	// stream and image bytes pass straight through.
+	if noCache, _ := f.GetBool("no-cache"); !noCache {
+		if dir := cacheDir(); dir != "" {
+			hc := client.HTTP()
+			hc.Transport = cache.Wrap(hc.Transport, dir, cacheTTL(), cacheYouTube)
+		}
+	}
+	return client
+}
+
+// cacheYouTube is the cache policy: cache only the InnerTube API and watch-page
+// reads on youtube.com, never the *.googlevideo.com stream bytes or the image
+// CDNs (those are large, expiring, or already localised into the repository).
+func cacheYouTube(req *http.Request) bool {
+	h := strings.ToLower(req.URL.Hostname())
+	return strings.HasSuffix(h, "youtube.com") || strings.Contains(h, "youtubei")
+}
+
+// cacheDir is the shared cache root: $KURA_CACHE, else $XDG_CACHE_HOME/kura, else
+// ~/.cache/kura. It lives outside any repository so re-runs of different archives
+// share one cache. An empty result disables the cache.
+func cacheDir() string {
+	if d := strings.TrimSpace(os.Getenv("KURA_CACHE")); d != "" {
+		return d
+	}
+	if d := strings.TrimSpace(os.Getenv("XDG_CACHE_HOME")); d != "" {
+		return filepath.Join(d, "kura")
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		return filepath.Join(home, ".cache", "kura")
+	}
+	return ""
+}
+
+// cacheTTL is the response freshness window, overridable with KURA_CACHE_TTL (a Go
+// duration like 30m or 6h), defaulting to cache.DefaultTTL.
+func cacheTTL() time.Duration {
+	if v := strings.TrimSpace(os.Getenv("KURA_CACHE_TTL")); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return cache.DefaultTTL
 }
 
 // stderrLog returns a progress sink that writes to stderr when verbose is set,
