@@ -101,6 +101,23 @@ pub const fn zigzag_decode(value: u64) -> i64 {
     ((value >> 1) as i64) ^ -((value & 1) as i64)
 }
 
+/// Writes a little endian `u16`.
+pub fn put_u16(out: &mut Vec<u8>, value: u16) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+/// Reads a little endian `u16` from the front of `input`.
+///
+/// # Errors
+///
+/// Returns [`Error::Truncated`] if fewer than two bytes are available.
+pub fn get_u16(input: &[u8]) -> Result<(u16, &[u8])> {
+    let (head, rest) = split_at(input, 2)?;
+    let mut buf = [0u8; 2];
+    buf.copy_from_slice(head);
+    Ok((u16::from_le_bytes(buf), rest))
+}
+
 /// Writes a little endian `u32`.
 pub fn put_u32(out: &mut Vec<u8>, value: u32) {
     out.extend_from_slice(&value.to_le_bytes());
@@ -116,6 +133,23 @@ pub fn get_u32(input: &[u8]) -> Result<(u32, &[u8])> {
     let mut buf = [0u8; 4];
     buf.copy_from_slice(head);
     Ok((u32::from_le_bytes(buf), rest))
+}
+
+/// Writes a little endian `u64`.
+pub fn put_u64(out: &mut Vec<u8>, value: u64) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+/// Reads a little endian `u64` from the front of `input`.
+///
+/// # Errors
+///
+/// Returns [`Error::Truncated`] if fewer than eight bytes are available.
+pub fn get_u64(input: &[u8]) -> Result<(u64, &[u8])> {
+    let (head, rest) = split_at(input, 8)?;
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(head);
+    Ok((u64::from_le_bytes(buf), rest))
 }
 
 /// Splits `input` at `n`, or reports how much was missing.
@@ -239,5 +273,27 @@ mod tests {
                 available: 3
             })
         ));
+    }
+
+    #[test]
+    fn fixed_width_integers_round_trip_and_report_truncation() {
+        let mut buf = Vec::new();
+        put_u16(&mut buf, 0xbeef);
+        put_u64(&mut buf, 0x0123_4567_89ab_cdef);
+
+        let (small, rest) = get_u16(&buf).expect("decode");
+        let (big, rest) = get_u64(rest).expect("decode");
+        assert_eq!(small, 0xbeef);
+        assert_eq!(big, 0x0123_4567_89ab_cdef);
+        assert!(rest.is_empty());
+
+        for len in 0..buf.len() {
+            let short = &buf[..len];
+            let err = get_u16(short).and_then(|(_, rest)| get_u64(rest));
+            assert!(
+                matches!(err, Err(Error::Truncated { .. })),
+                "len {len}: {err:?}"
+            );
+        }
     }
 }
