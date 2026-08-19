@@ -143,7 +143,23 @@ It is the one to use unless there is a measured reason not to.
 `Segment::open_without_checksum` skips the checksum and nothing else.
 The structural checks still run, so a section slice it hands back is still inside the input, and a corrupt section table is still refused.
 
-The distinction matters for a memory mapped file.
-Verifying the checksum means reading every page, which for a large segment is the difference between opening in microseconds and opening in the time it takes to fault in the whole thing.
+The distinction matters, and it is worth more than an argument from first principles, so here are the measurements.
+On a 2.1 MB segment holding a million document posting list and a megabyte term section, on an M series laptop:
+
+```
+open a segment, checksum verified               4055.0 us
+open a segment, checksum skipped                    84 ns
+```
+
+Run it yourself with `cargo run --release --example bench`.
+
+Skipping the checksum is roughly forty thousand times faster, and the gap grows with the size of the segment, because one side is a walk of a two entry table and the other is a pass over every byte.
+That is the shape you want: opening should cost what the table costs, and verifying should cost what the data costs.
+
+For a memory mapped file the difference is larger still, since verifying means faulting in every page rather than the one the table lives on.
 That trade is worth making for a segment this process wrote and published and has not touched since.
 It is not worth making for a file that arrived from somewhere else.
+
+The checksum runs at about 525 MB/s, which is what a byte at a time table driven CRC-32 gets.
+A slice by eight implementation would be several times quicker, and it is the obvious thing to do if checksumming ever shows up in a profile.
+It has not yet, so it has not been written.

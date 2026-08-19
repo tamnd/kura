@@ -22,6 +22,7 @@ use kura_core::DocId;
 use kura_core::bitmap::Bitmap;
 use kura_core::codec::{get_uvarint, put_uvarint};
 use kura_core::posting::{Reader, Writer};
+use kura_core::segment::Segment;
 use kura_core::vector::{Quantised, cosine};
 
 /// How many times each measurement is repeated before the median is taken.
@@ -84,6 +85,31 @@ fn main() {
             black_box(value);
             rest = tail;
         }
+    });
+
+    // The two numbers that decide whether checksumming on open is affordable.
+    // Opening is meant to be a walk of the section table and nothing else, so it
+    // should not move with the size of the segment, and verifying should move
+    // exactly linearly with it. If those two ever converge, the fast path has
+    // stopped being a fast path.
+    let mut segment = kura_core::segment::Writer::new();
+    segment
+        .add(kura_core::segment::kind::POSTINGS, encoded.clone())
+        .expect("one of a kind");
+    segment
+        .add(kura_core::segment::kind::TERMS, vec![0x5a; 1 << 20])
+        .expect("one of a kind");
+    let segment = segment.finish();
+    println!("segment: {} bytes over 2 sections", segment.len());
+
+    bench("open a segment, checksum verified", segment.len(), || {
+        let opened = Segment::open(black_box(&segment)).expect("open");
+        black_box(opened.section(kura_core::segment::kind::TERMS));
+    });
+
+    bench("open a segment, checksum skipped", 1, || {
+        let opened = Segment::open_without_checksum(black_box(&segment)).expect("open");
+        black_box(opened.section(kura_core::segment::kind::TERMS));
     });
 
     let query: Vec<f32> = (0..768).map(|i| ((i % 17) as f32 / 17.0) - 0.5).collect();
