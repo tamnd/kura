@@ -39,9 +39,13 @@ The primitives here sit under a query path, so a change that makes something ten
 cargo run --release --example bench
 ```
 
-That prints a table for the posting list, bitmap, varint and vector paths.
+That prints a table for the posting list, bitmap, varint, segment and vector paths.
 Run it before and after your change and put both in the pull request.
 It is deliberately a plain timing loop rather than a benchmark framework: the crate has no dependencies and keeping it that way is worth more than confidence intervals.
+
+Run it on an idle machine and say which machine it was.
+A laptop under load reports numbers three to four times worse across every row at once, which is easy to mistake for a regression in whichever row you happened to be looking at.
+If the whole table moved by the same factor, the machine moved, not the code.
 
 ## Dependencies
 
