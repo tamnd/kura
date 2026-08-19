@@ -31,7 +31,7 @@ jobs:
         os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-13, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: toolchain
         run: rustc --version && cargo --version
       - name: build
@@ -45,7 +45,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: rustfmt
         run: cargo fmt --all -- --check
       - name: clippy
@@ -65,7 +65,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: build the static library
         run: cargo build --release -p kura-ffi
       - name: compile and run the C caller
@@ -82,7 +82,7 @@ jobs:
   ffi-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: ilammy/msvc-dev-cmd@v1
       - name: build the static library
         run: cargo build --release -p kura-ffi
@@ -108,7 +108,7 @@ jobs:
           - x86_64-unknown-freebsd
           - wasm32-unknown-unknown
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: add the target
         run: rustup target add ${{ matrix.target }}
       - name: check
@@ -120,7 +120,7 @@ jobs:
   deny:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check all
@@ -130,7 +130,7 @@ jobs:
   lockfile:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: the lockfile is up to date
         run: cargo metadata --locked --format-version 1 > /dev/null
 
@@ -142,7 +142,7 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: stable
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: toolchain
         run: rustup toolchain install stable --profile minimal && rustc --version
       - name: build and test
