@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Local build output from the C example.
+/examples/c/smoke
+/examples/c/*.o
+
+.DS_Store

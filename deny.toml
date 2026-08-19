@@ -1,0 +1,25 @@
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+# The engine is linked into other people's binaries, so the list stays short and
+# permissive. Anything outside it needs a decision, not a default.
+allow = ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0"]
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# A storage engine that pulls a dependency tree pulls it into every host that
+# links it, so new dependencies are a deliberate decision rather than a habit.
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

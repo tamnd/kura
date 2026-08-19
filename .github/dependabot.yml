@@ -1,0 +1,15 @@
+version: 2
+updates:
+  # The crates have no dependencies today, which is deliberate. This is here so
+  # that the first one that arrives is watched from the day it arrives.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5

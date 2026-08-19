@@ -1,0 +1,25 @@
+[package]
+name = "kura-ffi"
+description = "C ABI for the kura storage engine, for linking into a host process."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+categories.workspace = true
+keywords.workspace = true
+
+[lib]
+# The library is called kura so that a host links -lkura, and the rlib is kept
+# so that the crate's own tests can run against the same symbols a C caller
+# sees.
+name = "kura"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+kura-core = { path = "../kura-core", version = "0.1.0" }

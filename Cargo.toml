@@ -1,0 +1,51 @@
+[workspace]
+resolver = "3"
+members = ["crates/kura-core", "crates/kura-ffi"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT"
+authors = ["Duc-Tam Nguyen <tamnd87@gmail.com>"]
+repository = "https://github.com/tamnd/kura"
+homepage = "https://github.com/tamnd/kura"
+categories = ["database-implementations", "data-structures", "compression"]
+keywords = ["storage", "columnar", "vector", "search", "index"]
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+rust_2024_compatibility = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+# The engine is the layer everything above it trusts for correctness, so the
+# lints that catch a silent wrong answer are denied rather than warned.
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+cast_possible_truncation = "deny"
+cast_possible_wrap = "deny"
+cast_sign_loss = "deny"
+missing_panics_doc = "warn"
+undocumented_unsafe_blocks = "deny"
+# Reading a struct field into a local of the same name is the clearest way to
+# write the hot loops here, and the module docs already carry the prose.
+module_name_repetitions = "allow"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+# The FFI library is loaded by a host process that owns its own panic policy, so
+# unwinding across the boundary has to stay impossible in every profile that
+# ships.
+[profile.release-ffi]
+inherits = "release"
+panic = "abort"
+
+[profile.bench]
+inherits = "release"
+debug = true

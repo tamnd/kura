@@ -1,0 +1,123 @@
+name: release
+
+# Pushing a version tag builds the library for every supported platform and
+# attaches the archives to a GitHub release, then publishes the crates if a
+# registry token is configured. Each archive holds the static library, the shared
+# library, the header and the license, which is everything a host needs to link
+# the engine without a Rust toolchain.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          - { os: macos-13, target: x86_64-apple-darwin }
+          - { os: macos-latest, target: aarch64-apple-darwin }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: build
+        run: cargo build --release -p kura-ffi --target ${{ matrix.target }}
+
+      - name: package
+        shell: bash
+        run: |
+          name="kura-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "dist/$name/lib" "dist/$name/include"
+          cp include/kura.h "dist/$name/include/"
+          cp LICENSE README.md "dist/$name/"
+          out="target/${{ matrix.target }}/release"
+          for f in libkura.a libkura.so libkura.dylib kura.lib kura.dll kura.dll.lib; do
+            if [ -f "$out/$f" ]; then cp "$out/$f" "dist/$name/lib/"; fi
+          done
+          cd dist
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z a "$name.zip" "$name" > /dev/null
+          else
+            tar czf "$name.tar.gz" "$name"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the GitHub release
+      id-token: write # keyless cosign signing
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # One checksum file for the whole release, which is what anyone verifying
+      # a download expects to find next to it.
+      - name: checksums
+        run: |
+          cd dist
+          sha256sum * > checksums.txt
+          cat checksums.txt
+
+      # Signing the checksum file signs every artifact in it, without a key to
+      # store or rotate anywhere.
+      - uses: sigstore/cosign-installer@v3
+      - name: sign the checksums
+        run: |
+          cd dist
+          cosign sign-blob --yes \
+            --output-certificate checksums.txt.pem \
+            --output-signature checksums.txt.sig \
+            checksums.txt
+
+      - name: create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/*
+
+  # Publishing to crates.io is optional on purpose. Without a token the job skips
+  # and the GitHub release still happens, so a release never fails on a registry
+  # that is not set up yet.
+  crates:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "no registry token configured, skipping the publish"
+            exit 0
+          fi
+          cargo publish -p kura-core
+          cargo publish -p kura-ffi

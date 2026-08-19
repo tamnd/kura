@@ -1,0 +1,6 @@
+[toolchain]
+# The minimum the crates claim to support, so that a build here fails the same
+# way a downstream build would rather than quietly using a newer feature.
+channel = "1.97"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

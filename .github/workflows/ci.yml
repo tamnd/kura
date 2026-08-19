@@ -1,0 +1,149 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# Cancel an in-flight run when a branch is pushed again.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # A backtrace on a failed test in CI is the difference between one debugging
+  # round trip and three.
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Build and test on every platform and architecture the engine claims to
+  # support. There is nothing to install first: the crates have no dependencies
+  # and the toolchain comes from rust-toolchain.toml, which rustup reads on the
+  # first cargo command.
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-13, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: toolchain
+        run: rustc --version && cargo --version
+      - name: build
+        run: cargo build --workspace --all-targets
+      - name: test
+        run: cargo test --workspace
+
+  # Formatting, lints and documentation. Warnings are errors here so that the
+  # main branch never accumulates them, which is the only way a warning stays
+  # worth reading.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: rustdoc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps
+
+  # The header, the symbol names and the calling convention are the part of this
+  # project another language actually touches, so a real compiler and a real
+  # linker exercise them on every change.
+  ffi:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: build the static library
+        run: cargo build --release -p kura-ffi
+      - name: compile and run the C caller
+        run: |
+          libs=""
+          if [ "$RUNNER_OS" = "Linux" ]; then libs="-lm -ldl -lpthread"; fi
+          cc -std=c11 -Wall -Wextra -Werror -O2 -Iinclude \
+            examples/c/smoke.c target/release/libkura.a $libs -o smoke
+          ./smoke
+
+  # The same on Windows, where the compiler, the object format and the runtime
+  # are all different. The developer command prompt is what puts cl.exe on the
+  # path, and cmd is the shell that keeps it there.
+  ffi-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: build the static library
+        run: cargo build --release -p kura-ffi
+      # Linking against the import library rather than the static one keeps the
+      # list of system libraries out of this file, where it would go stale.
+      - name: compile and run the C caller
+        shell: cmd
+        run: |
+          cl /nologo /W4 /O2 /Iinclude examples\c\smoke.c target\release\kura.dll.lib /Fe:smoke.exe
+          copy target\release\kura.dll .
+          smoke.exe
+
+  # Architectures without a hosted runner still have to compile. This does not
+  # link, which is the point: it catches the code that is wrong for a target
+  # rather than the toolchain that is missing for it.
+  cross:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-pc-windows-msvc
+          - x86_64-unknown-freebsd
+          - wasm32-unknown-unknown
+    steps:
+      - uses: actions/checkout@v5
+      - name: add the target
+        run: rustup target add ${{ matrix.target }}
+      - name: check
+        run: cargo check -p kura-core --target ${{ matrix.target }}
+
+  # Licenses, advisories and sources. The engine is linked into other people's
+  # binaries, so anything that arrives in the dependency tree has to be a
+  # decision rather than a surprise.
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check all
+
+  # A lockfile that does not match the manifests turns into a different build on
+  # someone else's machine, which is the failure this catches.
+  lockfile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: the lockfile is up to date
+        run: cargo metadata --locked --format-version 1 > /dev/null
+
+  # The pinned toolchain is the floor, not the ceiling. Building on stable as
+  # well catches the deprecation that is about to become an error long before a
+  # user hits it.
+  stable:
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@v5
+      - name: toolchain
+        run: rustup toolchain install stable --profile minimal && rustc --version
+      - name: build and test
+        run: cargo test --workspace
