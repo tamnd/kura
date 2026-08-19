@@ -28,10 +28,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-13, windows-latest]
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: toolchain
         run: rustc --version && cargo --version
       - name: build
@@ -45,7 +45,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: rustfmt
         run: cargo fmt --all -- --check
       - name: clippy
@@ -65,7 +65,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: build the static library
         run: cargo build --release -p kura-ffi
       - name: compile and run the C caller
@@ -77,13 +77,13 @@ jobs:
           ./smoke
 
   # The same on Windows, where the compiler, the object format and the runtime
-  # are all different. The developer command prompt is what puts cl.exe on the
-  # path, and cmd is the shell that keeps it there.
+  # are all different. vcvars64 is what puts cl.exe on the path, and vswhere is
+  # how you find vcvars64 without hard coding a Visual Studio version that the
+  # runner image will change out from under you.
   ffi-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: actions/checkout@v7
       - name: build the static library
         run: cargo build --release -p kura-ffi
       # Linking against the import library rather than the static one keeps the
@@ -91,8 +91,11 @@ jobs:
       - name: compile and run the C caller
         shell: cmd
         run: |
-          cl /nologo /W4 /O2 /Iinclude examples\c\smoke.c target\release\kura.dll.lib /Fe:smoke.exe
-          copy target\release\kura.dll .
+          set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+          for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSDIR=%%i"
+          call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          cl /nologo /W4 /O2 /Iinclude examples\c\smoke.c target\release\kura.dll.lib /Fe:smoke.exe || exit /b 1
+          copy target\release\kura.dll . || exit /b 1
           smoke.exe
 
   # Architectures without a hosted runner still have to compile. This does not
@@ -108,7 +111,7 @@ jobs:
           - x86_64-unknown-freebsd
           - wasm32-unknown-unknown
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: add the target
         run: rustup target add ${{ matrix.target }}
       - name: check
@@ -120,7 +123,7 @@ jobs:
   deny:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check all
@@ -130,7 +133,7 @@ jobs:
   lockfile:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: the lockfile is up to date
         run: cargo metadata --locked --format-version 1 > /dev/null
 
@@ -142,7 +145,7 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: stable
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: toolchain
         run: rustup toolchain install stable --profile minimal && rustc --version
       - name: build and test
