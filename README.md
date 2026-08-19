@@ -31,8 +31,10 @@ The crate holds the pieces the rest is built out of, and each one is tested and 
   This is what a permission filter runs on.
 - **Vectors.** Cosine similarity, unit normalisation and eight bit quantisation with a per vector scale, which cuts the memory a corpus costs by four with a bounded error.
 - **A C ABI.** A static and shared library with a hand written header, so a host in another language can use the engine without a socket and without copying the data.
+- **Segments.** The on disk container, holding a header, a section table and the section payloads, checksummed and verified on open.
+  It is documented in [docs/format.md](docs/format.md), field by field and with the reason for each one.
 
-Segments, the on disk format, the columnar layer and the graph layer are next.
+The columnar layer and the graph layer are next.
 The version number says 0.1.0 for a reason.
 
 ## Design rules
@@ -58,6 +60,7 @@ crates/kura-core   the engine, no dependencies, no unsafe on the decode paths
 crates/kura-ffi    the C ABI, built as a static and shared library
 include/kura.h     the header, written by hand and checked in
 examples/c         a C caller, compiled and run in CI on every platform
+docs/format.md     the on disk format
 ```
 
 ## Building

@@ -59,6 +59,30 @@ pub enum Error {
         /// The value that broke the order.
         at: u32,
     },
+
+    /// Two sections of a segment claimed the same kind, so a reader asking for
+    /// that kind would have to guess which one was meant.
+    DuplicateSection {
+        /// The kind that appeared twice.
+        kind: u16,
+    },
+
+    /// A segment's section table claims more sections than the format allows.
+    TooManySections {
+        /// The count found in the header.
+        count: usize,
+    },
+
+    /// A section's offset and length do not lie inside the segment, which means
+    /// the table is corrupt however plausible the individual numbers look.
+    SectionOutOfRange {
+        /// The kind of the offending section.
+        kind: u16,
+        /// Where the table said the section starts.
+        offset: u64,
+        /// How long the table said the section is.
+        length: u64,
+    },
 }
 
 impl fmt::Display for Error {
@@ -88,6 +112,26 @@ impl fmt::Display for Error {
                 write!(f, "vectors of different lengths: {left} and {right}")
             }
             Self::NotSorted { at } => write!(f, "posting list is not ascending at {at}"),
+            Self::DuplicateSection { kind } => {
+                write!(f, "section kind {kind} appears more than once")
+            }
+            Self::TooManySections { count } => {
+                write!(
+                    f,
+                    "segment claims {count} sections, which is more than the format allows"
+                )
+            }
+            Self::SectionOutOfRange {
+                kind,
+                offset,
+                length,
+            } => {
+                write!(
+                    f,
+                    "section kind {kind} claims bytes {offset}..{} which are not in the segment",
+                    offset.saturating_add(*length)
+                )
+            }
         }
     }
 }
