@@ -20,18 +20,27 @@ use std::time::{Duration, Instant};
 
 use kura_core::DocId;
 use kura_core::bitmap::Bitmap;
+use kura_core::bitpack;
 use kura_core::codec::{get_uvarint, put_uvarint};
 use kura_core::posting::{Reader, Writer};
 use kura_core::segment::{self, Segment};
 use kura_core::vector::{Quantised, cosine};
 
-/// How many times each measurement is repeated before the median is taken.
-const ROUNDS: usize = 9;
+/// How many times each measurement is repeated.
+///
+/// Enough that the fastest round has a fair chance of being one where nothing
+/// else on the machine got in the way, which is what makes the number below
+/// comparable between two runs on a laptop that is doing other things.
+const ROUNDS: usize = 25;
 
 fn main() {
-    println!("{:<44} {:>12} {:>14}", "case", "median", "per item");
+    println!(
+        "{:<44} {:>12} {:>12} {:>10}",
+        "case", "best", "median", "per item"
+    );
 
     let encoded = postings();
+    blocks();
     bitmaps();
     varints();
     segments(&encoded);
@@ -86,6 +95,74 @@ fn bitmaps() {
             black_box(left.len());
         },
     );
+}
+
+/// The two block codecs side by side, on the same ids.
+///
+/// This is the comparison the posting format rests on, so it is measured rather
+/// than argued about. Both do the same job: turn a run of ascending ids into
+/// bytes and back. One reads a value at a time and has to finish each before it
+/// knows where the next one starts, the other reads four at a time at a width it
+/// was told in advance.
+fn blocks() {
+    let ids: Vec<DocId> = (0..1_000_000u32).map(|i| i * 3).collect();
+
+    // One continuous run of gaps, which is the best shape a varint decoder can
+    // be given. Restarting the run every block would make the comparison below
+    // flattering for no reason.
+    let mut varint = Vec::new();
+    let mut previous = 0u32;
+    for id in &ids {
+        put_uvarint(&mut varint, u64::from(*id - previous));
+        previous = *id;
+    }
+
+    let mut packed = Vec::new();
+    let mut widths = Vec::new();
+    let mut base = 0u32;
+    for chunk in ids.chunks(bitpack::BLOCK) {
+        let mut block = [0u32; bitpack::BLOCK];
+        block[..chunk.len()].copy_from_slice(chunk);
+        for slot in &mut block[chunk.len()..] {
+            *slot = chunk[chunk.len() - 1];
+        }
+        widths.push(bitpack::pack(&block, base, &mut packed));
+        base = block[bitpack::BLOCK - 1];
+    }
+    println!(
+        "block codecs: varint {} bytes, packed {} bytes, {:.2} against {:.2} bytes per id",
+        varint.len(),
+        packed.len(),
+        varint.len() as f64 / ids.len() as f64,
+        packed.len() as f64 / ids.len() as f64
+    );
+
+    bench("decode a million gaps, varints", ids.len(), || {
+        let mut out = Vec::with_capacity(ids.len());
+        let mut rest = black_box(varint.as_slice());
+        let mut current = 0u32;
+        while !rest.is_empty() {
+            let (gap, tail) = get_uvarint(rest).expect("decode");
+            current += u32::try_from(gap).expect("gap fits");
+            out.push(current);
+            rest = tail;
+        }
+        black_box(out.len());
+    });
+
+    bench("decode a million ids, packed blocks", ids.len(), || {
+        let mut out = Vec::with_capacity(ids.len());
+        let mut block = [0u32; bitpack::BLOCK];
+        let mut rest = black_box(packed.as_slice());
+        let mut base = 0u32;
+        for width in &widths {
+            let read = bitpack::unpack(rest, *width, base, &mut block).expect("unpack");
+            out.extend_from_slice(&block);
+            base = block[bitpack::BLOCK - 1];
+            rest = &rest[read..];
+        }
+        black_box(out.len());
+    });
 }
 
 /// The codec everything else is built out of.
@@ -185,6 +262,15 @@ fn encode(ids: &[DocId]) -> Vec<u8> {
 }
 
 /// Runs `f` a few times and prints the median, plus the cost per item.
+/// Runs `f` a few times and prints the fastest round and the median, plus the
+/// cost per item at the fastest.
+///
+/// Both, because they answer different questions. The median is what the work
+/// costs on the machine as it actually is, sharing it with everything else that
+/// is running. The fastest round is the closest this can get to what the work
+/// costs on its own, and it is the one to compare against another build, because
+/// a change that made something slower should not be able to hide behind a busy
+/// afternoon.
 fn bench(name: &str, items: usize, mut f: impl FnMut()) {
     let mut timings = Vec::with_capacity(ROUNDS);
     for _ in 0..ROUNDS {
@@ -193,14 +279,19 @@ fn bench(name: &str, items: usize, mut f: impl FnMut()) {
         timings.push(start.elapsed());
     }
     timings.sort_unstable();
+    let best = timings[0];
     let median = timings[ROUNDS / 2];
 
     let per_item = if items > 1 {
-        format!("{:.1} ns", median.as_nanos() as f64 / items as f64)
+        format!("{:.2} ns", best.as_nanos() as f64 / items as f64)
     } else {
         String::new()
     };
-    println!("{name:<44} {:>12} {per_item:>14}", format_duration(median));
+    println!(
+        "{name:<44} {:>12} {:>12} {per_item:>10}",
+        format_duration(best),
+        format_duration(median)
+    );
 }
 
 fn format_duration(d: Duration) -> String {

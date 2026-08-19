@@ -18,6 +18,7 @@
 //! stops scaling.
 
 pub mod bitmap;
+pub mod bitpack;
 pub mod checksum;
 pub mod codec;
 pub mod error;

@@ -94,7 +94,7 @@ Relative to the body means a writer can build the body before it knows where in 
 | Kind | Name | What it holds |
 | --- | --- | --- |
 | 1 | terms | the term dictionary, and where each term's postings start |
-| 2 | postings | delta encoded posting lists |
+| 2 | postings | posting lists, packed in fixed size blocks |
 | 3 | fields | stored field values, returned with a hit rather than searched |
 | 4 | vectors | quantised vectors, one per passage |
 | 5 | acl | the access control lists governing the documents in this segment |
@@ -144,7 +144,9 @@ It is the one to use unless there is a measured reason not to.
 The structural checks still run, so a section slice it hands back is still inside the input, and a corrupt section table is still refused.
 
 The distinction matters, and it is worth more than an argument from first principles, so here is the measurement.
-The segment is 2.1 MB, holding a million document posting list and a megabyte term section, and the machine is an idle Intel i9-13900K running Windows.
+The segment holds a million document posting list and a megabyte term section, and the machine is an idle Intel i9-13900K running Windows.
+It came to 2.1 MB when this was taken.
+The posting format has since roughly halved that, which moves the verified figure down with it and leaves the skipped one exactly where it is, because one of them reads the data and the other reads the table.
 
 ```
 open a segment, checksum verified               3479.9 us

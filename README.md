@@ -25,8 +25,9 @@ Posting lists, bitmaps, integer codecs and quantised vectors, sharing one format
 This is early.
 The crate holds the pieces the rest is built out of, and each one is tested and measured on its own before anything is layered on top.
 
-- **Integer codecs.** LEB128 varints with zigzag mapping for signed values, which is what makes a delta encoded list small.
-- **Posting lists.** Fixed size blocks of delta encoded ids with a skip table, so a membership test on a list of millions decodes one block rather than all of them.
+- **Integer codecs.** LEB128 varints with zigzag mapping for signed values, which is what carries the lengths, the offsets and the runs too short to be worth packing.
+- **Posting lists.** Fixed size blocks packed at a width chosen per block, with a skip table, so a membership test on a list of millions decodes one block rather than all of them.
+  The blocks decode four ids at a time, which is what makes reading them three times faster than reading the same ids as varints, at a little over half the size.
 - **Bitmaps.** A set of document ids that switches between a sorted list and a dense word array depending on how full it is, with intersection, union and difference.
   This is what a permission filter runs on.
 - **Vectors.** Cosine similarity, unit normalisation and eight bit quantisation with a per vector scale, which cuts the memory a corpus costs by four with a bounded error.

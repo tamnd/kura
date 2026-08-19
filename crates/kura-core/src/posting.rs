@@ -1,25 +1,33 @@
 //! Compressed posting lists.
 //!
 //! A posting list is the set of documents one term appears in, and it is the
-//! single largest thing an inverted index stores. It is written as fixed size
-//! blocks of delta encoded varints, with a skip entry per block.
+//! single largest thing an inverted index stores. Whatever it costs to hold and
+//! to walk is what a query costs, multiplied by the number of terms in it.
 //!
-//! The blocks are what make a large list usable. Without them, finding whether
+//! It is written as fixed size blocks of a hundred and twenty eight ids, packed
+//! at a width chosen per block, with a skip entry per block. The packing is in
+//! [`crate::bitpack`], along with the reason it beats a varint by more than the
+//! width alone would suggest.
+//!
+//! Whatever is left over at the end, fewer ids than a block holds, is written as
+//! varint gaps instead. Uniformity would be nicer, but the vocabulary of a real
+//! corpus is mostly terms that appear in a handful of documents, and rounding
+//! every one of those up to a whole block would cost more in the term dictionary
+//! than the packing saves in the lists that are actually long.
+//!
+//! The blocks are what make a long list usable. Without them, finding whether
 //! document nine million is in a list means decoding everything before it. With
 //! them, the skip table says which block could contain it and only that block is
 //! decoded. That is the difference between an intersection that scales with the
 //! size of the rarest term and one that scales with the size of the commonest.
 
 use crate::DocId;
+use crate::bitpack::{self, BLOCK};
 use crate::codec::{get_u32, get_uvarint, put_u32, put_uvarint, split_at};
 use crate::error::{Error, Result};
 
-/// How many document ids go into one block.
-///
-/// A larger block compresses slightly better and skips slightly worse. This size
-/// keeps a decoded block inside a typical L1 data cache, which matters more than
-/// either.
-pub const BLOCK_SIZE: usize = 128;
+/// How many document ids go into one packed block.
+pub const BLOCK_SIZE: usize = BLOCK;
 
 /// The size of one skip entry: the last id of a block and the byte offset of the
 /// block, both as fixed width little endian words.
@@ -30,16 +38,38 @@ pub const BLOCK_SIZE: usize = 128;
 const SKIP_ENTRY: usize = 8;
 
 /// Builds a posting list from ascending document ids.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Writer {
     blocks: Vec<u8>,
     /// The last id of each block, which is the skip table.
     skips: Vec<DocId>,
     /// The byte offset of each block inside `blocks`.
     offsets: Vec<u32>,
-    pending: Vec<DocId>,
+    /// The width each block was packed at, one byte each.
+    widths: Vec<u8>,
+    pending: [DocId; BLOCK],
+    filled: usize,
+    /// The last id written into a block, which is the base the next block counts
+    /// from and the base the tail counts from.
+    packed_last: DocId,
     last: Option<DocId>,
     count: u32,
+}
+
+impl Default for Writer {
+    fn default() -> Self {
+        Self {
+            blocks: Vec::new(),
+            skips: Vec::new(),
+            offsets: Vec::new(),
+            widths: Vec::new(),
+            pending: [0; BLOCK],
+            filled: 0,
+            packed_last: 0,
+            last: None,
+            count: 0,
+        }
+    }
 }
 
 impl Writer {
@@ -56,6 +86,12 @@ impl Writer {
     /// Returns [`Error::NotSorted`] if `id` is not strictly greater than the
     /// previous one. The whole format rests on the order, so this is checked
     /// rather than assumed.
+    ///
+    /// Returns [`Error::Overflow`] if the packed blocks have grown past what a
+    /// four byte offset can address, which is a list of roughly two hundred
+    /// million ids in one term. A list that long belongs in more than one
+    /// segment, and saying so is better than writing a skip table that points at
+    /// the wrong bytes.
     pub fn push(&mut self, id: DocId) -> Result<()> {
         if let Some(last) = self.last
             && id <= last
@@ -64,50 +100,54 @@ impl Writer {
         }
         self.last = Some(id);
         self.count += 1;
-        self.pending.push(id);
-        if self.pending.len() == BLOCK_SIZE {
-            self.flush_block();
+        self.pending[self.filled] = id;
+        self.filled += 1;
+        if self.filled == BLOCK {
+            self.flush_block()?;
         }
         Ok(())
     }
 
     /// Finishes the list and returns the encoded bytes.
     #[must_use]
-    pub fn finish(mut self) -> Vec<u8> {
-        if !self.pending.is_empty() {
-            self.flush_block();
+    pub fn finish(self) -> Vec<u8> {
+        // The leftover ids go out as varint gaps rather than as a short block,
+        // so a term that appears in three documents costs three bytes.
+        let mut tail = Vec::new();
+        let mut previous = self.packed_last;
+        for id in &self.pending[..self.filled] {
+            put_uvarint(&mut tail, u64::from(*id - previous));
+            previous = *id;
         }
 
-        let mut out = Vec::with_capacity(self.blocks.len() + self.skips.len() * 8 + 16);
+        let blocks = self.skips.len();
+        let mut out =
+            Vec::with_capacity(self.blocks.len() + blocks * (SKIP_ENTRY + 1) + tail.len() + 24);
         put_uvarint(&mut out, u64::from(self.count));
-        put_uvarint(&mut out, self.skips.len() as u64);
+        put_uvarint(&mut out, blocks as u64);
         for (skip, offset) in self.skips.iter().zip(self.offsets.iter()) {
             put_u32(&mut out, *skip);
             put_u32(&mut out, *offset);
         }
+        out.extend_from_slice(&self.widths);
         put_uvarint(&mut out, self.blocks.len() as u64);
         out.extend_from_slice(&self.blocks);
+        put_uvarint(&mut out, tail.len() as u64);
+        out.extend_from_slice(&tail);
         out
     }
 
-    fn flush_block(&mut self) {
-        let Some(&first) = self.pending.first() else {
-            return;
-        };
-        let offset = u32::try_from(self.blocks.len()).unwrap_or(u32::MAX);
+    fn flush_block(&mut self) -> Result<()> {
+        let offset = u32::try_from(self.blocks.len()).map_err(|_| Error::Overflow)?;
+        let width = bitpack::pack(&self.pending, self.packed_last, &mut self.blocks);
+
         self.offsets.push(offset);
-
-        // The first id of a block is absolute, so a block can be decoded on its
-        // own after a skip. Everything after it is a gap.
-        put_uvarint(&mut self.blocks, u64::from(first));
-        let mut previous = first;
-        for id in self.pending.iter().skip(1) {
-            put_uvarint(&mut self.blocks, u64::from(*id - previous));
-            previous = *id;
-        }
-
-        self.skips.push(previous);
-        self.pending.clear();
+        self.skips.push(self.pending[BLOCK - 1]);
+        // The width never exceeds thirty two, so the byte is the whole of it.
+        self.widths.push(u8::try_from(width).unwrap_or(u8::MAX));
+        self.packed_last = self.pending[BLOCK - 1];
+        self.filled = 0;
+        Ok(())
     }
 }
 
@@ -120,9 +160,11 @@ impl Writer {
 #[derive(Debug)]
 pub struct Reader<'a> {
     count: u32,
-    skip_count: usize,
+    block_count: usize,
     table: &'a [u8],
+    widths: &'a [u8],
     blocks: &'a [u8],
+    tail: &'a [u8],
 }
 
 impl<'a> Reader<'a> {
@@ -130,25 +172,33 @@ impl<'a> Reader<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Truncated`] if the input ends inside the header or the
-    /// skip table, and [`Error::Overflow`] if a length does not decode.
+    /// Returns [`Error::Truncated`] if the input ends inside the header, the
+    /// skip table, the widths, the blocks or the tail, and [`Error::Overflow`]
+    /// if a length does not decode.
     pub fn new(input: &'a [u8]) -> Result<Self> {
         let (count, rest) = get_uvarint(input)?;
-        let (skip_count, rest) = get_uvarint(rest)?;
+        let (block_count, rest) = get_uvarint(rest)?;
 
-        let skip_count = usize::try_from(skip_count).map_err(|_| Error::Overflow)?;
-        let table_len = skip_count.checked_mul(SKIP_ENTRY).ok_or(Error::Overflow)?;
+        let block_count = usize::try_from(block_count).map_err(|_| Error::Overflow)?;
+        let table_len = block_count.checked_mul(SKIP_ENTRY).ok_or(Error::Overflow)?;
         let (table, rest) = split_at(rest, table_len)?;
+        let (widths, rest) = split_at(rest, block_count)?;
 
         let (blocks_len, rest) = get_uvarint(rest)?;
         let blocks_len = usize::try_from(blocks_len).map_err(|_| Error::Overflow)?;
-        let (blocks, _) = split_at(rest, blocks_len)?;
+        let (blocks, rest) = split_at(rest, blocks_len)?;
+
+        let (tail_len, rest) = get_uvarint(rest)?;
+        let tail_len = usize::try_from(tail_len).map_err(|_| Error::Overflow)?;
+        let (tail, _) = split_at(rest, tail_len)?;
 
         Ok(Self {
             count: u32::try_from(count).map_err(|_| Error::Overflow)?,
-            skip_count,
+            block_count,
             table,
+            widths,
             blocks,
+            tail,
         })
     }
 
@@ -164,7 +214,7 @@ impl<'a> Reader<'a> {
     /// Returns the index of the first block whose last id is not below `target`,
     /// which is the only block that can hold it.
     fn seek(&self, target: DocId) -> Option<usize> {
-        let (mut low, mut high) = (0usize, self.skip_count);
+        let (mut low, mut high) = (0usize, self.block_count);
         while low < high {
             let middle = low + (high - low) / 2;
             let (last_id, _) = self.skip(middle)?;
@@ -174,7 +224,7 @@ impl<'a> Reader<'a> {
                 high = middle;
             }
         }
-        (low < self.skip_count).then_some(low)
+        (low < self.block_count).then_some(low)
     }
 
     /// Returns how many document ids the list holds.
@@ -197,9 +247,12 @@ impl<'a> Reader<'a> {
     /// past the end of the identifier space.
     pub fn to_vec(&self) -> Result<Vec<DocId>> {
         let mut out = Vec::with_capacity(self.count as usize);
-        for index in 0..self.skip_count {
-            self.decode_block(index, &mut out)?;
+        let mut block = [0u32; BLOCK];
+        for index in 0..self.block_count {
+            self.decode_block(index, &mut block)?;
+            out.extend_from_slice(&block);
         }
+        self.decode_tail(&mut out)?;
         Ok(out)
     }
 
@@ -211,45 +264,63 @@ impl<'a> Reader<'a> {
     pub fn contains(&self, target: DocId) -> Result<bool> {
         // The skip table holds the last id of each block and is ascending, so a
         // binary search over it finds the one block that could hold the target.
-        let Some(index) = self.seek(target) else {
-            return Ok(false);
-        };
-        let mut block = Vec::with_capacity(BLOCK_SIZE);
-        self.decode_block(index, &mut block)?;
-        Ok(block.binary_search(&target).is_ok())
+        if let Some(index) = self.seek(target) {
+            let mut block = [0u32; BLOCK];
+            self.decode_block(index, &mut block)?;
+            return Ok(block.binary_search(&target).is_ok());
+        }
+        // Past the last packed block, so it is in the leftovers or nowhere. The
+        // leftovers are shorter than one block by construction, which is why
+        // walking them is not worth a second index.
+        let mut rest = Vec::with_capacity(BLOCK);
+        self.decode_tail(&mut rest)?;
+        Ok(rest.binary_search(&target).is_ok())
     }
 
-    /// Decodes one block onto the end of `out`.
-    fn decode_block(&self, index: usize, out: &mut Vec<DocId>) -> Result<()> {
-        let Some((_, offset)) = self.skip(index) else {
-            return Ok(());
+    /// Decodes one packed block into `out`.
+    fn decode_block(&self, index: usize, out: &mut [DocId; BLOCK]) -> Result<()> {
+        let (_, offset) = self.skip(index).ok_or(Error::Truncated {
+            needed: index,
+            available: self.block_count,
+        })?;
+        let width = u32::from(*self.widths.get(index).ok_or(Error::Truncated {
+            needed: index,
+            available: self.widths.len(),
+        })?);
+        // The block before this one ends where this one starts counting from.
+        // Block zero counts from zero, which is what makes the first id absolute
+        // without storing it as one.
+        let base = if index == 0 {
+            0
+        } else {
+            self.skip(index - 1).map_or(0, |(last, _)| last)
         };
+
         let start = offset as usize;
-        let end = self
-            .skip(index + 1)
-            .map_or(self.blocks.len(), |(_, next)| next as usize);
+        let bytes = self.blocks.get(start..).ok_or(Error::Truncated {
+            needed: start,
+            available: self.blocks.len(),
+        })?;
+        bitpack::unpack(bytes, width, base, out)?;
+        Ok(())
+    }
 
-        let Some(mut block) = self.blocks.get(start..end.max(start)) else {
-            return Err(Error::Truncated {
-                needed: end,
-                available: self.blocks.len(),
-            });
+    /// Decodes the varint gaps after the last packed block onto the end of
+    /// `out`.
+    fn decode_tail(&self, out: &mut Vec<DocId>) -> Result<()> {
+        let mut current = if self.block_count == 0 {
+            0
+        } else {
+            self.skip(self.block_count - 1).map_or(0, |(last, _)| last)
         };
-        if block.is_empty() {
-            return Ok(());
-        }
 
-        let (first, rest) = get_uvarint(block)?;
-        let mut current = u32::try_from(first).map_err(|_| Error::Overflow)?;
-        out.push(current);
-        block = rest;
-
-        while !block.is_empty() {
-            let (gap, rest) = get_uvarint(block)?;
+        let mut rest = self.tail;
+        while !rest.is_empty() {
+            let (gap, tail) = get_uvarint(rest)?;
             let gap = u32::try_from(gap).map_err(|_| Error::Overflow)?;
             current = current.checked_add(gap).ok_or(Error::Overflow)?;
             out.push(current);
-            block = rest;
+            rest = tail;
         }
         Ok(())
     }
@@ -293,6 +364,21 @@ mod tests {
     }
 
     #[test]
+    fn round_trips_at_every_length_around_a_block_boundary() {
+        // A list one id short of a block, exactly a block, and one over, which
+        // is where the split between packed blocks and leftovers is decided.
+        for len in 0..BLOCK_SIZE * 2 + 3 {
+            let ids: Vec<DocId> = (0..len)
+                .map(|i| u32::try_from(i * 7).expect("fits"))
+                .collect();
+            let encoded = encode(&ids);
+            let reader = Reader::new(&encoded).expect("header");
+            assert_eq!(reader.len(), count(&ids), "len {len}");
+            assert_eq!(reader.to_vec().expect("decode"), ids, "len {len}");
+        }
+    }
+
+    #[test]
     fn an_empty_list_is_valid() {
         let encoded = encode(&[]);
         let reader = Reader::new(&encoded).expect("header");
@@ -311,6 +397,24 @@ mod tests {
             assert!(reader.contains(id).expect("lookup"), "missing {id}");
         }
         for id in [1u32, 4, 9_996, u32::MAX] {
+            assert!(!reader.contains(id).expect("lookup"), "found {id}");
+        }
+    }
+
+    #[test]
+    fn contains_reaches_the_leftovers_as_well_as_the_blocks() {
+        // Two full blocks and a few beyond, so that the answer for the last ids
+        // is in the varint tail rather than in any block.
+        let ids: Vec<DocId> = (0..BLOCK_SIZE * 2 + 5)
+            .map(|i| u32::try_from(i * 3 + 1).expect("fits"))
+            .collect();
+        let encoded = encode(&ids);
+        let reader = Reader::new(&encoded).expect("header");
+
+        for id in &ids {
+            assert!(reader.contains(*id).expect("lookup"), "missing {id}");
+        }
+        for id in [0u32, 2, ids[ids.len() - 1] + 1] {
             assert!(!reader.contains(id).expect("lookup"), "found {id}");
         }
     }
@@ -342,14 +446,24 @@ mod tests {
     }
 
     #[test]
-    fn a_dense_list_compresses_below_four_bytes_per_document() {
+    fn a_dense_list_costs_well_under_a_byte_an_id() {
         let ids: Vec<DocId> = (0..10_000u32).collect();
         let encoded = encode(&ids);
         let raw = ids.len() * size_of::<DocId>();
         assert!(
-            encoded.len() < raw / 2,
+            encoded.len() * 8 < raw,
             "encoded {} bytes for {raw} raw bytes",
             encoded.len()
         );
+    }
+
+    #[test]
+    fn a_sparse_term_does_not_pay_for_a_whole_block() {
+        // The shape most of a real vocabulary has: a term in three documents.
+        // Rounding it up to a packed block would cost sixteen bytes at the
+        // narrowest width, and there are more terms like this than any other
+        // kind.
+        let encoded = encode(&[4u32, 900, 90_000]);
+        assert!(encoded.len() < 12, "encoded {} bytes", encoded.len());
     }
 }
