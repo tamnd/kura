@@ -22,7 +22,7 @@ use kura_core::DocId;
 use kura_core::bitmap::Bitmap;
 use kura_core::codec::{get_uvarint, put_uvarint};
 use kura_core::posting::{Reader, Writer};
-use kura_core::segment::Segment;
+use kura_core::segment::{self, Segment};
 use kura_core::vector::{Quantised, cosine};
 
 /// How many times each measurement is repeated before the median is taken.
@@ -31,6 +31,15 @@ const ROUNDS: usize = 9;
 fn main() {
     println!("{:<44} {:>12} {:>14}", "case", "median", "per item");
 
+    let encoded = postings();
+    bitmaps();
+    varints();
+    segments(&encoded);
+    vectors();
+}
+
+/// Posting lists: how small they get and what encoding and decoding cost.
+fn postings() -> Vec<u8> {
     let ids: Vec<DocId> = (0..1_000_000u32).map(|i| i * 3).collect();
     let encoded = encode(&ids);
     println!(
@@ -54,6 +63,11 @@ fn main() {
         black_box(reader.contains(black_box(2_999_997)).expect("lookup"));
     });
 
+    encoded
+}
+
+/// The permission filter, which is a bitmap intersection and nothing else.
+fn bitmaps() {
     let dense: Bitmap = (0..1_000_000u32).collect();
     let every_third: Bitmap = (0..1_000_000u32).filter(|i| i % 3 == 0).collect();
     bench("intersect two dense bitmaps", 1_000_000, || {
@@ -72,7 +86,10 @@ fn main() {
             black_box(left.len());
         },
     );
+}
 
+/// The codec everything else is built out of.
+fn varints() {
     let values: Vec<u64> = (0..1_000_000u64).map(|i| i * 7).collect();
     bench("varint round trip", values.len(), || {
         let mut buffer = Vec::with_capacity(values.len() * 2);
@@ -86,32 +103,39 @@ fn main() {
             rest = tail;
         }
     });
+}
 
-    // The two numbers that decide whether checksumming on open is affordable.
-    // Opening is meant to be a walk of the section table and nothing else, so it
-    // should not move with the size of the segment, and verifying should move
-    // exactly linearly with it. If those two ever converge, the fast path has
-    // stopped being a fast path.
-    let mut segment = kura_core::segment::Writer::new();
-    segment
-        .add(kura_core::segment::kind::POSTINGS, encoded.clone())
+/// The two numbers that decide whether checksumming on open is affordable.
+///
+/// Opening is meant to be a walk of the section table and nothing else, so it
+/// should not move with the size of the segment, and verifying should move
+/// exactly linearly with it. If those two ever converge, the fast path has
+/// stopped being a fast path.
+fn segments(postings: &[u8]) {
+    let mut writer = segment::Writer::new();
+    writer
+        .add(segment::kind::POSTINGS, postings.to_vec())
         .expect("one of a kind");
-    segment
-        .add(kura_core::segment::kind::TERMS, vec![0x5a; 1 << 20])
+    writer
+        .add(segment::kind::TERMS, vec![0x5a; 1 << 20])
         .expect("one of a kind");
-    let segment = segment.finish();
-    println!("segment: {} bytes over 2 sections", segment.len());
+    let bytes = writer.finish();
+    println!("segment: {} bytes over 2 sections", bytes.len());
 
-    bench("open a segment, checksum verified", segment.len(), || {
-        let opened = Segment::open(black_box(&segment)).expect("open");
-        black_box(opened.section(kura_core::segment::kind::TERMS));
+    bench("open a segment, checksum verified", bytes.len(), || {
+        let opened = Segment::open(black_box(&bytes)).expect("open");
+        black_box(opened.section(segment::kind::TERMS));
     });
 
     bench("open a segment, checksum skipped", 1, || {
-        let opened = Segment::open_without_checksum(black_box(&segment)).expect("open");
-        black_box(opened.section(kura_core::segment::kind::TERMS));
+        let opened = Segment::open_without_checksum(black_box(&bytes)).expect("open");
+        black_box(opened.section(segment::kind::TERMS));
     });
+}
 
+/// Similarity, at full width and quantised, which is the memory for time trade
+/// the vector layer exists to make.
+fn vectors() {
     let query: Vec<f32> = (0..768).map(|i| ((i % 17) as f32 / 17.0) - 0.5).collect();
     let corpus: Vec<Vec<f32>> = (0..10_000)
         .map(|n| {
