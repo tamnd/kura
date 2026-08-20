@@ -101,6 +101,7 @@ Relative to the body means a writer can build the body before it knows where in 
 | 6 | columns | columnar values, for filters and facets |
 | 7 | graph | entities and edges |
 | 8 | tombstones | documents deleted by a later segment |
+| 9 | norms | how long each document is, and how long they are on average |
 
 A section may be absent, and an absent section is not the same as an empty one.
 A term dictionary with no terms is a fact about the segment.

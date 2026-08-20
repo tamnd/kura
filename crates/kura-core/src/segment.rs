@@ -84,6 +84,9 @@ pub mod kind {
     pub const GRAPH: u16 = 7;
     /// Documents deleted by a later segment.
     pub const TOMBSTONES: u16 = 8;
+    /// How long each document is, and how long they are on average, which is
+    /// what a ranking function divides by.
+    pub const NORMS: u16 = 9;
 }
 
 /// Builds a segment.

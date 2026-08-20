@@ -17,12 +17,15 @@
 //! goes and a growing vector in the middle of it is the usual reason a benchmark
 //! stops scaling.
 
+pub mod analysis;
 pub mod bitmap;
 pub mod bitpack;
 pub mod checksum;
 pub mod codec;
 pub mod error;
+pub mod index;
 pub mod posting;
+pub mod search;
 pub mod segment;
 pub mod terms;
 pub mod vector;
