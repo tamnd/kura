@@ -91,6 +91,9 @@ pub struct Writer {
     payload: Vec<u8>,
     /// The block being filled, uncompressed.
     block: Vec<u8>,
+    /// Somewhere to hold a record while the block it landed in is closed
+    /// behind it. See the end of [`Writer::push`].
+    spill: Vec<u8>,
     /// The first document in the block being filled.
     first: u32,
     compressor: lz::Compressor,
@@ -122,12 +125,6 @@ impl Writer {
     ) -> Result<DocId> {
         let doc =
             u32::try_from(self.offsets.len()).map_err(|_| Error::NotSorted { at: u32::MAX })?;
-        // The block is closed before the record goes in rather than after, so a
-        // large document lands in a block of its own instead of being appended
-        // to one that was nearly full.
-        if self.block.len() >= BLOCK {
-            self.flush()?;
-        }
         let start = u32::try_from(self.block.len()).map_err(|_| Error::Overflow)?;
         // The count goes in first and is not known yet, so a placeholder is
         // written and rewritten. It is one byte for anything under 128 fields,
@@ -152,7 +149,23 @@ impl Writer {
             let at = start as usize;
             self.block.splice(at..=at, header);
         }
-        self.offsets.push(start);
+
+        // A record that takes the block past its size goes into one of its own
+        // rather than staying where it landed. Otherwise a block is a block
+        // plus however long the last document happened to be, and a lookup
+        // pays to decompress a neighbour it was not asked for. On a corpus of
+        // source files, where a document is a few kilobytes, that was most of
+        // what a lookup cost.
+        let mut offset = start;
+        if start > 0 && self.block.len() > BLOCK {
+            self.spill.clear();
+            self.spill.extend_from_slice(&self.block[start as usize..]);
+            self.block.truncate(start as usize);
+            self.flush()?;
+            self.block.extend_from_slice(&self.spill);
+            offset = 0;
+        }
+        self.offsets.push(offset);
         Ok(doc)
     }
 
@@ -738,6 +751,29 @@ mod tests {
             bytes.len() < raw / 4,
             "{} bytes for {raw} bytes of text",
             bytes.len()
+        );
+    }
+
+    #[test]
+    fn no_block_holds_more_than_a_block_of_documents_that_fit_in_one() {
+        // The property the lookup cost rests on. A block that overshot by the
+        // length of whatever document closed it would be decompressed in full
+        // to read any one document in it.
+        let mut writer = Writer::new();
+        for i in 0..400 {
+            let body = "x".repeat(BLOCK / 3 + i % 97);
+            writer.push([("body", body.as_bytes())]).expect("fits");
+        }
+        let bytes = writer.finish().expect("fits");
+        let store = Reader::new(&bytes).expect("reads");
+        let mut widest = 0;
+        for at in 0..store.blocks() {
+            let (_, _, raw, _) = store.entry(at).expect("the directory is there");
+            widest = widest.max(raw);
+        }
+        assert!(
+            widest <= BLOCK,
+            "a block of {widest} bytes against a block size of {BLOCK}"
         );
     }
 
