@@ -137,6 +137,88 @@ impl<'a, 'b> Searcher<'a, 'b> {
         }
     }
 
+    /// The best `k` documents and how many there are in all, in one pass.
+    ///
+    /// Asking for both separately walks the lists twice, and the walk is most of
+    /// what a query costs. This walks them once. The total needs every document
+    /// looked at, so there is no pruning to give up, and what would have been
+    /// pruned is skipped anyway: a document is only scored when the terms on it
+    /// could between them beat the worst hit held so far, which is decided from
+    /// bounds that are already in hand rather than from frequencies that would
+    /// have to be decoded.
+    ///
+    /// A result page and a total is what a search box shows, so this is the call
+    /// most callers want.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a posting list in the index does not decode.
+    pub fn search_and_count(&self, query: &str, k: usize) -> Result<(Vec<Hit>, u64)> {
+        let words = analyse(query);
+        let terms: Vec<&[u8]> = words.iter().map(Vec::as_slice).collect();
+        self.search_and_count_terms(&terms, k)
+    }
+
+    /// The best `k` documents and how many there are in all, for terms that are
+    /// already analysed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a posting list in the index does not decode.
+    pub fn search_and_count_terms(&self, terms: &[&[u8]], k: usize) -> Result<(Vec<Hit>, u64)> {
+        if k == 0 {
+            return Ok((Vec::new(), self.count_terms(terms)?));
+        }
+        let mut lists = self.open(terms)?;
+        if lists.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+        if lists.len() == 1 {
+            // One term, and its total is in the header of its own list. Nothing
+            // has to be walked to know it, so the search can prune the way it
+            // does when no total was asked for.
+            let total = u64::from(lists[0].count);
+            return Ok((self.search_terms(terms, k)?, total));
+        }
+
+        let average = self.index.average_length().max(1.0);
+        let mut top = TopK::new(k);
+        let mut total = 0u64;
+        loop {
+            let Some(doc) = lists.iter().map(|list| list.doc).min() else {
+                break;
+            };
+            total += 1;
+
+            // What the terms sitting on this document could add up to at their
+            // best. This costs an addition per term and saves the frequency
+            // decode, the length lookup and the division that scoring would.
+            let ceiling: f32 = lists
+                .iter()
+                .filter(|list| list.doc == doc)
+                .map(|list| list.bound)
+                .sum();
+            if ceiling > top.threshold() {
+                let length = length_of(self.index, doc);
+                let norm = self.k1 * (1.0 - self.b + self.b * length / average);
+                let score: f32 = lists
+                    .iter()
+                    .filter(|list| list.doc == doc)
+                    .map(|list| list.score(self.k1, norm))
+                    .sum();
+                top.push(Hit { doc, score });
+            }
+
+            for list in &mut lists {
+                if list.doc == doc {
+                    list.advance()?;
+                }
+            }
+            lists.retain(Term::alive);
+        }
+        Ok((top.into_sorted(), total))
+    }
+
     /// Returns the best `k` documents for a set of terms that are already
     /// analysed.
     ///
@@ -319,11 +401,6 @@ impl Term<'_> {
     }
 }
 
-/// The first list whose cumulative bound could beat the threshold.
-///
-/// Everything before it is on a document that cannot win even if every one of
-/// those terms is at its best, so the only candidate worth looking at is where
-/// this one is.
 /// Runs a query through the analyser and returns its distinct terms in order.
 fn analyse(query: &str) -> Vec<Vec<u8>> {
     let mut analyzer = Analyzer::new();
@@ -334,6 +411,15 @@ fn analyse(query: &str) -> Vec<Vec<u8>> {
     words
 }
 
+/// The first list whose cumulative bound could beat the threshold.
+///
+/// Everything before it is on a document that cannot win even if every one of
+/// those terms is at its best, so the only candidate worth looking at is where
+/// this one is. The bounds here are the ones that hold everywhere in a list
+/// rather than the ones that hold in the block a cursor is in, because the lists
+/// before the pivot are on documents of their own and a block bound taken from
+/// where they are now says nothing about the candidate. The tighter bound is
+/// used once the cursors agree, which is where it is sound.
 fn pivot(lists: &[Term<'_>], threshold: f32) -> Option<usize> {
     let mut sum = 0.0;
     for (at, list) in lists.iter().enumerate() {
@@ -665,6 +751,46 @@ mod tests {
                 let want = k.min(slow.len());
                 assert_eq!(fast.len(), want, "{query} at k {k}");
                 same(&fast, &slow[..want]);
+            }
+        }
+    }
+
+    #[test]
+    fn one_pass_gives_the_page_and_the_total_that_two_passes_give() {
+        // The one pass is only worth having if it is the same answer, so this
+        // runs it against the two calls it replaces on a corpus with a term in
+        // every document, a term in a few, and every query shape in between.
+        let docs: Vec<String> = (0..5_000)
+            .map(|i| {
+                let mut text = format!("common word{} filler", i % 300);
+                if i % 61 == 0 {
+                    text.push_str(" rare rare");
+                }
+                if i % 907 == 0 {
+                    text.push_str(" rarer");
+                }
+                text
+            })
+            .collect();
+        let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+        let bytes = build(&refs);
+        let segment = Segment::open(&bytes).expect("opens");
+        let index = Reader::open(&segment).expect("opens");
+        let searcher = Searcher::new(&index);
+
+        for query in [
+            "rare",
+            "common",
+            "common rare",
+            "rarer rare common",
+            "word7 common",
+            "word7 aardvark",
+            "aardvark",
+        ] {
+            for k in [1, 10, 100] {
+                let (hits, total) = searcher.search_and_count(query, k).expect("searches");
+                same(&hits, &searcher.search(query, k).expect("searches"));
+                assert_eq!(total, searcher.count(query).expect("counts"), "{query}");
             }
         }
     }

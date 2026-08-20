@@ -132,11 +132,11 @@ impl Writer {
         self.sections.is_empty()
     }
 
-    /// Writes the segment out.
+    /// Writes the segment out into a vector.
     ///
-    /// The header is written last, over a reservation made at the start, so that
-    /// the checksum covers a body that is already complete rather than one that
-    /// is still being appended to.
+    /// [`Writer::write_to`] is the one to use when there is a file to write to,
+    /// because this holds the segment and the sections it was made of at the
+    /// same time.
     ///
     /// # Panics
     ///
@@ -145,30 +145,68 @@ impl Writer {
     /// the body and still passes its own checksum.
     #[must_use]
     pub fn finish(self) -> Vec<u8> {
-        let table_len = self.sections.len() * ENTRY_LEN;
-        let payload_len: usize = self.sections.iter().map(|(_, bytes)| bytes.len()).sum();
+        let mut out = Vec::with_capacity(self.size());
+        // Writing into a vector cannot fail, and a vector that cannot grow has
+        // already aborted rather than returned.
+        self.write_to(&mut out)
+            .expect("a vector always takes what it is given");
+        out
+    }
 
-        let mut out = Vec::with_capacity(HEADER_LEN + table_len + payload_len);
-        out.resize(HEADER_LEN, 0);
+    /// How many bytes the segment will be once it is written.
+    ///
+    /// It is not called `len` because [`Writer::is_empty`] answers a different
+    /// question, which is whether any section has been added at all. A segment
+    /// with nothing in it is still a header.
+    #[must_use]
+    pub fn size(&self) -> usize {
+        let payload: usize = self.sections.iter().map(|(_, bytes)| bytes.len()).sum();
+        HEADER_LEN + self.sections.len() * ENTRY_LEN + payload
+    }
+
+    /// Writes the segment to `out`.
+    ///
+    /// This is what a caller with somewhere to put it should use. A segment is
+    /// the largest thing this crate builds, and handing back a vector of it
+    /// means the sections and the copy of them exist at the same time, which on
+    /// a real corpus is a few hundred megabytes of resident memory spent to say
+    /// what is already said.
+    ///
+    /// The sections are hashed before they are written rather than as they are
+    /// written, because the checksum sits in the header and the header goes out
+    /// first. That is one more pass over memory that is already warm, against a
+    /// seek back over a file that may not be seekable.
+    ///
+    /// # Errors
+    ///
+    /// Whatever `out` returns.
+    ///
+    /// # Panics
+    ///
+    /// If the section count does not fit the header field, which [`Writer::add`]
+    /// makes impossible. The alternative is writing a header that disagrees with
+    /// the body and still passes its own checksum.
+    pub fn write_to(self, out: &mut impl std::io::Write) -> std::io::Result<()> {
+        let table_len = self.sections.len() * ENTRY_LEN;
 
         // The table has to be written before the payloads and needs the offsets
         // the payloads will land at, so walk them once to work the offsets out.
+        let mut table = Vec::with_capacity(table_len);
         let mut offset = table_len as u64;
         for (kind, payload) in &self.sections {
-            put_u16(&mut out, *kind);
-            put_u16(&mut out, 0); // flags
-            put_u32(&mut out, 0); // padding, keeps the entry eight byte aligned
-            put_u64(&mut out, offset);
-            put_u64(&mut out, payload.len() as u64);
+            put_u16(&mut table, *kind);
+            put_u16(&mut table, 0); // flags
+            put_u32(&mut table, 0); // padding, keeps the entry eight byte aligned
+            put_u64(&mut table, offset);
+            put_u64(&mut table, payload.len() as u64);
             offset += payload.len() as u64;
         }
-        for (_, payload) in &self.sections {
-            out.extend_from_slice(payload);
-        }
 
-        let body_len = out.len() - HEADER_LEN;
         let mut hasher = Crc32::new();
-        hasher.update(&out[HEADER_LEN..]);
+        hasher.update(&table);
+        for (_, payload) in &self.sections {
+            hasher.update(payload);
+        }
 
         // The count fits because add refuses to go past MAX_SECTIONS, which is
         // exactly the range of the field. Writing a wrong count here would give
@@ -181,11 +219,15 @@ impl Writer {
         put_u16(&mut header, FORMAT_VERSION);
         put_u16(&mut header, count);
         put_u32(&mut header, hasher.finish());
-        put_u64(&mut header, body_len as u64);
+        put_u64(&mut header, offset);
         header.resize(HEADER_LEN, 0); // the reserved tail
-        out[..HEADER_LEN].copy_from_slice(&header);
 
-        out
+        out.write_all(&header)?;
+        out.write_all(&table)?;
+        for (_, payload) in &self.sections {
+            out.write_all(payload)?;
+        }
+        Ok(())
     }
 }
 

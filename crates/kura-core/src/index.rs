@@ -180,6 +180,21 @@ impl Writer {
     /// happen if this module wrote one wrong, and [`Error::Overflow`] if the
     /// parts together hold more documents than a document identifier can name.
     pub fn concat(parts: Vec<Self>) -> Result<Vec<u8>> {
+        Ok(Self::build(parts)?.finish())
+    }
+
+    /// Folds the parts and hands back the segment before it is laid out.
+    ///
+    /// This is [`Writer::concat`] without the copy at the end. A caller with a
+    /// file to write into should use this and
+    /// [`SegmentWriter::write_to`](crate::segment::Writer::write_to), because on
+    /// a corpus of any size the vector `concat` returns is a few hundred
+    /// megabytes that exist only to be handed straight on.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Writer::concat`].
+    pub fn build(parts: Vec<Self>) -> Result<SegmentWriter> {
         // Where each part's documents start once they are all in one segment.
         let mut base = Vec::with_capacity(parts.len());
         let mut documents = 0u32;
@@ -270,7 +285,7 @@ impl Writer {
         if let (true, Some(store)) = (stored, store) {
             segment.add(kind::FIELDS, store.finish()?)?;
         }
-        Ok(segment.finish())
+        Ok(segment)
     }
 }
 
