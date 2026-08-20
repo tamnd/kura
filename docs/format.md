@@ -95,12 +95,13 @@ Relative to the body means a writer can build the body before it knows where in 
 | --- | --- | --- |
 | 1 | terms | the term dictionary, in prefix folded blocks, and where each term's postings start |
 | 2 | postings | posting lists, packed in fixed size blocks, with term frequencies in a stream beside them |
-| 3 | fields | stored field values, returned with a hit rather than searched |
+| 3 | fields | stored field values, returned with a hit rather than searched, with the names in a dictionary and one offset per document |
 | 4 | vectors | quantised vectors, one per passage |
 | 5 | acl | the access control lists governing the documents in this segment |
 | 6 | columns | columnar values, for filters and facets |
 | 7 | graph | entities and edges |
 | 8 | tombstones | documents deleted by a later segment |
+| 9 | norms | how long each document is, and how long they are on average |
 
 A section may be absent, and an absent section is not the same as an empty one.
 A term dictionary with no terms is a fact about the segment.

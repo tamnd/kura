@@ -17,13 +17,17 @@
 //! goes and a growing vector in the middle of it is the usual reason a benchmark
 //! stops scaling.
 
+pub mod analysis;
 pub mod bitmap;
 pub mod bitpack;
 pub mod checksum;
 pub mod codec;
 pub mod error;
+pub mod index;
 pub mod posting;
+pub mod search;
 pub mod segment;
+pub mod store;
 pub mod terms;
 pub mod vector;
 
@@ -35,6 +39,13 @@ pub use error::{Error, Result};
 /// keeps posting lists dense and delta encoding worthwhile. The mapping back to
 /// the caller's own identifier lives one layer up.
 pub type DocId = u32;
+
+/// The version of this crate.
+///
+/// A host that links the engine and reports what it is running needs this, and
+/// a version compiled in is the only one that cannot drift from the code beside
+/// it. It is not the format version, which moves for its own reasons.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The version of the on disk format this build reads and writes.
 ///

@@ -31,6 +31,15 @@ The crate holds the pieces the rest is built out of, and each one is tested and 
   Term frequencies ride alongside the ids in a second packed stream that a caller only pays for when it reads it, and each block carries the largest frequency in it so a scorer can skip a block whose best possible contribution cannot reach the current cutoff.
 - **Term dictionary.** Terms in order, in blocks of sixteen, with the shared prefix folded out and one index entry per block.
   A lookup binary searches the index and then walks a block, so it touches two cache lines rather than the whole vocabulary, and the folding makes the dictionary smaller than the terms it holds even though it also stores three numbers for each of them.
+- **Text analysis.** One tokeniser, used for documents and for queries, because two that differ by anything at all produce an index that cannot find the words in it.
+  It folds case, keeps an apostrophe that has a word on both sides of it, and splits Han and kana per character so that text without spaces is findable at all.
+- **An index writer.** Text in, a segment out, in one pass.
+  Each term's postings go straight into that term's own delta coded chain in an arena, so nothing is buffered or sorted per posting and the only sort at the end is over the vocabulary.
+- **Ranked search.** BM25 with block-max WAND.
+  The per block frequency ceilings the posting format stores let the scorer decide that a whole block of 128 documents cannot beat what it already has, and skip it without decoding a frequency.
+  A total is a separate call from a page, because a total cannot be pruned and most callers do not need one.
+- **Stored fields.** The values that come back with a hit, held beside the index rather than in it.
+  Field names go in a dictionary at the front and each value refers to its name by number, and the offset array narrows to four bytes per document when the payload fits, which for a corpus of short documents is most of what the section costs.
 - **Bitmaps.** A set of document ids that switches between a sorted list and a dense word array depending on how full it is, with intersection, union and difference.
   This is what a permission filter runs on.
 - **Vectors.** Cosine similarity, unit normalisation and eight bit quantisation with a per vector scale, which cuts the memory a corpus costs by four with a bounded error.

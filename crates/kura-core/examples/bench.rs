@@ -13,7 +13,11 @@
 
 // Every cast here feeds a printed number that is already approximate, so losing
 // a digit of precision on the way to a rate costs nothing.
-#![allow(clippy::cast_precision_loss)]
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};
@@ -22,7 +26,9 @@ use kura_core::DocId;
 use kura_core::bitmap::Bitmap;
 use kura_core::bitpack;
 use kura_core::codec::{get_uvarint, put_uvarint};
+use kura_core::index;
 use kura_core::posting::{Reader, Writer};
+use kura_core::search::Searcher;
 use kura_core::segment::{self, Segment};
 use kura_core::terms;
 use kura_core::vector::{Quantised, cosine, dot, normalise};
@@ -41,6 +47,7 @@ fn main() {
     );
 
     let encoded = postings();
+    engine();
     blocks();
     dictionary();
     bitmaps();
@@ -457,16 +464,22 @@ fn encode(ids: &[DocId]) -> Vec<u8> {
 /// costs on its own, and it is the one to compare against another build, because
 /// a change that made something slower should not be able to hide behind a busy
 /// afternoon.
-fn bench(name: &str, items: usize, mut f: impl FnMut()) {
-    let mut timings = Vec::with_capacity(ROUNDS);
-    for _ in 0..ROUNDS {
+fn bench(name: &str, items: usize, f: impl FnMut()) {
+    bench_rounds(name, ROUNDS, items, f);
+}
+
+/// The same, with a round count of the caller's choosing, for work that is too
+/// slow to repeat twenty five times.
+fn bench_rounds(name: &str, rounds: usize, items: usize, mut f: impl FnMut()) {
+    let mut timings = Vec::with_capacity(rounds);
+    for _ in 0..rounds {
         let start = Instant::now();
         f();
         timings.push(start.elapsed());
     }
     timings.sort_unstable();
     let best = timings[0];
-    let median = timings[ROUNDS / 2];
+    let median = timings[rounds / 2];
 
     let per_item = if items > 1 {
         format!("{:.2} ns", best.as_nanos() as f64 / items as f64)
@@ -489,4 +502,119 @@ fn format_duration(d: Duration) -> String {
     } else {
         format!("{:.1} ms", nanos as f64 / 1_000_000.0)
     }
+}
+
+/// The whole engine, end to end: text in, a segment out, and queries against it.
+///
+/// The two numbers this exists for are how fast text turns into an index and how
+/// long a query takes once it is one. Everything above measures a piece in
+/// isolation, which is useful for catching a regression and useless for knowing
+/// whether the thing works, because a query spends its time in the interaction
+/// between the dictionary, the skip table and the scorer rather than in any one
+/// of them.
+///
+/// The corpus is generated rather than real, and generated text is kinder than
+/// real text: the vocabulary is smaller and the term distribution is smoother.
+/// Read these as a floor for regressions rather than as a claim about a corpus.
+/// The numbers against real documents and against other engines live in the
+/// benchmark suite, which is a separate repository because it has to depend on
+/// the engines it compares against.
+fn engine() {
+    let corpus = corpus(50_000);
+    let raw: usize = corpus.iter().map(String::len).sum();
+    let mut size = 0;
+    bench_rounds("index fifty thousand documents", 3, corpus.len(), || {
+        let mut writer = index::Writer::new();
+        for text in &corpus {
+            writer.add(text).expect("fifty thousand documents fit");
+        }
+        let bytes = writer.finish().expect("what was written decodes");
+        size = bytes.len();
+        black_box(&bytes);
+    });
+
+    let mut writer = index::Writer::new();
+    for text in &corpus {
+        writer.add(text).expect("fifty thousand documents fit");
+    }
+    let bytes = writer.finish().expect("what was written decodes");
+    let segment = Segment::open(&bytes).expect("a segment this writer wrote opens");
+    let reader = index::Reader::open(&segment).expect("the sections are all there");
+    println!(
+        "index: {} documents, {:.1} MB of text in {:.1} MB, {:.2} of the input, {} terms",
+        corpus.len(),
+        raw as f64 / 1e6,
+        size as f64 / 1e6,
+        size as f64 / raw as f64,
+        reader.terms()
+    );
+
+    let searcher = Searcher::new(&reader);
+    // A query is only interesting if it has to choose. One term is a walk down
+    // one list, and three terms with one of them common is where the pruning
+    // either works or does not.
+    let words = vocabulary(4_000);
+    let one: Vec<&str> = words.iter().step_by(37).map(String::as_str).collect();
+    let two: Vec<String> = one
+        .chunks(2)
+        .filter(|pair| pair.len() == 2)
+        .map(|pair| format!("{} {}", pair[0], pair[1]))
+        .collect();
+    let three: Vec<String> = one
+        .chunks(2)
+        .filter(|pair| pair.len() == 2)
+        .map(|pair| format!("{} {} {}", pair[0], pair[1], words[0]))
+        .collect();
+
+    bench("query one term, top ten", one.len(), || {
+        for query in &one {
+            black_box(searcher.search(query, 10).expect("searches"));
+        }
+    });
+    bench("query two terms, top ten", two.len(), || {
+        for query in &two {
+            black_box(searcher.search(query, 10).expect("searches"));
+        }
+    });
+    bench("query three terms, top ten", three.len(), || {
+        for query in &three {
+            black_box(searcher.search(query, 10).expect("searches"));
+        }
+    });
+    bench("query three terms, top hundred", three.len(), || {
+        for query in &three {
+            black_box(searcher.search(query, 100).expect("searches"));
+        }
+    });
+}
+
+/// Documents made of words drawn from a heavy tailed distribution.
+///
+/// Uniform words would make every posting list the same length, and a query
+/// planner that skips has nothing to skip when every term is equally common.
+/// Drawing the rank log uniformly gets the shape real text has, where a handful
+/// of words are in nearly every document and most words are in almost none.
+fn corpus(count: usize) -> Vec<String> {
+    let words = vocabulary(30_000);
+    let mut state = 0x2545_f491_4f6c_dd1d_u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut out = Vec::with_capacity(count);
+    let mut text = String::with_capacity(8_192);
+    for _ in 0..count {
+        text.clear();
+        let length = 60 + (next() % 540) as usize;
+        for _ in 0..length {
+            let u = (next() >> 11) as f64 / (1_u64 << 53) as f64;
+            let rank = ((words.len() as f64).powf(u) - 1.0) as usize;
+            text.push_str(&words[rank.min(words.len() - 1)]);
+            text.push(' ');
+        }
+        out.push(text.clone());
+    }
+    out
 }

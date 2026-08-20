@@ -93,6 +93,14 @@ pub enum Error {
         /// How long the table said the section is.
         length: u64,
     },
+
+    /// A segment is missing a section that the thing being read out of it
+    /// cannot do without, which is a different fact from the segment being
+    /// short or corrupt: the file is intact and holds something else.
+    MissingSection {
+        /// The kind that was needed and is not there.
+        kind: u16,
+    },
 }
 
 impl fmt::Display for Error {
@@ -147,6 +155,9 @@ impl fmt::Display for Error {
                     "section kind {kind} claims bytes {offset}..{} which are not in the segment",
                     offset.saturating_add(*length)
                 )
+            }
+            Self::MissingSection { kind } => {
+                write!(f, "the segment has no section of kind {kind}")
             }
         }
     }
