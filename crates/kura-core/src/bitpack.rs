@@ -89,12 +89,32 @@ pub const fn packed_len(width: u32) -> usize {
 /// belongs at the edge where the ids come in rather than on the write path of
 /// every block.
 pub fn pack(values: &[u32; BLOCK], base: u32, out: &mut Vec<u8>) -> u32 {
-    let deltas = deltas(values, base);
-    // A block of a hundred and twenty eight values that are all the base cannot
-    // come out of an ascending list, so the zero width never arises. Spending a
-    // bit on it anyway is what lets every block in the format be decoded by the
-    // same path, with no special case for a width that means nothing.
-    let width = width_of(&deltas).max(1);
+    lay(&deltas(values, base), out)
+}
+
+/// Packs one block of values as they are, without differencing, and returns the
+/// width it used.
+///
+/// This is for the streams that run alongside a posting list and are not
+/// ascending: term frequencies, positions counts, anything where value `n` says
+/// nothing about value `n + 1`. Differencing those would make them bigger rather
+/// than smaller, and the running sum on the way back out would cost more than it
+/// saved.
+///
+/// Frequencies pack particularly well without any of that, because almost every
+/// term appears once in almost every document it appears in at all, so most
+/// blocks come out at one or two bits a value.
+pub fn pack_flat(values: &[u32; BLOCK], out: &mut Vec<u8>) -> u32 {
+    lay(values, out)
+}
+
+/// Writes one block at the smallest width its values fit in.
+fn lay(values: &[u32; BLOCK], out: &mut Vec<u8>) -> u32 {
+    // A block whose values are all zero is a real block for the flat form and
+    // cannot happen for the delta form, and spending a bit on it either way is
+    // what lets every block in the format be decoded by the same path, with no
+    // special case for a width that means nothing.
+    let width = width_of(values).max(1);
 
     // The widest a block can be is thirty two bits a value, which is 128 words.
     // Sizing for that keeps the write path free of an allocation as well.
@@ -105,7 +125,7 @@ pub fn pack(values: &[u32; BLOCK], base: u32, out: &mut Vec<u8>) -> u32 {
         let shift = u32::try_from(bit % 32).unwrap_or(0);
         let spills = shift + width > 32;
         for lane in 0..LANES {
-            let value = deltas[step * LANES + lane];
+            let value = values[step * LANES + lane];
             words[word * LANES + lane] |= value << shift;
             if spills {
                 words[(word + 1) * LANES + lane] |= value >> (32 - shift);
@@ -136,13 +156,35 @@ pub fn pack(values: &[u32; BLOCK], base: u32, out: &mut Vec<u8>) -> u32 {
 /// Returns [`Error::Overflow`] if `width` is above thirty two, and
 /// [`Error::Truncated`] if `input` holds fewer bytes than that width needs.
 pub fn unpack(input: &[u8], width: u32, base: u32, out: &mut [u32; BLOCK]) -> Result<usize> {
+    let read = unpack_flat(input, width, out)?;
+    // The lanes are independent all the way through the read above, and this is
+    // the only place they meet: four running sums side by side, each one a chain
+    // of thirty two adds rather than the one chain of a hundred and twenty eight
+    // that storing adjacent gaps would have cost.
+    let mut running = [base; LANES];
+    for step in 0..STEPS {
+        for lane in 0..LANES {
+            running[lane] = running[lane].wrapping_add(out[step * LANES + lane]);
+            out[step * LANES + lane] = running[lane];
+        }
+    }
+    Ok(read)
+}
+
+/// Unpacks one block written by [`pack_flat`], leaving the values as they are.
+///
+/// # Errors
+///
+/// Returns [`Error::Overflow`] if `width` is above thirty two, and
+/// [`Error::Truncated`] if `input` holds fewer bytes than that width needs.
+pub fn unpack_flat(input: &[u8], width: u32, out: &mut [u32; BLOCK]) -> Result<usize> {
     if width > MAX_WIDTH {
         return Err(Error::Overflow);
     }
     if width == 0 {
-        // Every value equal to the base. It cannot come out of an ascending
-        // list, so nothing here writes it, but a reader that met it and guessed
-        // would be the bug rather than the file.
+        // Nothing here writes a zero width, because the packer spends a bit on
+        // an all zero block rather than encode it as nothing. A reader that met
+        // one and guessed would be the bug rather than the file.
         return Err(Error::Overflow);
     }
 
@@ -159,7 +201,6 @@ pub fn unpack(input: &[u8], width: u32, base: u32, out: &mut [u32; BLOCK]) -> Re
     } else {
         (1u32 << width) - 1
     };
-    let mut running = [base; LANES];
 
     for step in 0..STEPS {
         let bit = step * width as usize;
@@ -167,17 +208,12 @@ pub fn unpack(input: &[u8], width: u32, base: u32, out: &mut [u32; BLOCK]) -> Re
         let shift = u32::try_from(bit % 32).unwrap_or(0);
         let spills = shift + width > 32;
 
-        let mut lanes = [0u32; LANES];
         for lane in 0..LANES {
             let mut value = u32::from_le_bytes(words[word * LANES + lane]) >> shift;
             if spills {
                 value |= u32::from_le_bytes(words[(word + 1) * LANES + lane]) << (32 - shift);
             }
-            lanes[lane] = value & mask;
-        }
-        for lane in 0..LANES {
-            running[lane] = running[lane].wrapping_add(lanes[lane]);
-            out[step * LANES + lane] = running[lane];
+            out[step * LANES + lane] = value & mask;
         }
     }
 
@@ -200,9 +236,9 @@ fn deltas(values: &[u32; BLOCK], base: u32) -> [u32; BLOCK] {
 }
 
 /// The smallest number of bits every value fits in.
-fn width_of(deltas: &[u32; BLOCK]) -> u32 {
+fn width_of(values: &[u32; BLOCK]) -> u32 {
     let mut all = 0u32;
-    for value in deltas {
+    for value in values {
         all |= *value;
     }
     MAX_WIDTH - all.leading_zeros()

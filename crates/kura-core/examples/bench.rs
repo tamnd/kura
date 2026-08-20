@@ -180,10 +180,58 @@ fn postings() -> Vec<u8> {
         black_box(reader.to_vec().expect("decode"));
     });
 
-    bench("membership test, one block decoded", 1, || {
+    // A thousand of them, spread across the list, rather than one. A single
+    // lookup on a cold cache is mostly a measurement of what the benchmark
+    // before it left in L2, and it moves by a factor of two between runs for
+    // that reason alone.
+    let probes: Vec<DocId> = (0..1_000u32).map(|i| i * 2_999).collect();
+    bench("membership tests, one block each", probes.len(), || {
         let reader = Reader::new(&encoded).expect("header");
-        black_box(reader.contains(black_box(2_999_997)).expect("lookup"));
+        let mut found = 0usize;
+        for probe in &probes {
+            if reader.contains(black_box(*probe)).expect("lookup") {
+                found += 1;
+            }
+        }
+        black_box(found);
     });
+
+    // What a scorer actually does: walk the list a posting at a time, reading
+    // the frequency of each. It costs more than `to_vec` because it decodes both
+    // streams and hands the values out one at a time rather than in blocks.
+    bench(
+        "walk a million postings with frequencies",
+        ids.len(),
+        || {
+            let reader = Reader::new(&encoded).expect("header");
+            let mut cursor = reader.cursor();
+            let mut total = 0u64;
+            while let Some(doc) = cursor.advance().expect("decode") {
+                total += u64::from(doc) + u64::from(cursor.frequency());
+            }
+            black_box(total);
+        },
+    );
+
+    // What an intersection does: a cursor on the long list, driven by ids from
+    // a short one, jumping blocks rather than walking them. A thousand seeks
+    // spread over a million postings, so almost every one crosses blocks.
+    let targets: Vec<DocId> = (0..1_000u32).map(|i| i * 2_999).collect();
+    bench(
+        "seek a thousand times into a million",
+        targets.len(),
+        || {
+            let reader = Reader::new(&encoded).expect("header");
+            let mut cursor = reader.cursor();
+            let mut found = 0u64;
+            for target in &targets {
+                if let Some(doc) = cursor.seek(black_box(*target)).expect("decode") {
+                    found += u64::from(doc);
+                }
+            }
+            black_box(found);
+        },
+    );
 
     encoded
 }
@@ -394,7 +442,7 @@ fn vectors() {
 fn encode(ids: &[DocId]) -> Vec<u8> {
     let mut writer = Writer::new();
     for id in ids {
-        writer.push(*id).expect("ascending input");
+        writer.push(*id, 1).expect("ascending input");
     }
     writer.finish()
 }
