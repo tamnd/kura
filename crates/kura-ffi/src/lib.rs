@@ -60,7 +60,7 @@ pub const KURA_ERR_PANIC: i32 = 10;
 /// It changes whenever a signature, a status code or a struct layout changes. A
 /// host that links a prebuilt library should compare it against the value its
 /// header was generated from before calling anything else.
-pub const KURA_ABI_VERSION: u32 = 1;
+pub const KURA_ABI_VERSION: u32 = 2;
 
 /// A block of bytes the engine allocated.
 ///
@@ -387,17 +387,23 @@ pub unsafe extern "C" fn kura_bitmap_to_array(
 
 /// Encodes ascending document ids into a compressed posting list.
 ///
+/// `frequencies` says how often the term occurs in each document and may be
+/// null, which means once in each. A caller building a plain set of documents
+/// rather than a scored index wants null and should not have to allocate an
+/// array of ones to say so.
+///
 /// On success `out` receives a buffer that has to go back to
 /// [`kura_buffer_free`]. On failure it receives an empty buffer, which is safe
 /// to free.
 ///
 /// # Safety
 ///
-/// `ids` must be readable for `len` ids, and `out` must point at a writable
-/// [`KuraBuffer`].
+/// `ids` must be readable for `len` ids, `frequencies` must be null or readable
+/// for `len` values, and `out` must point at a writable [`KuraBuffer`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kura_postings_encode(
     ids: *const u32,
+    frequencies: *const u32,
     len: usize,
     out: *mut KuraBuffer,
 ) -> i32 {
@@ -412,10 +418,18 @@ pub unsafe extern "C" fn kura_postings_encode(
         // SAFETY: ids is non null whenever len is above zero, and the contract
         // says it is readable for that many ids.
         let ids = unsafe { as_slice(ids, len) };
+        let freqs = if frequencies.is_null() {
+            None
+        } else {
+            // SAFETY: frequencies is non null here, and the contract says it is
+            // readable for the same count as ids.
+            Some(unsafe { as_slice(frequencies, len) })
+        };
 
         let mut writer = Writer::new();
-        for id in ids {
-            if let Err(err) = writer.push(*id) {
+        for (i, id) in ids.iter().enumerate() {
+            let frequency = freqs.map_or(1, |values| values[i]);
+            if let Err(err) = writer.push(*id, frequency) {
                 return status_of(&err);
             }
         }
@@ -750,12 +764,65 @@ mod tests {
     }
 
     #[test]
+    fn frequencies_cross_the_boundary_when_they_are_given() {
+        // Null means once in each, and a real array means what it says. Both go
+        // through the same entry point, so the only way to know the pointer is
+        // being read is to encode the same ids twice and look.
+        let ids: Vec<u32> = (0..500u32).map(|i| i * 3).collect();
+        let freqs: Vec<u32> = (0..500u32).map(|i| (i % 9) + 1).collect();
+
+        let mut plain = KuraBuffer::empty();
+        let mut scored = KuraBuffer::empty();
+        // SAFETY: the pointers are to live local values.
+        unsafe {
+            assert_eq!(
+                kura_postings_encode(ids.as_ptr(), core::ptr::null(), ids.len(), &raw mut plain),
+                KURA_OK
+            );
+            assert_eq!(
+                kura_postings_encode(ids.as_ptr(), freqs.as_ptr(), ids.len(), &raw mut scored),
+                KURA_OK
+            );
+        }
+
+        // SAFETY: both buffers came from a successful encode.
+        let plain_bytes = unsafe { slice::from_raw_parts(plain.data, plain.len) };
+        // SAFETY: as above.
+        let scored_bytes = unsafe { slice::from_raw_parts(scored.data, scored.len) };
+
+        let want: Vec<(u32, u32)> = ids.iter().copied().zip(freqs.iter().copied()).collect();
+        let ones: Vec<(u32, u32)> = ids.iter().map(|id| (*id, 1)).collect();
+        assert_eq!(
+            Reader::new(scored_bytes)
+                .expect("header")
+                .to_postings()
+                .expect("decode"),
+            want
+        );
+        assert_eq!(
+            Reader::new(plain_bytes)
+                .expect("header")
+                .to_postings()
+                .expect("decode"),
+            ones
+        );
+
+        // SAFETY: both buffers came from the engine and are freed once.
+        unsafe {
+            kura_buffer_free(plain);
+            kura_buffer_free(scored);
+        }
+    }
+
+    #[test]
     fn postings_round_trip_through_the_boundary() {
         let ids: Vec<u32> = (0..1_000u32).map(|i| i * 7).collect();
 
         let mut buffer = KuraBuffer::empty();
         // SAFETY: the pointers are to live local values.
-        let status = unsafe { kura_postings_encode(ids.as_ptr(), ids.len(), &raw mut buffer) };
+        let status = unsafe {
+            kura_postings_encode(ids.as_ptr(), core::ptr::null(), ids.len(), &raw mut buffer)
+        };
         assert_eq!(status, KURA_OK);
         assert!(!buffer.data.is_null());
 
@@ -801,7 +868,9 @@ mod tests {
         let ids: Vec<u32> = (0..300u32).collect();
         let mut buffer = KuraBuffer::empty();
         // SAFETY: the pointers are to live local values.
-        let status = unsafe { kura_postings_encode(ids.as_ptr(), ids.len(), &raw mut buffer) };
+        let status = unsafe {
+            kura_postings_encode(ids.as_ptr(), core::ptr::null(), ids.len(), &raw mut buffer)
+        };
         assert_eq!(status, KURA_OK);
 
         let mut written = 0usize;
@@ -827,7 +896,9 @@ mod tests {
         let ids = [5u32, 4];
         let mut buffer = KuraBuffer::empty();
         // SAFETY: the pointers are to live local values.
-        let status = unsafe { kura_postings_encode(ids.as_ptr(), ids.len(), &raw mut buffer) };
+        let status = unsafe {
+            kura_postings_encode(ids.as_ptr(), core::ptr::null(), ids.len(), &raw mut buffer)
+        };
         assert_eq!(status, KURA_ERR_NOT_SORTED);
         assert!(buffer.data.is_null());
 
@@ -850,7 +921,12 @@ mod tests {
         // SAFETY: passing null is the case under test.
         unsafe {
             assert_eq!(
-                kura_postings_encode(core::ptr::null(), 3, core::ptr::null_mut()),
+                kura_postings_encode(
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    3,
+                    core::ptr::null_mut()
+                ),
                 KURA_ERR_NULL
             );
             assert_eq!(

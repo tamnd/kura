@@ -34,7 +34,7 @@ extern "C" {
 #endif
 
 /* The version of this ABI. Compare against kura_abi_version() at startup. */
-#define KURA_ABI_VERSION 1u
+#define KURA_ABI_VERSION 2u
 
 /* Status codes. */
 #define KURA_OK 0
@@ -81,13 +81,16 @@ int32_t kura_bitmap_to_array(const KuraBitmap *bitmap, uint32_t *out, size_t cap
 /*
  * Posting lists.
  *
- * kura_postings_encode takes ascending ids and returns compressed bytes.
+ * kura_postings_encode takes ascending ids and returns compressed bytes. The
+ * frequencies say how often the term occurs in each document and may be null,
+ * which means once in each, so a caller building a plain set of documents does
+ * not have to allocate an array of ones to say so.
  * kura_postings_len reads the count out of the header, which is what a caller
  * sizes its buffer from before calling kura_postings_decode.
  * kura_postings_contains answers a membership question by decoding one block,
  * so a host never has to pull a large list across the boundary to ask it.
  */
-int32_t kura_postings_encode(const uint32_t *ids, size_t len, KuraBuffer *out);
+int32_t kura_postings_encode(const uint32_t *ids, const uint32_t *frequencies, size_t len, KuraBuffer *out);
 int32_t kura_postings_len(const uint8_t *data, size_t len, size_t *out);
 int32_t kura_postings_decode(const uint8_t *data, size_t len, uint32_t *out, size_t cap, size_t *out_len);
 int32_t kura_postings_contains(const uint8_t *data, size_t len, uint32_t id, int32_t *out);

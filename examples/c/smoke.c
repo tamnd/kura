@@ -40,7 +40,7 @@ static void postings(void) {
   }
 
   KuraBuffer encoded = {NULL, 0, 0};
-  check_status(kura_postings_encode(ids, COUNT, &encoded), "encode a posting list");
+  check_status(kura_postings_encode(ids, NULL, COUNT, &encoded), "encode a posting list");
   check(encoded.len < sizeof(ids) / 2, "the encoded list is smaller than the raw ids");
 
   size_t count = 0;
