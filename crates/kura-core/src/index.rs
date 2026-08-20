@@ -701,7 +701,9 @@ mod tests {
 
         let mut whole = Writer::new();
         for text in &docs {
-            whole.add_with_fields(text, [("n", text.as_bytes())]).expect("adds");
+            whole
+                .add_with_fields(text, [("n", text.as_bytes())])
+                .expect("adds");
         }
         let one = whole.finish().expect("finishes");
 
@@ -709,7 +711,8 @@ mod tests {
         for slice in docs.chunks(97) {
             let mut part = Writer::new();
             for text in slice {
-                part.add_with_fields(text, [("n", text.as_bytes())]).expect("adds");
+                part.add_with_fields(text, [("n", text.as_bytes())])
+                    .expect("adds");
             }
             parts.push(part);
         }
@@ -734,7 +737,11 @@ mod tests {
             assert_eq!(left.length(doc), right.length(doc));
             let store = right.store().expect("the fields were stored");
             assert_eq!(
-                store.get(doc, &mut scratch).expect("reads").field("n").expect("decodes"),
+                store
+                    .get(doc, &mut scratch)
+                    .expect("reads")
+                    .field("n")
+                    .expect("decodes"),
                 Some(docs[doc as usize].as_bytes()),
                 "document {doc}"
             );
