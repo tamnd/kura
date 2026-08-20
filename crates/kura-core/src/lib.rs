@@ -24,6 +24,7 @@ pub mod codec;
 pub mod error;
 pub mod posting;
 pub mod segment;
+pub mod terms;
 pub mod vector;
 
 pub use error::{Error, Result};

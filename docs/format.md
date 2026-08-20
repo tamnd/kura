@@ -93,7 +93,7 @@ Relative to the body means a writer can build the body before it knows where in 
 
 | Kind | Name | What it holds |
 | --- | --- | --- |
-| 1 | terms | the term dictionary, and where each term's postings start |
+| 1 | terms | the term dictionary, in prefix folded blocks, and where each term's postings start |
 | 2 | postings | posting lists, packed in fixed size blocks |
 | 3 | fields | stored field values, returned with a hit rather than searched |
 | 4 | vectors | quantised vectors, one per passage |

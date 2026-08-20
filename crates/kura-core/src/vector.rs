@@ -115,7 +115,60 @@ impl Quantised {
     }
 }
 
+/// How many partial sums a floating point reduction keeps.
+///
+/// Floating point addition is not associative, so a compiler is not allowed to
+/// split one running total into independent parts, and one running total is a
+/// chain where every add waits on the one before it. At four cycles an add that
+/// is what the loop costs, however many multiplies the machine could have been
+/// doing at the same time. Writing the parts out is what makes them independent,
+/// and eight of them is enough to fill the vector units on every target this
+/// builds for.
+///
+/// This is written here rather than turned on with a compiler flag because it
+/// changes the answer in the last bit or two against a strictly left to right
+/// sum. A flag would change it differently on different targets. A constant
+/// changes it the same way everywhere, which is what a score that has to be
+/// reproducible needs.
+const LANES: usize = 8;
+
+/// Returns the dot product of two vectors.
+///
+/// This is the fast path, and the reason [`normalise`] exists. On vectors that
+/// are already unit length the dot product is the cosine similarity, so a search
+/// that normalises once on the way in does a third of the arithmetic per
+/// candidate and none of the square roots.
+///
+/// # Errors
+///
+/// Returns [`Error::DimensionMismatch`] if the lengths differ.
+pub fn dot(a: &[f32], b: &[f32]) -> Result<f32> {
+    if a.len() != b.len() {
+        return Err(Error::DimensionMismatch {
+            left: a.len(),
+            right: b.len(),
+        });
+    }
+
+    let mut sums = [0.0f32; LANES];
+    let (a_blocks, a_tail) = a.as_chunks::<LANES>();
+    let (b_blocks, b_tail) = b.as_chunks::<LANES>();
+    for (x, y) in a_blocks.iter().zip(b_blocks) {
+        for lane in 0..LANES {
+            sums[lane] += x[lane] * y[lane];
+        }
+    }
+    for (lane, (x, y)) in a_tail.iter().zip(b_tail).enumerate() {
+        sums[lane] += x * y;
+    }
+    Ok(reduce(sums))
+}
+
 /// Returns the cosine similarity of two vectors, in the range -1 to 1.
+///
+/// It reads both vectors once and does three multiplies per dimension where
+/// [`dot`] does one. Prefer normalising on the way in and calling [`dot`], and
+/// keep this for the case where the caller does not own the vectors and cannot.
 ///
 /// # Errors
 ///
@@ -128,23 +181,44 @@ pub fn cosine(a: &[f32], b: &[f32]) -> Result<f32> {
         });
     }
 
-    let mut dot = 0.0f32;
-    let mut norm_a = 0.0f32;
-    let mut norm_b = 0.0f32;
-    for (x, y) in a.iter().zip(b.iter()) {
-        dot += x * y;
-        norm_a += x * x;
-        norm_b += y * y;
+    let mut dots = [0.0f32; LANES];
+    let mut norms_a = [0.0f32; LANES];
+    let mut norms_b = [0.0f32; LANES];
+    let (a_blocks, a_tail) = a.as_chunks::<LANES>();
+    let (b_blocks, b_tail) = b.as_chunks::<LANES>();
+    for (x, y) in a_blocks.iter().zip(b_blocks) {
+        for lane in 0..LANES {
+            dots[lane] += x[lane] * y[lane];
+            norms_a[lane] += x[lane] * x[lane];
+            norms_b[lane] += y[lane] * y[lane];
+        }
+    }
+    for (lane, (x, y)) in a_tail.iter().zip(b_tail).enumerate() {
+        dots[lane] += x * y;
+        norms_a[lane] += x * x;
+        norms_b[lane] += y * y;
     }
 
-    let denominator = norm_a.sqrt() * norm_b.sqrt();
+    let denominator = reduce(norms_a).sqrt() * reduce(norms_b).sqrt();
     if denominator == 0.0 {
         // A zero vector has no direction, so it is not similar to anything. The
         // alternative, returning a division by zero, poisons every ranking it
         // touches.
         return Ok(0.0);
     }
-    Ok((dot / denominator).clamp(-1.0, 1.0))
+    Ok((reduce(dots) / denominator).clamp(-1.0, 1.0))
+}
+
+/// Adds the partial sums up, pairwise, so the order is fixed and shallow.
+fn reduce(mut sums: [f32; LANES]) -> f32 {
+    let mut width = LANES / 2;
+    while width > 0 {
+        for lane in 0..width {
+            sums[lane] += sums[lane + width];
+        }
+        width /= 2;
+    }
+    sums[0]
 }
 
 /// Scales a vector to unit length in place.
@@ -168,11 +242,57 @@ mod tests {
     // value, such as the zero a degenerate vector has to produce. Everywhere the
     // result is arithmetic, they go through `approx`.
     #![allow(clippy::float_cmp)]
+    // The vectors below are built out of loop counters, and a counter that fits
+    // in three digits converts to a float exactly.
+    #![allow(clippy::cast_precision_loss)]
 
     use super::*;
 
     fn approx(a: f32, b: f32, tolerance: f32) -> bool {
         (a - b).abs() <= tolerance
+    }
+
+    #[test]
+    fn the_dot_product_matches_a_plain_sum_at_every_length() {
+        // Every length from nothing to past two full blocks, because the lanes
+        // and the leftovers are two different pieces of arithmetic and the seam
+        // between them is where an off by one hides.
+        for len in 0..LANES * 2 + 3 {
+            let a: Vec<f32> = (0..len).map(|i| (i as f32) * 0.25 - 1.0).collect();
+            let b: Vec<f32> = (0..len).map(|i| 2.0 - (i as f32) * 0.125).collect();
+            let want: f32 = a.iter().zip(&b).map(|(x, y)| x * y).sum();
+            let got = dot(&a, &b).expect("same length");
+            assert!(
+                approx(got, want, want.abs() * 1e-5 + 1e-5),
+                "length {len}: {got} against {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_normalised_dot_product_is_the_cosine() {
+        // This is the whole reason the fast path exists, so it is checked rather
+        // than assumed.
+        let mut a: Vec<f32> = (0..768).map(|i| ((i % 17) as f32) - 8.0).collect();
+        let mut b: Vec<f32> = (0..768).map(|i| 4.0 - ((i % 23) as f32)).collect();
+        let want = cosine(&a, &b).expect("same length");
+        normalise(&mut a);
+        normalise(&mut b);
+        let got = dot(&a, &b).expect("same length");
+        assert!(approx(got, want, 1e-5), "{got} against {want}");
+    }
+
+    #[test]
+    fn different_lengths_are_refused_by_the_dot_product() {
+        assert_eq!(
+            dot(&[1.0, 2.0], &[1.0]),
+            Err(Error::DimensionMismatch { left: 2, right: 1 })
+        );
+    }
+
+    #[test]
+    fn the_dot_product_of_nothing_is_zero() {
+        assert_eq!(dot(&[], &[]).expect("same length"), 0.0);
     }
 
     #[test]

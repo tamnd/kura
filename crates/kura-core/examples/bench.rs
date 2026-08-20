@@ -24,7 +24,8 @@ use kura_core::bitpack;
 use kura_core::codec::{get_uvarint, put_uvarint};
 use kura_core::posting::{Reader, Writer};
 use kura_core::segment::{self, Segment};
-use kura_core::vector::{Quantised, cosine};
+use kura_core::terms;
+use kura_core::vector::{Quantised, cosine, dot, normalise};
 
 /// How many times each measurement is repeated.
 ///
@@ -41,10 +42,122 @@ fn main() {
 
     let encoded = postings();
     blocks();
+    dictionary();
     bitmaps();
     varints();
     segments(&encoded);
     vectors();
+}
+
+/// The term dictionary, which every query walks once per term before it reads a
+/// single posting.
+///
+/// Two numbers matter. How many bytes a term costs, because the dictionary is
+/// the part of a segment that a query touches all of and so the part that wants
+/// to be resident. And what a lookup costs, including the misses, which is why
+/// the lookups below are spread across the vocabulary rather than hammering one
+/// term that would sit in cache after the first round.
+fn dictionary() {
+    let words = vocabulary(200_000);
+    let mut writer = terms::Writer::new();
+    let mut offset = 0u64;
+    for (i, word) in words.iter().enumerate() {
+        let len = (i as u64 % 64) + 8;
+        writer
+            .push(
+                word.as_bytes(),
+                terms::Entry {
+                    docs: u32::try_from(i % 5_000).expect("under five thousand") + 1,
+                    offset,
+                    len,
+                },
+            )
+            .expect("ascending input");
+        offset += len;
+    }
+    let encoded = writer.finish();
+    let raw: usize = words.iter().map(String::len).sum();
+    println!(
+        "term dictionary: {} terms in {} bytes, {:.2} bytes per term, {:.2} raw",
+        words.len(),
+        encoded.len(),
+        encoded.len() as f64 / words.len() as f64,
+        raw as f64 / words.len() as f64
+    );
+
+    // Every sixteenth term, so the walk lands in a different block each time and
+    // the run covers the whole dictionary rather than one warm corner of it.
+    let probes: Vec<&str> = words.iter().step_by(16).map(String::as_str).collect();
+    let reader = terms::Reader::new(&encoded).expect("header");
+    bench("look up terms across the dictionary", probes.len(), || {
+        let mut found = 0usize;
+        for probe in &probes {
+            if reader
+                .get(black_box(probe.as_bytes()))
+                .expect("lookup")
+                .is_some()
+            {
+                found += 1;
+            }
+        }
+        black_box(found);
+    });
+
+    let absent: Vec<String> = probes.iter().map(|p| format!("{p}x")).collect();
+    bench("look up terms that are not there", absent.len(), || {
+        let mut found = 0usize;
+        for probe in &absent {
+            if reader
+                .get(black_box(probe.as_bytes()))
+                .expect("lookup")
+                .is_some()
+            {
+                found += 1;
+            }
+        }
+        black_box(found);
+    });
+}
+
+/// A vocabulary shaped like a real one: a few thousand stems, each carried
+/// through a set of endings, so consecutive terms share a long prefix the way
+/// "configure", "configured" and "configuration" do.
+fn vocabulary(count: usize) -> Vec<String> {
+    const STEMS: [&str; 16] = [
+        "config",
+        "index",
+        "search",
+        "storage",
+        "document",
+        "cluster",
+        "process",
+        "connect",
+        "transact",
+        "compress",
+        "distribute",
+        "authent",
+        "replicat",
+        "aggregat",
+        "normalis",
+        "serialis",
+    ];
+    const ENDINGS: [&str; 8] = ["", "ed", "es", "ing", "ion", "or", "able", "ility"];
+
+    let mut out = Vec::with_capacity(count);
+    let mut n = 0usize;
+    while out.len() < count {
+        for stem in STEMS {
+            for ending in ENDINGS {
+                if out.len() == count {
+                    break;
+                }
+                out.push(format!("{stem}{ending}{n:05}"));
+            }
+        }
+        n += 1;
+    }
+    out.sort();
+    out
 }
 
 /// Posting lists: how small they get and what encoding and decoding cost.
@@ -232,6 +345,31 @@ fn vectors() {
         }
         black_box(best);
     });
+
+    let mut unit_query = query.clone();
+    normalise(&mut unit_query);
+    let unit: Vec<Vec<f32>> = corpus
+        .iter()
+        .map(|v| {
+            let mut v = v.clone();
+            normalise(&mut v);
+            v
+        })
+        .collect();
+    bench(
+        "dot over ten thousand normalised f32 vectors",
+        unit.len(),
+        || {
+            let mut best = f32::MIN;
+            for candidate in &unit {
+                let score = dot(black_box(&unit_query), candidate).expect("same length");
+                if score > best {
+                    best = score;
+                }
+            }
+            black_box(best);
+        },
+    );
 
     let quantised_query = Quantised::from_f32(&query);
     let quantised: Vec<Quantised> = corpus.iter().map(|v| Quantised::from_f32(v)).collect();

@@ -53,11 +53,21 @@ pub enum Error {
         right: usize,
     },
 
-    /// A posting list was not in ascending order, which every decoder and every
-    /// intersection in this crate relies on.
+    /// Input that has to be ascending was not, which every decoder, every
+    /// intersection and every binary search in this crate relies on.
     NotSorted {
-        /// The value that broke the order.
+        /// Where the order broke, as a value for a posting list and as a
+        /// position for anything the caller pushes in sequence.
         at: u32,
+    },
+
+    /// A term claimed to share more of the term before it than that term has,
+    /// so the block it is in cannot be reconstructed.
+    BadPrefix {
+        /// How many bytes the entry said it shares.
+        shared: usize,
+        /// How many bytes the term before it has.
+        available: usize,
     },
 
     /// Two sections of a segment claimed the same kind, so a reader asking for
@@ -111,7 +121,13 @@ impl fmt::Display for Error {
             Self::DimensionMismatch { left, right } => {
                 write!(f, "vectors of different lengths: {left} and {right}")
             }
-            Self::NotSorted { at } => write!(f, "posting list is not ascending at {at}"),
+            Self::NotSorted { at } => write!(f, "input is not ascending at {at}"),
+            Self::BadPrefix { shared, available } => {
+                write!(
+                    f,
+                    "term shares {shared} bytes with a term that is only {available} long"
+                )
+            }
             Self::DuplicateSection { kind } => {
                 write!(f, "section kind {kind} appears more than once")
             }
