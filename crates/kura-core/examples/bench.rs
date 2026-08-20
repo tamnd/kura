@@ -669,6 +669,21 @@ fn engine() {
             black_box(searcher.search(query, 100).expect("searches"));
         }
     });
+
+    // What a search box actually asks for, which is a page and a count of what
+    // it is a page of. The two calls are what the one replaces, so they are
+    // here beside it rather than in a note.
+    bench("page and total, one walk", three.len(), || {
+        for query in &three {
+            black_box(searcher.search_and_count(query, 10).expect("searches"));
+        }
+    });
+    bench("page and total, two walks", three.len(), || {
+        for query in &three {
+            black_box(searcher.count(query).expect("counts"));
+            black_box(searcher.search(query, 10).expect("searches"));
+        }
+    });
 }
 
 /// What the fold buys, which is the whole reason it exists.
