@@ -90,6 +90,10 @@ pub struct Writer {
     freq_widths: Vec<u8>,
     /// The largest frequency in each block, saturating.
     maxima: Vec<u8>,
+    /// The postings that did not fill a block, as varints.
+    tail: Vec<u8>,
+    /// Their frequencies, as varints.
+    tail_freqs: Vec<u8>,
 
     pending: [DocId; BLOCK],
     pending_freqs: [u32; BLOCK],
@@ -112,6 +116,8 @@ impl Default for Writer {
             widths: Vec::new(),
             freq_widths: Vec::new(),
             maxima: Vec::new(),
+            tail: Vec::new(),
+            tail_freqs: Vec::new(),
             pending: [0; BLOCK],
             pending_freqs: [0; BLOCK],
             filled: 0,
@@ -165,53 +171,77 @@ impl Writer {
 
     /// Finishes the list and returns the encoded bytes.
     #[must_use]
-    pub fn finish(self) -> Vec<u8> {
+    pub fn finish(mut self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.finish_into(&mut out);
+        out
+    }
+
+    /// Appends the encoded list to `out` and empties the writer for the next
+    /// one.
+    ///
+    /// This is what a caller writing a whole term dictionary uses. A segment has
+    /// as many lists as it has terms, most of them a handful of bytes long, and
+    /// a writer per term would spend more time in the allocator than in the
+    /// codec. Reusing one writer and appending straight into the postings
+    /// section costs neither the allocation nor the copy.
+    pub fn finish_into(&mut self, out: &mut Vec<u8>) {
         // The leftover postings go out as varints rather than as a short block,
         // so a term that appears in three documents costs a handful of bytes.
-        let mut tail = Vec::new();
-        let mut tail_freqs = Vec::new();
+        self.tail.clear();
+        self.tail_freqs.clear();
         let mut previous = self.packed_last;
-        for (id, frequency) in self.pending[..self.filled]
-            .iter()
-            .zip(&self.pending_freqs[..self.filled])
-        {
-            put_uvarint(&mut tail, u64::from(*id - previous));
-            put_uvarint(&mut tail_freqs, u64::from(*frequency));
-            previous = *id;
+        for at in 0..self.filled {
+            let id = self.pending[at];
+            put_uvarint(&mut self.tail, u64::from(id - previous));
+            put_uvarint(&mut self.tail_freqs, u64::from(self.pending_freqs[at]));
+            previous = id;
         }
 
         let blocks = self.skips.len();
-        let mut out = Vec::with_capacity(
+        out.reserve(
             self.docs.len()
                 + self.freqs.len()
                 + blocks * (SKIP_WIDTH * 3 + 3)
-                + tail.len()
-                + tail_freqs.len()
+                + self.tail.len()
+                + self.tail_freqs.len()
                 + 32,
         );
-        put_uvarint(&mut out, u64::from(self.count));
-        put_uvarint(&mut out, blocks as u64);
+        put_uvarint(out, u64::from(self.count));
+        put_uvarint(out, blocks as u64);
         for skip in &self.skips {
-            put_u32(&mut out, *skip);
+            put_u32(out, *skip);
         }
         for offset in &self.offsets {
-            put_u32(&mut out, *offset);
+            put_u32(out, *offset);
         }
         for offset in &self.freq_offsets {
-            put_u32(&mut out, *offset);
+            put_u32(out, *offset);
         }
         out.extend_from_slice(&self.widths);
         out.extend_from_slice(&self.freq_widths);
         out.extend_from_slice(&self.maxima);
-        put_uvarint(&mut out, self.docs.len() as u64);
+        put_uvarint(out, self.docs.len() as u64);
         out.extend_from_slice(&self.docs);
-        put_uvarint(&mut out, self.freqs.len() as u64);
+        put_uvarint(out, self.freqs.len() as u64);
         out.extend_from_slice(&self.freqs);
-        put_uvarint(&mut out, tail.len() as u64);
-        out.extend_from_slice(&tail);
-        put_uvarint(&mut out, tail_freqs.len() as u64);
-        out.extend_from_slice(&tail_freqs);
-        out
+        put_uvarint(out, self.tail.len() as u64);
+        out.extend_from_slice(&self.tail);
+        put_uvarint(out, self.tail_freqs.len() as u64);
+        out.extend_from_slice(&self.tail_freqs);
+
+        self.docs.clear();
+        self.freqs.clear();
+        self.skips.clear();
+        self.offsets.clear();
+        self.freq_offsets.clear();
+        self.widths.clear();
+        self.freq_widths.clear();
+        self.maxima.clear();
+        self.filled = 0;
+        self.packed_last = 0;
+        self.last = None;
+        self.count = 0;
     }
 
     fn flush_block(&mut self) -> Result<()> {
