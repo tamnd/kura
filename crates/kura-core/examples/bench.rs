@@ -50,6 +50,7 @@ fn main() {
 
     let encoded = postings();
     engine();
+    parallel();
     stores();
     blocks();
     dictionary();
@@ -668,6 +669,80 @@ fn engine() {
             black_box(searcher.search(query, 100).expect("searches"));
         }
     });
+}
+
+/// What the fold buys, which is the whole reason it exists.
+///
+/// The same corpus is indexed on one thread and then on several, and the
+/// segments are compared byte for byte, because a build that goes wide and
+/// comes out different is not a faster build of the same thing.
+///
+/// The speedup is under the thread count and always will be. The fold itself is
+/// serial, and so is the write of the term dictionary, so the parts that go wide
+/// are the analysis and the posting chains. Those are most of the time, which is
+/// why this is worth doing at all.
+fn parallel() {
+    let corpus = corpus(50_000);
+    let threads = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
+
+    let mut one = Vec::new();
+    let mut serial = Duration::MAX;
+    for _ in 0..3 {
+        let start = Instant::now();
+        let mut writer = index::Writer::new();
+        for text in &corpus {
+            writer.add(text).expect("fifty thousand documents fit");
+        }
+        one = writer.finish().expect("what was written decodes");
+        serial = serial.min(start.elapsed());
+    }
+    println!(
+        "index on one thread: {} in {}",
+        corpus.len(),
+        format_duration(serial)
+    );
+
+    let mut widths = vec![2, 4, threads];
+    widths.retain(|width| *width <= threads);
+    widths.sort_unstable();
+    widths.dedup();
+    for width in widths {
+        // Ceiling division, so the last slice is the short one rather than
+        // there being a slice more than there are threads.
+        let slice = corpus.len().div_ceil(width);
+        let mut best = Duration::MAX;
+        let mut many = Vec::new();
+        for _ in 0..3 {
+            let start = Instant::now();
+            let parts = std::thread::scope(|scope| {
+                let handles: Vec<_> = corpus
+                    .chunks(slice)
+                    .map(|slice| {
+                        scope.spawn(move || {
+                            let mut part = index::Writer::new();
+                            for text in slice {
+                                part.add(text).expect("a slice of the corpus fits");
+                            }
+                            part
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().expect("a writer thread does not panic"))
+                    .collect()
+            });
+            many = index::Writer::concat(parts).expect("the parts fold");
+            best = best.min(start.elapsed());
+        }
+        assert_eq!(one, many, "a segment folded on {width} threads differs");
+        println!(
+            "index on {width} threads: {} in {}, {:.2}x",
+            corpus.len(),
+            format_duration(best),
+            serial.as_secs_f64() / best.as_secs_f64()
+        );
+    }
 }
 
 /// Documents made of words drawn from a heavy tailed distribution.

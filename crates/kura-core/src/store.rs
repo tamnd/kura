@@ -228,6 +228,69 @@ impl Writer {
         (self.names.len() - 1) as u64
     }
 
+    /// Folds a store over the documents that come after this one's into it.
+    ///
+    /// The documents of `other` are renumbered to follow the ones already here,
+    /// which is the only thing the order of a fold decides. Blocks are moved
+    /// across as they stand, still compressed, so folding costs a copy of the
+    /// payload and not a pass over the text.
+    ///
+    /// The exception is a store whose field names disagree with this one's,
+    /// which cannot happen when both were filled from the same corpus and is
+    /// handled by rewriting the records rather than by refusing. Names are
+    /// numbered in the order they were first seen, so agreeing means one list
+    /// is the start of the other.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Overflow`] if the two together pass what a store can
+    /// hold.
+    pub fn merge(&mut self, mut other: Self) -> Result<()> {
+        self.flush()?;
+        other.flush()?;
+        if self.names.iter().zip(&other.names).all(|(a, b)| a == b) {
+            if other.names.len() > self.names.len() {
+                self.names
+                    .extend_from_slice(&other.names[self.names.len()..]);
+            }
+            let base = u32::try_from(self.offsets.len()).map_err(|_| Error::Overflow)?;
+            let start = u32::try_from(self.payload.len()).map_err(|_| Error::Overflow)?;
+            self.blocks.reserve(other.blocks.len());
+            for entry in other.blocks.chunks_exact(4) {
+                self.blocks.extend_from_slice(&[
+                    entry[0].checked_add(base).ok_or(Error::Overflow)?,
+                    entry[1].checked_add(start).ok_or(Error::Overflow)?,
+                    entry[2],
+                    entry[3],
+                ]);
+            }
+            self.offsets.extend_from_slice(&other.offsets);
+            self.payload.extend_from_slice(&other.payload);
+            self.values += other.values;
+            self.first = u32::try_from(self.offsets.len()).map_err(|_| Error::Overflow)?;
+            return Ok(());
+        }
+
+        // The names disagree, so every record has to be read and written again
+        // with the numbers it will have here. This is the path that is not
+        // taken by a corpus where every document has the same fields.
+        let bytes = other.finish()?;
+        let read = Reader::new(&bytes)?;
+        let mut scratch = Scratch::new();
+        for doc in 0..read.len() {
+            // The values are copied out rather than borrowed, because they
+            // point into the buffer the next document is about to be
+            // decompressed into.
+            let mut fields: Vec<(&str, Vec<u8>)> = Vec::new();
+            let mut record = read.get(doc, &mut scratch)?;
+            while let Some((name, value)) = record.next_field()? {
+                fields.push((name, value.to_vec()));
+            }
+            self.push(fields.iter().map(|(name, value)| (*name, value.as_slice())))?;
+        }
+        Ok(())
+    }
+
     /// Writes the section.
     ///
     /// # Errors

@@ -142,42 +142,133 @@ impl Writer {
     /// Returns an error if a posting chain does not decode, which can only
     /// happen if this module wrote one wrong.
     pub fn finish(self) -> Result<Vec<u8>> {
-        let mut order: Vec<u32> = (0..self.postings.vocabulary.count()).collect();
-        let vocabulary = &self.postings.vocabulary;
-        order.sort_unstable_by(|a, b| vocabulary.term(*a).cmp(vocabulary.term(*b)));
+        Self::concat(vec![self])
+    }
 
-        let mut dictionary = terms::Writer::new();
-        let mut blob = Vec::new();
-        let mut list = Vec::new();
-        for id in order {
-            self.postings.encode(id, &mut list)?;
-            dictionary.push(
-                vocabulary.term(id),
-                terms::Entry {
-                    docs: self.postings.documents[id as usize],
-                    offset: blob.len() as u64,
-                    len: list.len() as u64,
-                },
-            )?;
-            blob.extend_from_slice(&list);
+    /// Writes one segment out of writers that indexed consecutive slices of the
+    /// same corpus.
+    ///
+    /// This is how indexing goes wide without this crate deciding how. Split
+    /// the corpus, hand each slice to a writer on a thread of its own, and fold
+    /// the writers here in the order the slices were taken. The documents of a
+    /// part are numbered after the documents of every part before it, which is
+    /// the only thing that order decides.
+    ///
+    /// Nothing is sorted here either. Each part already knows its own
+    /// vocabulary in order, and this walks all of them at once, so the cost is
+    /// one pass over the postings and no pass over the text. The parts are not
+    /// combined into a larger index first, because holding one is the memory
+    /// this is trying not to spend.
+    ///
+    /// ```
+    /// # use kura_core::index::Writer;
+    /// let mut parts = Vec::new();
+    /// for slice in [["the first document", "and the second"], ["a third", "a fourth"]] {
+    ///     let mut part = Writer::new();
+    ///     for text in slice {
+    ///         part.add(text)?;
+    ///     }
+    ///     parts.push(part);
+    /// }
+    /// let segment = Writer::concat(parts)?;
+    /// # Ok::<(), kura_core::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a posting chain does not decode, which can only
+    /// happen if this module wrote one wrong, and [`Error::Overflow`] if the
+    /// parts together hold more documents than a document identifier can name.
+    pub fn concat(parts: Vec<Self>) -> Result<Vec<u8>> {
+        // Where each part's documents start once they are all in one segment.
+        let mut base = Vec::with_capacity(parts.len());
+        let mut documents = 0u32;
+        for part in &parts {
+            base.push(documents);
+            documents = u32::try_from(part.lengths.len())
+                .ok()
+                .and_then(|count| documents.checked_add(count))
+                .ok_or(Error::Overflow)?;
         }
 
-        let mut norms = Vec::with_capacity(16 + self.lengths.len() * 4);
-        put_u32(
-            &mut norms,
-            u32::try_from(self.lengths.len()).unwrap_or(u32::MAX),
-        );
-        put_u64(&mut norms, self.total);
-        for length in &self.lengths {
-            put_u32(&mut norms, *length);
+        let order: Vec<Vec<u32>> = parts.iter().map(|part| part.postings.sorted()).collect();
+        let mut front = vec![0usize; parts.len()];
+        let mut dictionary = terms::Writer::new();
+        let mut blob = Vec::new();
+        // One list writer for the whole vocabulary. A segment has as many lists
+        // as terms and most of them are a few bytes long, so a writer per term
+        // would be an allocation per term for nothing.
+        let mut list = posting::Writer::new();
+
+        loop {
+            // The next term is the smallest at the front of any part. There are
+            // as many parts as there are threads, so finding it by looking at
+            // all of them costs less than the heap that would avoid it.
+            let mut next: Option<&[u8]> = None;
+            for (index, part) in parts.iter().enumerate() {
+                if let Some(&id) = order[index].get(front[index]) {
+                    let term = part.postings.vocabulary.term(id);
+                    if next.is_none_or(|held| term < held) {
+                        next = Some(term);
+                    }
+                }
+            }
+            let Some(term) = next else { break };
+
+            let mut docs = 0u32;
+            for index in 0..parts.len() {
+                let Some(&id) = order[index].get(front[index]) else {
+                    continue;
+                };
+                let part = &parts[index];
+                if part.postings.vocabulary.term(id) != term {
+                    continue;
+                }
+                part.postings.walk(id, base[index], &mut list)?;
+                docs += part.postings.documents[id as usize];
+                front[index] += 1;
+            }
+            let offset = blob.len() as u64;
+            list.finish_into(&mut blob);
+            dictionary.push(
+                term,
+                terms::Entry {
+                    docs,
+                    offset,
+                    len: blob.len() as u64 - offset,
+                },
+            )?;
+        }
+
+        let mut norms = Vec::with_capacity(16 + documents as usize * 4);
+        put_u32(&mut norms, documents);
+        let total: u64 = parts.iter().map(|part| part.total).sum();
+        put_u64(&mut norms, total);
+        for part in &parts {
+            for length in &part.lengths {
+                put_u32(&mut norms, *length);
+            }
+        }
+
+        // The stores are folded last and into the first of them rather than
+        // into a new one, so the largest thing here is moved once instead of
+        // twice.
+        let mut stored = false;
+        let mut store: Option<store::Writer> = None;
+        for part in parts {
+            stored |= part.stored;
+            match &mut store {
+                Some(held) => held.merge(part.store)?,
+                None => store = Some(part.store),
+            }
         }
 
         let mut segment = SegmentWriter::new();
         segment.add(kind::TERMS, dictionary.finish())?;
         segment.add(kind::POSTINGS, blob)?;
         segment.add(kind::NORMS, norms)?;
-        if self.stored {
-            segment.add(kind::FIELDS, self.store.finish()?)?;
+        if let (true, Some(store)) = (stored, store) {
+            segment.add(kind::FIELDS, store.finish()?)?;
         }
         Ok(segment.finish())
     }
@@ -268,13 +359,27 @@ impl Accumulator {
         at
     }
 
-    /// Walks a term's chain and writes it out as a posting list.
-    fn encode(&self, id: u32, out: &mut Vec<u8>) -> Result<()> {
+    /// The vocabulary in term order, as identifiers.
+    ///
+    /// This is the only sort in an index build. A few hundred thousand terms
+    /// against tens of millions of postings is the trade the whole module is
+    /// arranged around.
+    fn sorted(&self) -> Vec<u32> {
+        let mut order: Vec<u32> = (0..self.vocabulary.count()).collect();
+        order.sort_unstable_by(|a, b| self.vocabulary.term(*a).cmp(self.vocabulary.term(*b)));
+        order
+    }
+
+    /// Walks a term's chain onto a posting list, shifting every document by
+    /// `base`.
+    ///
+    /// The shift is what lets a part that numbered its documents from zero sit
+    /// after another part in one segment.
+    fn walk(&self, id: u32, base: DocId, writer: &mut posting::Writer) -> Result<()> {
         let at = id as usize;
         let mut chunk = self.head[at] as usize;
         let mut offset = 0;
         let mut doc: DocId = 0;
-        let mut writer = posting::Writer::new();
         for index in 0..self.documents[at] {
             if offset + MAX_PAIR > PAYLOAD {
                 let link = &self.arena[chunk..chunk + LINK];
@@ -288,9 +393,9 @@ impl Accumulator {
             offset = chunk + CHUNK - rest.len() - chunk - LINK;
             let gap = u32::try_from(gap).map_err(|_| Error::NotSorted { at: doc })?;
             doc = if index == 0 { gap } else { doc + gap };
-            writer.push(doc, u32::try_from(frequency).unwrap_or(u32::MAX))?;
+            let shifted = doc.checked_add(base).ok_or(Error::Overflow)?;
+            writer.push(shifted, u32::try_from(frequency).unwrap_or(u32::MAX))?;
         }
-        *out = writer.finish();
         Ok(())
     }
 }
@@ -583,6 +688,103 @@ mod tests {
         let segment = Segment::open(&bytes).expect("opens");
         assert!(segment.section(kind::FIELDS).is_none());
         assert!(Reader::open(&segment).expect("opens").store().is_none());
+    }
+
+    #[test]
+    fn a_segment_built_in_parts_is_the_segment_built_in_one() {
+        // The property the whole fold rests on. Whether a corpus went through
+        // one writer or four is not something a reader should be able to tell,
+        // beyond the store packing its blocks at different boundaries.
+        let docs: Vec<String> = (0..400)
+            .map(|i| format!("document {i} the quick brown fox term{} shared", i % 37))
+            .collect();
+
+        let mut whole = Writer::new();
+        for text in &docs {
+            whole.add_with_fields(text, [("n", text.as_bytes())]).expect("adds");
+        }
+        let one = whole.finish().expect("finishes");
+
+        let mut parts = Vec::new();
+        for slice in docs.chunks(97) {
+            let mut part = Writer::new();
+            for text in slice {
+                part.add_with_fields(text, [("n", text.as_bytes())]).expect("adds");
+            }
+            parts.push(part);
+        }
+        let many = Writer::concat(parts).expect("folds");
+
+        let left = Segment::open(&one).expect("opens");
+        let right = Segment::open(&many).expect("opens");
+        for kind in [kind::TERMS, kind::POSTINGS, kind::NORMS] {
+            assert_eq!(
+                left.section(kind),
+                right.section(kind),
+                "section {kind} differs"
+            );
+        }
+
+        let left = Reader::open(&left).expect("opens");
+        let right = Reader::open(&right).expect("opens");
+        assert_eq!(left.documents(), right.documents());
+        assert_eq!(left.terms(), right.terms());
+        let mut scratch = store::Scratch::new();
+        for doc in 0..right.documents() {
+            assert_eq!(left.length(doc), right.length(doc));
+            let store = right.store().expect("the fields were stored");
+            assert_eq!(
+                store.get(doc, &mut scratch).expect("reads").field("n").expect("decodes"),
+                Some(docs[doc as usize].as_bytes()),
+                "document {doc}"
+            );
+        }
+    }
+
+    #[test]
+    fn folding_parts_that_hold_nothing_changes_nothing() {
+        let mut part = Writer::new();
+        part.add("the only document there is").expect("adds");
+        let alone = part.finish().expect("finishes");
+
+        let mut part = Writer::new();
+        part.add("the only document there is").expect("adds");
+        let folded = Writer::concat(vec![Writer::new(), part, Writer::new()]).expect("folds");
+        assert_eq!(alone, folded);
+    }
+
+    #[test]
+    fn a_fold_of_nothing_is_a_segment() {
+        let bytes = Writer::concat(Vec::new()).expect("folds");
+        let segment = Segment::open(&bytes).expect("opens");
+        let index = Reader::open(&segment).expect("opens");
+        assert!(index.is_empty());
+        assert_eq!(index.terms(), 0);
+    }
+
+    #[test]
+    fn a_term_only_one_part_has_still_finds_its_documents() {
+        let mut first = Writer::new();
+        first.add("alpha beta").expect("adds");
+        let mut second = Writer::new();
+        second.add("gamma").expect("adds");
+        second.add("beta gamma").expect("adds");
+        let bytes = Writer::concat(vec![first, second]).expect("folds");
+        let segment = Segment::open(&bytes).expect("opens");
+        let index = Reader::open(&segment).expect("opens");
+        for (term, want) in [
+            (&b"alpha"[..], vec![0]),
+            (&b"beta"[..], vec![0, 2]),
+            (&b"gamma"[..], vec![1, 2]),
+        ] {
+            let seen = index
+                .postings(term)
+                .expect("decodes")
+                .expect("the term is there")
+                .to_vec()
+                .expect("the list decodes");
+            assert_eq!(seen, want, "{}", String::from_utf8_lossy(term));
+        }
     }
 
     #[test]
