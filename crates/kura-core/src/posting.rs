@@ -727,6 +727,15 @@ impl Cursor<'_> {
         Some(self.docs[self.len - 1])
     }
 
+    /// Which block the cursor is decoding.
+    ///
+    /// A caller that recomputes something per block can hold it against this
+    /// and recompute only when it changes.
+    #[must_use]
+    pub fn block(&self) -> usize {
+        self.block
+    }
+
     /// How many documents are left in the block the cursor is in, counting the
     /// one it is sitting on.
     ///

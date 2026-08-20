@@ -194,7 +194,7 @@ impl<'a, 'b> Searcher<'a, 'b> {
             return Ok((self.search_terms(terms, k)?, total));
         }
 
-        let average = self.index.average_length().max(1.0);
+        let norm = Norm::new(self.k1, self.b, self.index.average_length());
         let floor = self.k1 * (1.0 - self.b);
         let mut top = TopK::new(k);
         let mut total = 0u64;
@@ -228,8 +228,7 @@ impl<'a, 'b> Searcher<'a, 'b> {
                 .map(|head| head.bound)
                 .sum();
             if ceiling > top.threshold() {
-                let length = length_of(self.index, doc);
-                let norm = self.k1 * (1.0 - self.b + self.b * length / average);
+                let norm = norm.of(self.index, doc);
                 let mut score = 0.0;
                 for at in 0..lists.len() {
                     if lists.heads[at].doc == doc {
@@ -270,7 +269,7 @@ impl<'a, 'b> Searcher<'a, 'b> {
             return self.search_one(&mut lists, k);
         }
 
-        let average = self.index.average_length().max(1.0);
+        let norm = Norm::new(self.k1, self.b, self.index.average_length());
         // The smallest the denominator of the tf factor can get, which is what
         // turns a frequency into an upper bound on a score.
         let floor = self.k1 * (1.0 - self.b);
@@ -325,8 +324,7 @@ impl<'a, 'b> Searcher<'a, 'b> {
                 continue;
             }
 
-            let length = length_of(self.index, candidate);
-            let norm = self.k1 * (1.0 - self.b + self.b * length / average);
+            let norm = norm.of(self.index, candidate);
             let mut score = 0.0;
             let mut moved = 0;
             while moved < live && lists.heads[order[moved]].doc == candidate {
@@ -354,13 +352,21 @@ impl<'a, 'b> Searcher<'a, 'b> {
     /// still steps over a whole block whose best posting cannot displace the
     /// worst hit in hand.
     fn search_one(&self, lists: &mut Lists<'b>, k: usize) -> Result<Vec<Hit>> {
-        let average = self.index.average_length().max(1.0);
+        let norm = Norm::new(self.k1, self.b, self.index.average_length());
         let floor = self.k1 * (1.0 - self.b);
         let mut top = TopK::new(k);
+        // The block bound only changes when the block does, and this is the one
+        // walk that asks for it on every document, so it is worked out once per
+        // block rather than once per posting.
+        let mut cached = (usize::MAX, 0.0f32);
 
         while lists.heads[0].doc != DocId::MAX {
             let doc = lists.heads[0].doc;
-            if lists.block_bound(0, self.k1, floor) <= top.threshold() {
+            let block = lists.cursors[0].block();
+            if cached.0 != block {
+                cached = (block, lists.block_bound(0, self.k1, floor));
+            }
+            if cached.1 <= top.threshold() {
                 let next = lists.cursors[0]
                     .block_last()
                     .unwrap_or(doc)
@@ -369,11 +375,9 @@ impl<'a, 'b> Searcher<'a, 'b> {
                 lists.seek(0, next)?;
                 continue;
             }
-            let length = length_of(self.index, doc);
-            let norm = self.k1 * (1.0 - self.b + self.b * length / average);
             top.push(Hit {
                 doc,
-                score: lists.score(0, self.k1, norm),
+                score: lists.score(0, self.k1, norm.of(self.index, doc)),
             });
             lists.advance(0)?;
         }
@@ -578,6 +582,31 @@ fn idf(documents: u32, holding: u32) -> f32 {
 )]
 fn length_of(index: &Reader<'_>, doc: DocId) -> f32 {
     index.length(doc) as f32
+}
+
+/// The length normalisation, with the query's constants already folded in.
+///
+/// Written out, the denominator BM25 divides by is `k1 * (1 - b + b * len /
+/// average)`, which is a division per document scored. Nothing in it varies
+/// with the document except the length, so the rest is worked out once when the
+/// query starts and what is left is a multiply and an add.
+#[derive(Debug, Clone, Copy)]
+struct Norm {
+    base: f32,
+    per_term: f32,
+}
+
+impl Norm {
+    fn new(k1: f32, b: f32, average: f32) -> Self {
+        Self {
+            base: k1 * (1.0 - b),
+            per_term: k1 * b / average.max(1.0),
+        }
+    }
+
+    fn of(self, index: &Reader<'_>, doc: DocId) -> f32 {
+        self.per_term.mul_add(length_of(index, doc), self.base)
+    }
 }
 
 /// The best `k` hits seen so far, as a heap with the worst at the root.

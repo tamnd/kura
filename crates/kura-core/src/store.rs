@@ -500,8 +500,11 @@ impl<'a> Reader<'a> {
         } else {
             let held = (self.payload.as_ptr() as usize, which);
             if scratch.held != Some(held) {
-                scratch.clear();
-                lz::decompress(bytes, raw, &mut scratch.block)?;
+                // Cleared by the claim rather than by emptying the buffer,
+                // because the decode replaces every byte it is going to read
+                // and an empty buffer would have to be zeroed first.
+                scratch.held = None;
+                lz::decompress_into(bytes, raw, &mut scratch.block)?;
                 scratch.held = Some(held);
             }
             &scratch.block
