@@ -28,9 +28,12 @@ The crate holds the pieces the rest is built out of, and each one is tested and 
 - **Integer codecs.** LEB128 varints with zigzag mapping for signed values, which is what carries the lengths, the offsets and the runs too short to be worth packing.
 - **Posting lists.** Fixed size blocks packed at a width chosen per block, with a skip table, so a membership test on a list of millions decodes one block rather than all of them.
   The blocks decode four ids at a time, which is what makes reading them three times faster than reading the same ids as varints, at a little over half the size.
+- **Term dictionary.** Terms in order, in blocks of sixteen, with the shared prefix folded out and one index entry per block.
+  A lookup binary searches the index and then walks a block, so it touches two cache lines rather than the whole vocabulary, and the folding makes the dictionary smaller than the terms it holds even though it also stores three numbers for each of them.
 - **Bitmaps.** A set of document ids that switches between a sorted list and a dense word array depending on how full it is, with intersection, union and difference.
   This is what a permission filter runs on.
 - **Vectors.** Cosine similarity, unit normalisation and eight bit quantisation with a per vector scale, which cuts the memory a corpus costs by four with a bounded error.
+  Scoring keeps eight partial sums rather than one so the reduction vectorises, and at that point it is bandwidth bound, which is why the quantised form is another four times faster than the full width one.
 - **A C ABI.** A static and shared library with a hand written header, so a host in another language can use the engine without a socket and without copying the data.
 - **Segments.** The on disk container, holding a header, a section table and the section payloads, checksummed and verified on open.
   It is documented in [docs/format.md](docs/format.md), field by field and with the reason for each one.
