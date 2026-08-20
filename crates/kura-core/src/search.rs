@@ -89,13 +89,52 @@ impl<'a, 'b> Searcher<'a, 'b> {
     ///
     /// Returns an error if a posting list in the index does not decode.
     pub fn search(&self, query: &str, k: usize) -> Result<Vec<Hit>> {
-        let mut analyzer = Analyzer::new();
-        let mut words: Vec<Vec<u8>> = Vec::new();
-        analyzer.analyze(query, |term, _| words.push(term.to_vec()));
-        words.sort_unstable();
-        words.dedup();
+        let words = analyse(query);
         let terms: Vec<&[u8]> = words.iter().map(Vec::as_slice).collect();
         self.search_terms(&terms, k)
+    }
+
+    /// How many documents hold at least one of the query's terms.
+    ///
+    /// This is a different question from what [`search`](Self::search) answers
+    /// and it costs more, because a total cannot be pruned: every posting has
+    /// to be looked at to know whether its document was already counted. A
+    /// caller that only needs a page of results should not ask for it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a posting list in the index does not decode.
+    pub fn count(&self, query: &str) -> Result<u64> {
+        let words = analyse(query);
+        let terms: Vec<&[u8]> = words.iter().map(Vec::as_slice).collect();
+        self.count_terms(&terms)
+    }
+
+    /// How many documents hold at least one of a set of analysed terms.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a posting list in the index does not decode.
+    pub fn count_terms(&self, terms: &[&[u8]]) -> Result<u64> {
+        let mut lists = self.open(terms)?;
+        // One term is the common case and its answer is already in the header
+        // of its posting list, so nothing needs decoding at all.
+        if lists.len() <= 1 {
+            return Ok(lists.first().map_or(0, |list| u64::from(list.count)));
+        }
+        let mut total = 0;
+        loop {
+            let Some(doc) = lists.iter().map(|list| list.doc).min() else {
+                return Ok(total);
+            };
+            total += 1;
+            for list in &mut lists {
+                if list.doc == doc {
+                    list.advance()?;
+                }
+            }
+            lists.retain(Term::alive);
+        }
     }
 
     /// Returns the best `k` documents for a set of terms that are already
@@ -206,6 +245,7 @@ impl<'a, 'b> Searcher<'a, 'b> {
             };
             lists.push(Term {
                 cursor,
+                count: list.len(),
                 doc,
                 idf,
                 bound: idf * (self.k1 + 1.0),
@@ -219,6 +259,9 @@ impl<'a, 'b> Searcher<'a, 'b> {
 #[derive(Debug)]
 struct Term<'a> {
     cursor: Cursor<'a>,
+    /// How many documents the list holds, which a total wants and the scorer
+    /// has already spent to get the inverse document frequency.
+    count: u32,
     /// Where the cursor is, cached because the pivot search reads it once per
     /// term per iteration and the sort reads it again.
     doc: DocId,
@@ -281,6 +324,16 @@ impl Term<'_> {
 /// Everything before it is on a document that cannot win even if every one of
 /// those terms is at its best, so the only candidate worth looking at is where
 /// this one is.
+/// Runs a query through the analyser and returns its distinct terms in order.
+fn analyse(query: &str) -> Vec<Vec<u8>> {
+    let mut analyzer = Analyzer::new();
+    let mut words: Vec<Vec<u8>> = Vec::new();
+    analyzer.analyze(query, |term, _| words.push(term.to_vec()));
+    words.sort_unstable();
+    words.dedup();
+    words
+}
+
 fn pivot(lists: &[Term<'_>], threshold: f32) -> Option<usize> {
     let mut sum = 0.0;
     for (at, list) in lists.iter().enumerate() {
@@ -512,6 +565,39 @@ mod tests {
         assert_eq!(hits[0].doc, 2);
         assert_eq!(hits[1].doc, 0);
         assert!(!hits.iter().any(|hit| hit.doc == 4));
+    }
+
+    #[test]
+    fn a_total_counts_the_union_and_not_the_sum() {
+        // Two terms that share a document. Adding the list lengths would say
+        // four, and four is wrong.
+        let bytes = build(&["alpha", "beta", "alpha beta", "gamma"]);
+        let segment = Segment::open(&bytes).expect("opens");
+        let index = Reader::open(&segment).expect("opens");
+        let searcher = Searcher::new(&index);
+        assert_eq!(searcher.count("alpha").expect("counts"), 2);
+        assert_eq!(searcher.count("alpha beta").expect("counts"), 3);
+        assert_eq!(searcher.count("alpha beta gamma").expect("counts"), 4);
+        assert_eq!(searcher.count("nothing here").expect("counts"), 0);
+    }
+
+    #[test]
+    fn a_total_agrees_with_counting_the_hits_by_hand() {
+        // The page is pruned and the total is not, so the two are different
+        // walks over the same lists. Asking for every document back is what
+        // checks they agree.
+        let bytes = build(&DOCS);
+        let segment = Segment::open(&bytes).expect("opens");
+        let index = Reader::open(&segment).expect("opens");
+        let searcher = Searcher::new(&index);
+        for query in ["fox", "quick dog", "lazy fox brown", "absent"] {
+            let hits = searcher.search(query, DOCS.len()).expect("searches");
+            assert_eq!(
+                searcher.count(query).expect("counts"),
+                hits.len() as u64,
+                "{query}"
+            );
+        }
     }
 
     #[test]

@@ -37,6 +37,9 @@ The crate holds the pieces the rest is built out of, and each one is tested and 
   Each term's postings go straight into that term's own delta coded chain in an arena, so nothing is buffered or sorted per posting and the only sort at the end is over the vocabulary.
 - **Ranked search.** BM25 with block-max WAND.
   The per block frequency ceilings the posting format stores let the scorer decide that a whole block of 128 documents cannot beat what it already has, and skip it without decoding a frequency.
+  A total is a separate call from a page, because a total cannot be pruned and most callers do not need one.
+- **Stored fields.** The values that come back with a hit, held beside the index rather than in it.
+  Field names go in a dictionary at the front and each value refers to its name by number, and the offset array narrows to four bytes per document when the payload fits, which for a corpus of short documents is most of what the section costs.
 - **Bitmaps.** A set of document ids that switches between a sorted list and a dense word array depending on how full it is, with intersection, union and difference.
   This is what a permission filter runs on.
 - **Vectors.** Cosine similarity, unit normalisation and eight bit quantisation with a per vector scale, which cuts the memory a corpus costs by four with a bounded error.

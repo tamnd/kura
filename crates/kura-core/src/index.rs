@@ -21,7 +21,7 @@ use crate::analysis::Analyzer;
 use crate::codec::{get_u32, get_u64, get_uvarint, put_u32, put_u64, put_uvarint};
 use crate::error::{Error, Result};
 use crate::segment::{Segment, Writer as SegmentWriter, kind};
-use crate::{DocId, posting, terms};
+use crate::{DocId, posting, store, terms};
 
 /// The size of one link in a term's posting chain, in bytes.
 ///
@@ -59,6 +59,11 @@ pub struct Writer {
     postings: Accumulator,
     lengths: Vec<u32>,
     total: u64,
+    store: store::Writer,
+    /// Whether any document stored anything, which decides whether the store
+    /// section is written at all. An index nobody asks values back from should
+    /// not carry eight bytes per document saying so.
+    stored: bool,
 }
 
 impl Writer {
@@ -75,6 +80,25 @@ impl Writer {
     /// Returns [`Error::NotSorted`] if more documents are added than a document
     /// identifier can hold.
     pub fn add(&mut self, text: &str) -> Result<DocId> {
+        self.add_with_fields(text, core::iter::empty())
+    }
+
+    /// Adds a document, indexing `text` and keeping `fields` to hand back with
+    /// a hit.
+    ///
+    /// The two are separate on purpose. What is worth searching and what is
+    /// worth showing are different questions, and a path is the usual example
+    /// of something that answers no to the first and yes to the second.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotSorted`] if more documents are added than a document
+    /// identifier can hold.
+    pub fn add_with_fields<'f>(
+        &mut self,
+        text: &str,
+        fields: impl IntoIterator<Item = (&'f str, &'f [u8])>,
+    ) -> Result<DocId> {
         let doc =
             u32::try_from(self.lengths.len()).map_err(|_| Error::NotSorted { at: u32::MAX })?;
         // The stamp is the document number plus one so that zero can mean a term
@@ -86,11 +110,16 @@ impl Writer {
             postings,
             lengths,
             total,
+            store,
+            stored,
         } = self;
         let length = analyzer.analyze(text, |term, _| postings.count(term, stamp));
         postings.flush(doc);
         lengths.push(length);
         *total += u64::from(length);
+        let before = store.values();
+        store.push(fields)?;
+        *stored |= store.values() > before;
         Ok(doc)
     }
 
@@ -147,6 +176,9 @@ impl Writer {
         segment.add(kind::TERMS, dictionary.finish())?;
         segment.add(kind::POSTINGS, blob)?;
         segment.add(kind::NORMS, norms)?;
+        if self.stored {
+            segment.add(kind::FIELDS, self.store.finish())?;
+        }
         Ok(segment.finish())
     }
 }
@@ -377,6 +409,7 @@ pub struct Reader<'a> {
     terms: terms::Reader<'a>,
     postings: &'a [u8],
     lengths: &'a [u8],
+    store: Option<store::Reader<'a>>,
     documents: u32,
     total: u64,
 }
@@ -402,10 +435,15 @@ impl<'a> Reader<'a> {
                 available: lengths.len(),
             });
         }
+        let store = match segment.section(kind::FIELDS) {
+            Some(bytes) => Some(store::Reader::new(bytes)?),
+            None => None,
+        };
         Ok(Self {
             terms: terms::Reader::new(dictionary)?,
             postings,
             lengths,
+            store,
             documents,
             total,
         })
@@ -454,6 +492,12 @@ impl<'a> Reader<'a> {
             return 0.0;
         }
         (self.total as f64 / f64::from(self.documents)) as f32
+    }
+
+    /// The stored fields, or nothing if the index was built without any.
+    #[must_use]
+    pub const fn store(&self) -> Option<&store::Reader<'a>> {
+        self.store.as_ref()
     }
 
     /// The posting list of a term, or nothing if the term is not in the index.
@@ -506,6 +550,38 @@ mod tests {
             writer.add(doc).expect("a handful of documents fit");
         }
         writer.finish().expect("what was written decodes")
+    }
+
+    #[test]
+    fn stored_fields_come_back_with_the_document_they_went_in_with() {
+        let mut writer = Writer::new();
+        writer
+            .add_with_fields("the quick brown fox", [("id", &b"a"[..]), ("n", &b"1"[..])])
+            .expect("adds");
+        writer
+            .add_with_fields("the lazy dog", [("id", &b"b"[..]), ("n", &b"2"[..])])
+            .expect("adds");
+        let bytes = writer.finish().expect("finishes");
+        let segment = Segment::open(&bytes).expect("opens");
+        let index = Reader::open(&segment).expect("opens");
+        let store = index.store().expect("the fields were stored");
+        assert_eq!(store.len(), 2);
+        for (doc, want) in [(0, &b"a"[..]), (1, &b"b"[..])] {
+            let fields = store.get(doc).expect("reads");
+            assert_eq!(fields.field("id").expect("reads"), Some(want));
+        }
+    }
+
+    #[test]
+    fn an_index_that_stores_nothing_carries_no_store() {
+        // Eight bytes a document for an empty record is eight bytes a document
+        // nobody asked for.
+        let mut writer = Writer::new();
+        writer.add("the quick brown fox").expect("adds");
+        let bytes = writer.finish().expect("finishes");
+        let segment = Segment::open(&bytes).expect("opens");
+        assert!(segment.section(kind::FIELDS).is_none());
+        assert!(Reader::open(&segment).expect("opens").store().is_none());
     }
 
     #[test]

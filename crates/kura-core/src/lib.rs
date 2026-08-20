@@ -27,6 +27,7 @@ pub mod index;
 pub mod posting;
 pub mod search;
 pub mod segment;
+pub mod store;
 pub mod terms;
 pub mod vector;
 
