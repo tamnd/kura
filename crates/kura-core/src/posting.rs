@@ -727,6 +727,20 @@ impl Cursor<'_> {
         Some(self.docs[self.len - 1])
     }
 
+    /// How many documents are left in the block the cursor is in, counting the
+    /// one it is sitting on.
+    ///
+    /// A caller that knows every one of them belongs in its answer can take
+    /// them all at once and skip to the next block, which is how counting a
+    /// union stops costing a step per document.
+    #[must_use]
+    pub fn remaining_in_block(&self) -> usize {
+        if self.done {
+            return 0;
+        }
+        self.len.saturating_sub(self.at)
+    }
+
     /// Decodes block `index`, or the leftovers when `index` is the one past the
     /// last block, or ends the walk when it is past that.
     ///

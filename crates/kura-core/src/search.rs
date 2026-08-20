@@ -123,17 +123,31 @@ impl<'a, 'b> Searcher<'a, 'b> {
             return Ok(lists.counts.first().map_or(0, |&count| u64::from(count)));
         }
         let mut total = 0;
-        let mut doc = lists.front();
-        while doc != DocId::MAX {
+        loop {
+            let (which, doc, second) = lists.front_two();
+            if doc == DocId::MAX {
+                return Ok(total);
+            }
+
+            // Where the block this list is in ends before any other list starts,
+            // every document left in it belongs to the union and belongs to
+            // nobody else, so the whole block is one step rather than a hundred
+            // and twenty eight. On the query shape that costs the most, one
+            // common term and one rare one, this is nearly all of the walk.
+            if let Some(last) = lists.cursors[which].block_last()
+                && last < second
+            {
+                total += lists.take_block(which, last)?;
+                continue;
+            }
+
             total += 1;
             for at in 0..lists.len() {
                 if lists.heads[at].doc == doc {
                     lists.advance(at)?;
                 }
             }
-            doc = lists.front();
         }
-        Ok(total)
     }
 
     /// The best `k` documents and how many there are in all, in one pass.
@@ -181,10 +195,27 @@ impl<'a, 'b> Searcher<'a, 'b> {
         }
 
         let average = self.index.average_length().max(1.0);
+        let floor = self.k1 * (1.0 - self.b);
         let mut top = TopK::new(k);
         let mut total = 0u64;
-        let mut doc = lists.front();
-        while doc != DocId::MAX {
+        loop {
+            let (which, doc, second) = lists.front_two();
+            if doc == DocId::MAX {
+                break;
+            }
+
+            // A block of one list that no other list reaches into, whose best
+            // posting cannot beat the worst hit in hand, contributes documents
+            // to the total and nothing to the page. Those are counted in one
+            // step instead of being walked and rejected one at a time.
+            if let Some(last) = lists.cursors[which].block_last()
+                && last < second
+                && lists.block_bound(which, self.k1, floor) <= top.threshold()
+            {
+                total += lists.take_block(which, last)?;
+                continue;
+            }
+
             total += 1;
 
             // What the terms sitting on this document could add up to at their
@@ -213,7 +244,6 @@ impl<'a, 'b> Searcher<'a, 'b> {
                     lists.advance(at)?;
                 }
             }
-            doc = lists.front();
         }
         Ok((top.into_sorted(), total))
     }
@@ -420,14 +450,40 @@ impl Lists<'_> {
         self.heads.is_empty()
     }
 
-    /// The lowest document any list is still on, or [`DocId::MAX`] when they
-    /// are all spent.
-    fn front(&self) -> DocId {
-        self.heads
-            .iter()
-            .map(|head| head.doc)
-            .min()
-            .unwrap_or(DocId::MAX)
+    /// Which list is on the lowest document, that document, and the lowest
+    /// document any of the others is on.
+    ///
+    /// The second one is what says how far the first can run on its own. Where
+    /// two lists are on the same document the two come back equal, which is the
+    /// answer that stops a caller skipping over a document it shares.
+    fn front_two(&self) -> (usize, DocId, DocId) {
+        let mut which = 0;
+        let mut first = DocId::MAX;
+        let mut second = DocId::MAX;
+        for (at, head) in self.heads.iter().enumerate() {
+            if head.doc < first {
+                second = first;
+                first = head.doc;
+                which = at;
+            } else if head.doc < second {
+                second = head.doc;
+            }
+        }
+        (which, first, second)
+    }
+
+    /// Takes the rest of one list's block in one step, and says how many
+    /// documents that was.
+    ///
+    /// Only sound when the caller has established that no other list reaches
+    /// into this block, which [`Lists::front_two`] is what answers.
+    fn take_block(&mut self, at: usize, last: DocId) -> Result<u64> {
+        let taken = self.cursors[at].remaining_in_block() as u64;
+        match last.checked_add(1) {
+            Some(next) => self.seek(at, next)?,
+            None => self.heads[at].doc = DocId::MAX,
+        }
+        Ok(taken)
     }
 
     /// Moves one list to its next document.
@@ -858,6 +914,47 @@ mod tests {
                 let (hits, total) = searcher.search_and_count(query, k).expect("searches");
                 same(&hits, &searcher.search(query, k).expect("searches"));
                 assert_eq!(total, searcher.count(query).expect("counts"), "{query}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_block_no_other_term_reaches_into_is_still_counted_document_by_document() {
+        // The walk takes a whole block in one step when no other list reaches
+        // into it, which is the case this corpus is built to produce: one term
+        // in every document and a second term clustered at each end, so most of
+        // the common term's blocks belong to it alone. The total has to be the
+        // same total either way, and the page has to be the same page.
+        let docs: Vec<String> = (0..4_000)
+            .map(|i| {
+                let mut text = String::from("common filler filler filler");
+                if !(40..=3_950).contains(&i) {
+                    text.push_str(" cluster cluster");
+                }
+                if i == 2_000 {
+                    text.push_str(" lonely");
+                }
+                text
+            })
+            .collect();
+        let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+        let bytes = build(&refs);
+        let segment = Segment::open(&bytes).expect("opens");
+        let index = Reader::open(&segment).expect("opens");
+        let searcher = Searcher::new(&index);
+
+        assert_eq!(searcher.count("common cluster").expect("counts"), 4_000);
+        assert_eq!(searcher.count("common lonely").expect("counts"), 4_000);
+        assert_eq!(searcher.count("cluster lonely").expect("counts"), 90);
+        for query in ["common cluster", "common lonely", "cluster lonely"] {
+            for k in [1, 10, 200] {
+                let (hits, total) = searcher.search_and_count(query, k).expect("searches");
+                same(&hits, &searcher.search(query, k).expect("searches"));
+                assert_eq!(
+                    total,
+                    searcher.count(query).expect("counts"),
+                    "{query} at k {k}"
+                );
             }
         }
     }
