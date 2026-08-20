@@ -426,7 +426,7 @@ impl<'a> Reader<'a> {
             self.decode_block(index, &mut block)?;
             out.extend_from_slice(&block);
         }
-        self.decode_tail(&mut out, &mut Vec::new())?;
+        self.walk_tail(|id, _| out.push(id))?;
         Ok(out)
     }
 
@@ -472,9 +472,9 @@ impl<'a> Reader<'a> {
         // Past the last packed block, so it is in the leftovers or nowhere. The
         // leftovers are shorter than one block by construction, which is why
         // walking them is not worth a second index.
-        let mut rest = Vec::with_capacity(BLOCK);
-        self.decode_tail(&mut rest, &mut Vec::new())?;
-        Ok(rest.binary_search(&target).is_ok())
+        let mut found = false;
+        self.walk_tail(|id, _| found |= id == target)?;
+        Ok(found)
     }
 
     /// Starts a walk over the postings.
@@ -542,6 +542,17 @@ impl<'a> Reader<'a> {
     /// Decodes the varints after the last packed block onto the end of `ids`,
     /// and their frequencies onto the end of `freqs`.
     fn decode_tail(&self, ids: &mut Vec<DocId>, freqs: &mut Vec<u32>) -> Result<()> {
+        self.walk_tail(|id, frequency| {
+            ids.push(id);
+            freqs.push(frequency);
+        })
+    }
+
+    /// Hands every leftover posting to `f`, in order.
+    ///
+    /// Callers that already have somewhere to put the postings use this rather
+    /// than [`Reader::decode_tail`], which needs two vectors to fill.
+    fn walk_tail(&self, mut f: impl FnMut(DocId, u32)) -> Result<()> {
         let mut current = if self.block_count == 0 {
             0
         } else {
@@ -554,12 +565,13 @@ impl<'a> Reader<'a> {
             let (gap, tail) = get_uvarint(rest)?;
             let gap = u32::try_from(gap).map_err(|_| Error::Overflow)?;
             current = current.checked_add(gap).ok_or(Error::Overflow)?;
-            ids.push(current);
             rest = tail;
 
             let (frequency, tail) = get_uvarint(rest_freqs)?;
-            freqs.push(u32::try_from(frequency).map_err(|_| Error::Overflow)?);
+            let frequency = u32::try_from(frequency).map_err(|_| Error::Overflow)?;
             rest_freqs = tail;
+
+            f(current, frequency);
         }
         Ok(())
     }
@@ -736,17 +748,25 @@ impl Cursor<'_> {
             return Ok(());
         }
 
-        let mut ids = Vec::with_capacity(BLOCK);
-        let mut freqs = Vec::with_capacity(BLOCK);
-        self.list.decode_tail(&mut ids, &mut freqs)?;
-        if ids.is_empty() || ids.len() != freqs.len() {
+        // Straight into the cursor's own arrays. The leftovers are shorter than
+        // one block by construction, so they always fit, and a cursor that has
+        // been built once never allocates again.
+        let mut filled = 0usize;
+        let docs = &mut self.docs;
+        let freqs = &mut self.freqs;
+        self.list.walk_tail(|id, frequency| {
+            if let (Some(slot), Some(count)) = (docs.get_mut(filled), freqs.get_mut(filled)) {
+                *slot = id;
+                *count = frequency;
+                filled += 1;
+            }
+        })?;
+        if filled == 0 {
             self.len = 0;
             self.done = true;
             return Ok(());
         }
-        self.len = ids.len();
-        self.docs[..self.len].copy_from_slice(&ids);
-        self.freqs[..self.len].copy_from_slice(&freqs);
+        self.len = filled;
         Ok(())
     }
 }

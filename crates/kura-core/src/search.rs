@@ -120,21 +120,20 @@ impl<'a, 'b> Searcher<'a, 'b> {
         // One term is the common case and its answer is already in the header
         // of its posting list, so nothing needs decoding at all.
         if lists.len() <= 1 {
-            return Ok(lists.first().map_or(0, |list| u64::from(list.count)));
+            return Ok(lists.counts.first().map_or(0, |&count| u64::from(count)));
         }
         let mut total = 0;
-        loop {
-            let Some(doc) = lists.iter().map(|list| list.doc).min() else {
-                return Ok(total);
-            };
+        let mut doc = lists.front();
+        while doc != DocId::MAX {
             total += 1;
-            for list in &mut lists {
-                if list.doc == doc {
-                    list.advance()?;
+            for at in 0..lists.len() {
+                if lists.heads[at].doc == doc {
+                    lists.advance(at)?;
                 }
             }
-            lists.retain(Term::alive);
+            doc = lists.front();
         }
+        Ok(total)
     }
 
     /// The best `k` documents and how many there are in all, in one pass.
@@ -177,44 +176,44 @@ impl<'a, 'b> Searcher<'a, 'b> {
             // One term, and its total is in the header of its own list. Nothing
             // has to be walked to know it, so the search can prune the way it
             // does when no total was asked for.
-            let total = u64::from(lists[0].count);
+            let total = u64::from(lists.counts[0]);
             return Ok((self.search_terms(terms, k)?, total));
         }
 
         let average = self.index.average_length().max(1.0);
         let mut top = TopK::new(k);
         let mut total = 0u64;
-        loop {
-            let Some(doc) = lists.iter().map(|list| list.doc).min() else {
-                break;
-            };
+        let mut doc = lists.front();
+        while doc != DocId::MAX {
             total += 1;
 
             // What the terms sitting on this document could add up to at their
             // best. This costs an addition per term and saves the frequency
             // decode, the length lookup and the division that scoring would.
             let ceiling: f32 = lists
+                .heads
                 .iter()
-                .filter(|list| list.doc == doc)
-                .map(|list| list.bound)
+                .filter(|head| head.doc == doc)
+                .map(|head| head.bound)
                 .sum();
             if ceiling > top.threshold() {
                 let length = length_of(self.index, doc);
                 let norm = self.k1 * (1.0 - self.b + self.b * length / average);
-                let score: f32 = lists
-                    .iter()
-                    .filter(|list| list.doc == doc)
-                    .map(|list| list.score(self.k1, norm))
-                    .sum();
+                let mut score = 0.0;
+                for at in 0..lists.len() {
+                    if lists.heads[at].doc == doc {
+                        score += lists.score(at, self.k1, norm);
+                    }
+                }
                 top.push(Hit { doc, score });
             }
 
-            for list in &mut lists {
-                if list.doc == doc {
-                    list.advance()?;
+            for at in 0..lists.len() {
+                if lists.heads[at].doc == doc {
+                    lists.advance(at)?;
                 }
             }
-            lists.retain(Term::alive);
+            doc = lists.front();
         }
         Ok((top.into_sorted(), total))
     }
@@ -237,6 +236,9 @@ impl<'a, 'b> Searcher<'a, 'b> {
         if lists.is_empty() {
             return Ok(Vec::new());
         }
+        if lists.len() == 1 {
+            return self.search_one(&mut lists, k);
+        }
 
         let average = self.index.average_length().max(1.0);
         // The smallest the denominator of the tf factor can get, which is what
@@ -244,46 +246,52 @@ impl<'a, 'b> Searcher<'a, 'b> {
         let floor = self.k1 * (1.0 - self.b);
         let mut top = TopK::new(k);
         let mut threshold = 0.0;
+        // The lists in order of where their cursors are. This is a list of
+        // subscripts rather than the lists themselves because it is sorted on
+        // every iteration and a cursor is a kilobyte, so sorting the lists would
+        // copy kilobytes to move a term one place.
+        let mut order: Vec<usize> = (0..lists.len()).collect();
 
         loop {
-            lists.sort_unstable_by_key(|list| list.doc);
-            let Some(pivot) = pivot(&lists, threshold) else {
+            order.sort_unstable_by_key(|&at| lists.heads[at].doc);
+            // A spent list carries the largest identifier there is, so the sort
+            // leaves the live ones in front and this is where they stop.
+            let live = order.partition_point(|&at| lists.heads[at].doc != DocId::MAX);
+            let Some(pivot) = pivot(&lists, &order[..live], threshold) else {
                 break;
             };
-            let candidate = lists[pivot].doc;
+            let candidate = lists.heads[order[pivot]].doc;
 
-            if lists[0].doc != candidate {
+            if lists.heads[order[0]].doc != candidate {
                 // The lists before the pivot are behind it, and nothing between
                 // where they are and the pivot can reach the threshold, so there
                 // is no reason to decode any of it.
-                for list in &mut lists[..pivot] {
-                    list.seek(candidate)?;
+                for &at in &order[..pivot] {
+                    lists.seek(at, candidate)?;
                 }
-                lists.retain(Term::alive);
                 continue;
             }
 
             // Everything up to the pivot is on the candidate. Before paying for
             // the frequencies, ask what the blocks these cursors are sitting in
             // could possibly add up to.
-            let ceiling: f32 = lists[..=pivot]
+            let ceiling: f32 = order[..=pivot]
                 .iter()
-                .map(|list| list.block_bound(self.k1, floor))
+                .map(|&at| lists.block_bound(at, self.k1, floor))
                 .sum();
             if ceiling <= threshold {
-                let next = lists[..=pivot]
+                let next = order[..=pivot]
                     .iter()
-                    .filter_map(Term::block_last)
+                    .filter_map(|&at| lists.cursors[at].block_last())
                     .min()
                     .unwrap_or(candidate)
                     .saturating_add(1)
                     .max(candidate.saturating_add(1));
-                for list in &mut lists {
-                    if list.doc < next {
-                        list.seek(next)?;
+                for at in 0..lists.len() {
+                    if lists.heads[at].doc < next {
+                        lists.seek(at, next)?;
                     }
                 }
-                lists.retain(Term::alive);
                 continue;
             }
 
@@ -291,8 +299,8 @@ impl<'a, 'b> Searcher<'a, 'b> {
             let norm = self.k1 * (1.0 - self.b + self.b * length / average);
             let mut score = 0.0;
             let mut moved = 0;
-            while moved < lists.len() && lists[moved].doc == candidate {
-                score += lists[moved].score(self.k1, norm);
+            while moved < live && lists.heads[order[moved]].doc == candidate {
+                score += lists.score(order[moved], self.k1, norm);
                 moved += 1;
             }
             top.push(Hit {
@@ -300,19 +308,57 @@ impl<'a, 'b> Searcher<'a, 'b> {
                 score,
             });
             threshold = top.threshold();
-            for list in &mut lists[..moved] {
-                list.advance()?;
+            for &at in &order[..moved] {
+                lists.advance(at)?;
             }
-            lists.retain(Term::alive);
+        }
+
+        Ok(top.into_sorted())
+    }
+
+    /// Returns the best `k` documents for a query that came down to one list.
+    ///
+    /// One term is the commonest query there is and it has no pivot to find:
+    /// every document in the list is a candidate and the only question is which
+    /// of them score. What is left of the pruning is the block bound, which
+    /// still steps over a whole block whose best posting cannot displace the
+    /// worst hit in hand.
+    fn search_one(&self, lists: &mut Lists<'b>, k: usize) -> Result<Vec<Hit>> {
+        let average = self.index.average_length().max(1.0);
+        let floor = self.k1 * (1.0 - self.b);
+        let mut top = TopK::new(k);
+
+        while lists.heads[0].doc != DocId::MAX {
+            let doc = lists.heads[0].doc;
+            if lists.block_bound(0, self.k1, floor) <= top.threshold() {
+                let next = lists.cursors[0]
+                    .block_last()
+                    .unwrap_or(doc)
+                    .saturating_add(1)
+                    .max(doc.saturating_add(1));
+                lists.seek(0, next)?;
+                continue;
+            }
+            let length = length_of(self.index, doc);
+            let norm = self.k1 * (1.0 - self.b + self.b * length / average);
+            top.push(Hit {
+                doc,
+                score: lists.score(0, self.k1, norm),
+            });
+            lists.advance(0)?;
         }
 
         Ok(top.into_sorted())
     }
 
     /// Opens a cursor for each term that is in the index.
-    fn open(&self, terms: &[&[u8]]) -> Result<Vec<Term<'b>>> {
+    fn open(&self, terms: &[&[u8]]) -> Result<Lists<'b>> {
         let documents = self.index.documents();
-        let mut lists = Vec::with_capacity(terms.len());
+        let mut lists = Lists {
+            heads: Vec::with_capacity(terms.len()),
+            cursors: Vec::with_capacity(terms.len()),
+            counts: Vec::with_capacity(terms.len()),
+        };
         for term in terms {
             let Some(list) = self.index.postings(term)? else {
                 continue;
@@ -325,57 +371,78 @@ impl<'a, 'b> Searcher<'a, 'b> {
             let Some(doc) = cursor.advance()? else {
                 continue;
             };
-            lists.push(Term {
-                cursor,
-                count: list.len(),
+            lists.heads.push(Head {
                 doc,
                 idf,
                 bound: idf * (self.k1 + 1.0),
             });
+            lists.cursors.push(cursor);
+            lists.counts.push(list.len());
         }
         Ok(lists)
     }
 }
 
-/// One query term, its cursor and the most it can ever contribute.
-#[derive(Debug)]
-struct Term<'a> {
-    cursor: Cursor<'a>,
-    /// How many documents the list holds, which a total wants and the scorer
-    /// has already spent to get the inverse document frequency.
-    count: u32,
-    /// Where the cursor is, cached because the pivot search reads it once per
-    /// term per iteration and the sort reads it again.
+/// The hot half of a query term: where its cursor is and what it could add.
+///
+/// This is kept away from the cursor because a cursor holds a decoded block and
+/// so is a kilobyte wide, and the walk reads these three numbers once per term
+/// for every document it steps over. Held inside the cursors, that would be a
+/// fresh cache line per term per step; held here it is a few words that stay in
+/// cache for the whole query.
+#[derive(Debug, Clone, Copy)]
+struct Head {
+    /// Where the cursor is, or [`DocId::MAX`] once the list is spent. Nothing
+    /// else can carry that identifier, because a corpus with four billion
+    /// documents in one segment does not get written in the first place.
     doc: DocId,
     idf: f32,
     /// The most this term can add to any document's score, anywhere.
     bound: f32,
 }
 
-impl Term<'_> {
-    /// Whether the cursor still has documents.
-    fn alive(&self) -> bool {
-        self.cursor.doc().is_some()
+/// The posting lists one query is walking.
+#[derive(Debug)]
+struct Lists<'a> {
+    heads: Vec<Head>,
+    cursors: Vec<Cursor<'a>>,
+    /// How many documents each list holds, which a total wants and the scorer
+    /// has already spent to get the inverse document frequency.
+    counts: Vec<u32>,
+}
+
+impl Lists<'_> {
+    fn len(&self) -> usize {
+        self.heads.len()
     }
 
-    /// Moves to the next document.
-    fn advance(&mut self) -> Result<()> {
-        self.doc = self.cursor.advance()?.unwrap_or(DocId::MAX);
+    fn is_empty(&self) -> bool {
+        self.heads.is_empty()
+    }
+
+    /// The lowest document any list is still on, or [`DocId::MAX`] when they
+    /// are all spent.
+    fn front(&self) -> DocId {
+        self.heads
+            .iter()
+            .map(|head| head.doc)
+            .min()
+            .unwrap_or(DocId::MAX)
+    }
+
+    /// Moves one list to its next document.
+    fn advance(&mut self, at: usize) -> Result<()> {
+        self.heads[at].doc = self.cursors[at].advance()?.unwrap_or(DocId::MAX);
         Ok(())
     }
 
-    /// Moves to the first document at or after `target`.
-    fn seek(&mut self, target: DocId) -> Result<()> {
-        self.doc = self.cursor.seek(target)?.unwrap_or(DocId::MAX);
+    /// Moves one list to the first document at or after `target`.
+    fn seek(&mut self, at: usize, target: DocId) -> Result<()> {
+        self.heads[at].doc = self.cursors[at].seek(target)?.unwrap_or(DocId::MAX);
         Ok(())
     }
 
-    /// The last document of the block the cursor is in.
-    fn block_last(&self) -> Option<DocId> {
-        self.cursor.block_last()
-    }
-
-    /// The most this term can add to a document in the block the cursor is in.
+    /// The most one term can add to a document in the block its cursor is in.
     ///
     /// The frequency comes from the byte the posting format stores per block,
     /// and the length is taken to be zero, which is the shortest a document can
@@ -385,19 +452,19 @@ impl Term<'_> {
         reason = "a frequency past the range of f32 would need a document of four \
                   billion words, and it is a bound rather than a score"
     )]
-    fn block_bound(&self, k1: f32, floor: f32) -> f32 {
-        let frequency = self.cursor.block_max_frequency() as f32;
-        self.idf * (frequency * (k1 + 1.0)) / (frequency + floor)
+    fn block_bound(&self, at: usize, k1: f32, floor: f32) -> f32 {
+        let frequency = self.cursors[at].block_max_frequency() as f32;
+        self.heads[at].idf * (frequency * (k1 + 1.0)) / (frequency + floor)
     }
 
-    /// What this term adds to the document the cursor is on.
+    /// What one term adds to the document its cursor is on.
     #[expect(
         clippy::cast_precision_loss,
         reason = "the same bound as block_bound, on the same quantity"
     )]
-    fn score(&self, k1: f32, norm: f32) -> f32 {
-        let frequency = self.cursor.frequency() as f32;
-        self.idf * (frequency * (k1 + 1.0)) / (frequency + norm)
+    fn score(&self, at: usize, k1: f32, norm: f32) -> f32 {
+        let frequency = self.cursors[at].frequency() as f32;
+        self.heads[at].idf * (frequency * (k1 + 1.0)) / (frequency + norm)
     }
 }
 
@@ -420,10 +487,10 @@ fn analyse(query: &str) -> Vec<Vec<u8>> {
 /// before the pivot are on documents of their own and a block bound taken from
 /// where they are now says nothing about the candidate. The tighter bound is
 /// used once the cursors agree, which is where it is sound.
-fn pivot(lists: &[Term<'_>], threshold: f32) -> Option<usize> {
+fn pivot(lists: &Lists<'_>, order: &[usize], threshold: f32) -> Option<usize> {
     let mut sum = 0.0;
-    for (at, list) in lists.iter().enumerate() {
-        sum += list.bound;
+    for (at, &which) in order.iter().enumerate() {
+        sum += lists.heads[which].bound;
         if sum > threshold {
             return Some(at);
         }
