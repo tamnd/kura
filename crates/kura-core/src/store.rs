@@ -14,19 +14,66 @@
 //! of documents, so writing the name with every value would cost more than most
 //! of the values do.
 //!
-//! Lookup is a direct index into an offset array rather than a walk. A hit list
-//! is a scattered set of document numbers by the time it reaches here, so the
-//! access pattern is random and any layout that has to scan to find a document
-//! is the wrong one.
+//! # Why this is compressed and the index is not
 //!
-//! The offsets are four bytes each unless the payload needs more, which is the
-//! difference between four and eight bytes per document for every store under
-//! four gigabytes, and those are almost all of them. A store of short documents
-//! is mostly its offset array, so this is not a small saving.
+//! The store is the largest thing in a segment, usually by more than it is
+//! close. An index of prose is a fraction of the prose; the copy of the prose
+//! kept to show a person is all of it. It is also the coldest thing in a
+//! segment: a query touches the postings of every matching document and the
+//! stored fields of ten. Spending a decompression on those ten to make the
+//! whole file half the size is the easiest trade in the format.
+//!
+//! Records are packed into blocks of about sixteen kilobytes and each block is
+//! compressed on its own. Compressing the whole store as one stream would give
+//! up random access, and compressing each document on its own would throw away
+//! the repetition between documents, which on a real corpus is most of what
+//! there is to find. A block is the smallest unit that still has neighbours in
+//! it.
+//!
+//! A document larger than a block gets a block to itself, so reading it means
+//! decompressing all of it. That is the price of storing a large document at
+//! all, and it is paid by the query that asks for it rather than by the corpus.
+//!
+//! # Finding a document
+//!
+//! A hit list is a scattered set of document numbers by the time it reaches
+//! here, so lookup is random access and anything that scans is the wrong shape.
+//! Each document has a four byte offset into its own decompressed block, and
+//! the block it belongs to is found by a binary search over a directory with
+//! one entry per block. The search is a few dozen nanoseconds against a
+//! decompression measured in microseconds, so it does not show up.
+//!
+//! Decompressing needs somewhere to put the bytes, and a reader is shared and
+//! immutable, so the caller passes a [`Scratch`]. It holds the last block that
+//! was decoded, which is what makes reading a page of hits that landed near
+//! each other cost one decompression rather than ten.
 
 use crate::DocId;
 use crate::codec::{get_uvarint, put_uvarint, split_at};
 use crate::error::{Error, Result};
+use crate::lz;
+
+/// How much raw record data a block holds before the next document starts a new
+/// one.
+///
+/// The trade is compression against the cost of one lookup, and it is lopsided.
+/// Over fifty thousand generated documents of about five kilobytes each, four
+/// kilobyte blocks stored the corpus at 0.40 of its size and read a document in
+/// 4.1 microseconds, eight at 0.39 and 5.9, sixteen at 0.38 and 9.6, and thirty
+/// two at 0.37 and 16.7. Quadrupling the block buys three percent of the size
+/// and costs four times the read.
+///
+/// Eight is the point where the ratio has nearly stopped moving. Documents
+/// shorter than this share a block and compress against each other, which is
+/// where blocking earns its keep; documents longer than it are on their own
+/// either way.
+const BLOCK: usize = 8 * 1024;
+
+/// The size of one entry in the block directory.
+const ENTRY: usize = 16;
+
+/// The size of one document offset.
+const SLOT: usize = 4;
 
 /// Builds a store.
 ///
@@ -36,8 +83,17 @@ use crate::error::{Error, Result};
 #[derive(Debug, Default)]
 pub struct Writer {
     names: Vec<String>,
-    offsets: Vec<u64>,
+    /// Where each document starts inside its own block, four bytes each.
+    offsets: Vec<u32>,
+    /// The directory, four `u32` fields per block. See [`Writer::flush`].
+    blocks: Vec<u32>,
+    /// The compressed blocks, back to back.
     payload: Vec<u8>,
+    /// The block being filled, uncompressed.
+    block: Vec<u8>,
+    /// The first document in the block being filled.
+    first: u32,
+    compressor: lz::Compressor,
     values: u64,
 }
 
@@ -58,38 +114,74 @@ impl Writer {
     /// # Errors
     ///
     /// Returns [`Error::NotSorted`] if more documents are added than a document
-    /// identifier can hold.
+    /// identifier can hold, and [`Error::Overflow`] if the compressed payload
+    /// passes four gigabytes, which is where a segment is split anyway.
     pub fn push<'a>(
         &mut self,
         fields: impl IntoIterator<Item = (&'a str, &'a [u8])>,
     ) -> Result<DocId> {
         let doc =
             u32::try_from(self.offsets.len()).map_err(|_| Error::NotSorted { at: u32::MAX })?;
-        let start = self.payload.len();
+        // The block is closed before the record goes in rather than after, so a
+        // large document lands in a block of its own instead of being appended
+        // to one that was nearly full.
+        if self.block.len() >= BLOCK {
+            self.flush()?;
+        }
+        let start = u32::try_from(self.block.len()).map_err(|_| Error::Overflow)?;
         // The count goes in first and is not known yet, so a placeholder is
         // written and rewritten. It is one byte for anything under 128 fields,
         // and a document with more fields than that is not a document.
-        self.payload.push(0);
+        self.block.push(0);
         let mut count = 0u64;
         for (name, value) in fields {
             let index = self.name(name);
-            put_uvarint(&mut self.payload, index);
-            put_uvarint(&mut self.payload, value.len() as u64);
-            self.payload.extend_from_slice(value);
+            put_uvarint(&mut self.block, index);
+            put_uvarint(&mut self.block, value.len() as u64);
+            self.block.extend_from_slice(value);
             count += 1;
         }
         self.values += count;
-        if let (true, Some(slot)) = (count < 128, self.payload.get_mut(start)) {
+        if let (true, Some(slot)) = (count < 128, self.block.get_mut(start as usize)) {
             *slot = u8::try_from(count).unwrap_or(0);
         } else {
             // Rare enough not to be worth a second pass over the common case.
             // The placeholder is dropped and the real count spliced in.
             let mut header = Vec::with_capacity(crate::codec::MAX_VARINT_LEN64);
             put_uvarint(&mut header, count);
-            self.payload.splice(start..=start, header);
+            let at = start as usize;
+            self.block.splice(at..=at, header);
         }
-        self.offsets.push(start as u64);
+        self.offsets.push(start);
         Ok(doc)
+    }
+
+    /// Compresses the block being filled and starts a new one.
+    ///
+    /// The directory entry is the first document in the block, where the block
+    /// starts in the payload, how many bytes it was and how many it became. A
+    /// block that did not compress is written as it stands and says so by
+    /// giving the same number twice, which is why the compressed form is thrown
+    /// away when it is not smaller rather than when it is not strictly smaller.
+    fn flush(&mut self) -> Result<()> {
+        if self.block.is_empty() {
+            return Ok(());
+        }
+        let start = u32::try_from(self.payload.len()).map_err(|_| Error::Overflow)?;
+        let raw = u32::try_from(self.block.len()).map_err(|_| Error::Overflow)?;
+        self.compressor.compress(&self.block, &mut self.payload);
+        let mut comp =
+            u32::try_from(self.payload.len() - start as usize).map_err(|_| Error::Overflow)?;
+        if comp >= raw {
+            self.payload.truncate(start as usize);
+            self.payload.extend_from_slice(&self.block);
+            comp = raw;
+        }
+        self.blocks
+            .extend_from_slice(&[self.first, start, raw, comp]);
+        self.first = u32::try_from(self.offsets.len()).map_err(|_| Error::Overflow)?;
+        self.block.clear();
+        Ok(())
     }
 
     /// How many documents have been pushed.
@@ -124,39 +216,60 @@ impl Writer {
     }
 
     /// Writes the section.
-    #[must_use]
-    pub fn finish(self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.payload.len() + self.offsets.len() * 8 + 64);
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Overflow`] if the compressed payload passes four
+    /// gigabytes.
+    pub fn finish(mut self) -> Result<Vec<u8>> {
+        self.flush()?;
+        let mut out = Vec::with_capacity(self.payload.len() + self.offsets.len() * SLOT + 64);
         put_uvarint(&mut out, self.offsets.len() as u64);
         put_uvarint(&mut out, self.names.len() as u64);
         for name in &self.names {
             put_uvarint(&mut out, name.len() as u64);
             out.extend_from_slice(name.as_bytes());
         }
-        // Four bytes covers every payload under four gigabytes, which is the
-        // size a segment is split at anyway, so the wide form is a fallback
-        // rather than a case worth optimising.
-        let width: u8 = if self.payload.len() > u32::MAX as usize {
-            8
-        } else {
-            4
-        };
-        out.push(width);
-        put_uvarint(&mut out, self.offsets.len() as u64 * u64::from(width));
+        put_uvarint(&mut out, self.blocks.len() as u64 * 4);
+        for field in &self.blocks {
+            out.extend_from_slice(&field.to_le_bytes());
+        }
+        put_uvarint(&mut out, self.offsets.len() as u64 * SLOT as u64);
         for offset in &self.offsets {
-            // The low four bytes of a little endian u64 are the little endian
-            // u32, so the narrow form is a prefix of the wide one and neither
-            // needs a cast.
-            out.extend_from_slice(
-                offset
-                    .to_le_bytes()
-                    .get(..usize::from(width))
-                    .unwrap_or_default(),
-            );
+            out.extend_from_slice(&offset.to_le_bytes());
         }
         put_uvarint(&mut out, self.payload.len() as u64);
         out.extend_from_slice(&self.payload);
-        out
+        Ok(out)
+    }
+}
+
+/// Somewhere to put a decompressed block.
+///
+/// A reader is shared and holds nothing that changes, so the buffer a block is
+/// decoded into belongs to whoever is reading. One of these per thread is the
+/// intended shape. It caches the last block, so a page of hits that landed near
+/// each other in the corpus costs one decompression rather than one each.
+#[derive(Debug, Default)]
+pub struct Scratch {
+    block: Vec<u8>,
+    /// Which block is in the buffer, and which reader it came from. Two readers
+    /// number their blocks the same way, so the block number alone would let a
+    /// scratch used against one reader answer for the other.
+    held: Option<(usize, usize)>,
+}
+
+impl Scratch {
+    /// Creates an empty buffer.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Forgets whatever block is held, without releasing the memory.
+    pub fn clear(&mut self) {
+        self.block.clear();
+        self.held = None;
     }
 }
 
@@ -164,10 +277,10 @@ impl Writer {
 #[derive(Debug, Clone)]
 pub struct Reader<'a> {
     names: Vec<&'a str>,
+    blocks: &'a [u8],
     offsets: &'a [u8],
     payload: &'a [u8],
     count: u32,
-    width: usize,
 }
 
 impl<'a> Reader<'a> {
@@ -191,17 +304,19 @@ impl<'a> Reader<'a> {
             resolved.push(core::str::from_utf8(bytes).map_err(|_| Error::Overflow)?);
             rest = tail;
         }
-        let (width, rest) = split_at(rest, 1)?;
-        let width = match width.first() {
-            Some(4) => 4usize,
-            Some(8) => 8usize,
-            _ => return Err(Error::Overflow),
-        };
+        let (len, rest) = get_uvarint(rest)?;
+        let (blocks, rest) = split_at(rest, usize::try_from(len).map_err(|_| Error::Overflow)?)?;
+        if blocks.len() % ENTRY != 0 {
+            return Err(Error::Truncated {
+                needed: blocks.len().next_multiple_of(ENTRY),
+                available: blocks.len(),
+            });
+        }
         let (len, rest) = get_uvarint(rest)?;
         let (offsets, rest) = split_at(rest, usize::try_from(len).map_err(|_| Error::Overflow)?)?;
-        if offsets.len() != count as usize * width {
+        if offsets.len() != count as usize * SLOT {
             return Err(Error::Truncated {
-                needed: count as usize * width,
+                needed: count as usize * SLOT,
                 available: offsets.len(),
             });
         }
@@ -209,10 +324,10 @@ impl<'a> Reader<'a> {
         let (payload, _) = split_at(rest, usize::try_from(len).map_err(|_| Error::Overflow)?)?;
         Ok(Self {
             names: resolved,
+            blocks,
             offsets,
             payload,
             count,
-            width,
         })
     }
 
@@ -234,29 +349,91 @@ impl<'a> Reader<'a> {
         &self.names
     }
 
+    /// How many blocks the store is split into.
+    #[must_use]
+    pub const fn blocks(&self) -> usize {
+        self.blocks.len() / ENTRY
+    }
+
+    /// One directory entry, as first document, start, raw length, stored
+    /// length.
+    fn entry(&self, at: usize) -> Option<(u32, usize, usize, usize)> {
+        let bytes = self.blocks.get(at * ENTRY..at * ENTRY + ENTRY)?;
+        let mut field = [0u32; 4];
+        for (slot, raw) in field.iter_mut().zip(bytes.chunks_exact(4)) {
+            *slot = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+        }
+        Some((
+            field[0],
+            field[1] as usize,
+            field[2] as usize,
+            field[3] as usize,
+        ))
+    }
+
+    /// The block a document lives in, which is the last one that starts at or
+    /// before it.
+    fn locate(&self, doc: DocId) -> Option<usize> {
+        let (mut lo, mut hi) = (0usize, self.blocks());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.entry(mid)?.0 <= doc {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo.checked_sub(1)
+    }
+
     /// The values stored for a document.
+    ///
+    /// The scratch buffer is where the document's block is decompressed, and it
+    /// keeps whatever it decoded last, so asking for documents that were
+    /// written near each other costs one decompression between them.
     ///
     /// # Errors
     ///
     /// Returns [`Error::NotSorted`] if there is no such document, and a
     /// decoding error if the record for it is not what it claims to be.
-    pub fn get(&self, doc: DocId) -> Result<Document<'a, '_>> {
+    pub fn get<'s>(&'s self, doc: DocId, scratch: &'s mut Scratch) -> Result<Document<'s>> {
         if doc >= self.count {
             return Err(Error::NotSorted { at: doc });
         }
-        let at = doc as usize * self.width;
-        let bytes = self
+        let at = doc as usize * SLOT;
+        let slot = self
             .offsets
-            .get(at..at + self.width)
+            .get(at..at + SLOT)
             .ok_or(Error::NotSorted { at: doc })?;
-        let mut raw = [0u8; 8];
-        for (slot, byte) in raw.iter_mut().zip(bytes) {
-            *slot = *byte;
-        }
-        let offset = usize::try_from(u64::from_le_bytes(raw)).map_err(|_| Error::Overflow)?;
-        let rest = self.payload.get(offset..).ok_or(Error::Truncated {
+        let offset = u32::from_le_bytes([slot[0], slot[1], slot[2], slot[3]]) as usize;
+
+        let which = self.locate(doc).ok_or(Error::NotSorted { at: doc })?;
+        let (_, start, raw, stored) = self.entry(which).ok_or(Error::NotSorted { at: doc })?;
+        let bytes = self
+            .payload
+            .get(start..start + stored)
+            .ok_or(Error::Truncated {
+                needed: start + stored,
+                available: self.payload.len(),
+            })?;
+        // A block that did not compress is read where it lies. That is not only
+        // faster, it is the whole of the read for a store of values that have
+        // nothing in common with each other.
+        let block: &'s [u8] = if stored == raw {
+            bytes
+        } else {
+            let held = (self.payload.as_ptr() as usize, which);
+            if scratch.held != Some(held) {
+                scratch.clear();
+                lz::decompress(bytes, raw, &mut scratch.block)?;
+                scratch.held = Some(held);
+            }
+            &scratch.block
+        };
+
+        let rest = block.get(offset..).ok_or(Error::Truncated {
             needed: offset,
-            available: self.payload.len(),
+            available: block.len(),
         })?;
         let (count, rest) = get_uvarint(rest)?;
         Ok(Document {
@@ -270,23 +447,23 @@ impl<'a> Reader<'a> {
 /// The values of one document, walked as they are asked for.
 ///
 /// Nothing is decoded until a field is read, and a value that is read comes
-/// back as a slice of the segment rather than a copy of it. A result page asks
-/// for two fields out of six, so decoding all six on the way past would be five
-/// sixths wasted.
+/// back as a slice of the block it was decompressed into rather than a copy of
+/// it. A result page asks for two fields out of six, so decoding all six on the
+/// way past would be five sixths wasted.
 #[derive(Debug, Clone)]
-pub struct Document<'a, 'n> {
-    names: &'n [&'a str],
-    rest: &'a [u8],
+pub struct Document<'s> {
+    names: &'s [&'s str],
+    rest: &'s [u8],
     left: u64,
 }
 
-impl<'a> Document<'a, '_> {
+impl<'s> Document<'s> {
     /// The next field and its value.
     ///
     /// # Errors
     ///
     /// Returns a decoding error if the record ends in the middle of a value.
-    pub fn next_field(&mut self) -> Result<Option<(&'a str, &'a [u8])>> {
+    pub fn next_field(&mut self) -> Result<Option<(&'s str, &'s [u8])>> {
         if self.left == 0 {
             return Ok(None);
         }
@@ -305,7 +482,7 @@ impl<'a> Document<'a, '_> {
     /// # Errors
     ///
     /// Returns a decoding error if the record ends in the middle of a value.
-    pub fn field(&self, name: &str) -> Result<Option<&'a [u8]>> {
+    pub fn field(&self, name: &str) -> Result<Option<&'s [u8]>> {
         let mut walk = self.clone();
         while let Some((found, value)) = walk.next_field()? {
             if found == name {
@@ -331,7 +508,7 @@ mod tests {
                 .push(doc.iter().map(|(n, v)| (*n, v.as_bytes())))
                 .expect("a handful of documents fit");
         }
-        writer.finish()
+        writer.finish().expect("a handful of documents fit")
     }
 
     fn corpus() -> Vec<Vec<(&'static str, &'static str)>> {
@@ -352,8 +529,11 @@ mod tests {
         let bytes = build(&corpus());
         let store = Reader::new(&bytes).expect("what was written reads");
         assert_eq!(store.len(), 3);
+        let mut scratch = Scratch::new();
         for (doc, fields) in corpus().iter().enumerate() {
-            let record = store.get(doc as DocId).expect("the document is there");
+            let record = store
+                .get(doc as DocId, &mut scratch)
+                .expect("the document is there");
             for (name, value) in fields {
                 assert_eq!(
                     record.field(name).expect("decodes"),
@@ -368,7 +548,8 @@ mod tests {
     fn a_field_a_document_does_not_have_is_not_there() {
         let bytes = build(&corpus());
         let store = Reader::new(&bytes).expect("reads");
-        let record = store.get(1).expect("is there");
+        let mut scratch = Scratch::new();
+        let record = store.get(1, &mut scratch).expect("is there");
         assert_eq!(record.field("body").expect("decodes"), None);
         assert_eq!(record.field("nothing").expect("decodes"), None);
     }
@@ -377,7 +558,8 @@ mod tests {
     fn an_empty_value_is_not_a_missing_value() {
         let bytes = build(&corpus());
         let store = Reader::new(&bytes).expect("reads");
-        let record = store.get(2).expect("is there");
+        let mut scratch = Scratch::new();
+        let record = store.get(2, &mut scratch).expect("is there");
         assert_eq!(record.field("body").expect("decodes"), Some(&b""[..]));
     }
 
@@ -385,7 +567,8 @@ mod tests {
     fn the_fields_come_back_in_the_order_they_were_written() {
         let bytes = build(&corpus());
         let store = Reader::new(&bytes).expect("reads");
-        let mut record = store.get(2).expect("is there");
+        let mut scratch = Scratch::new();
+        let mut record = store.get(2, &mut scratch).expect("is there");
         let mut seen = Vec::new();
         while let Some((name, _)) = record.next_field().expect("decodes") {
             seen.push(name);
@@ -428,9 +611,10 @@ mod tests {
         writer
             .push([("author", &b"ada"[..]), ("author", &b"grace"[..])])
             .expect("fits");
-        let bytes = writer.finish();
+        let bytes = writer.finish().expect("fits");
         let store = Reader::new(&bytes).expect("reads");
-        let mut record = store.get(0).expect("is there");
+        let mut scratch = Scratch::new();
+        let mut record = store.get(0, &mut scratch).expect("is there");
         let mut seen = Vec::new();
         while let Some((name, value)) = record.next_field().expect("decodes") {
             seen.push((name, value.to_vec()));
@@ -446,14 +630,16 @@ mod tests {
         let mut writer = Writer::new();
         writer.push(core::iter::empty()).expect("fits");
         writer.push([("id", &b"x"[..])]).expect("fits");
-        let bytes = writer.finish();
+        let bytes = writer.finish().expect("fits");
         let store = Reader::new(&bytes).expect("reads");
         assert_eq!(store.len(), 2);
-        let mut record = store.get(0).expect("is there");
+        let mut scratch = Scratch::new();
+        let mut record = store.get(0, &mut scratch).expect("is there");
         assert!(record.next_field().expect("decodes").is_none());
+        let mut scratch = Scratch::new();
         assert_eq!(
             store
-                .get(1)
+                .get(1, &mut scratch)
                 .expect("is there")
                 .field("id")
                 .expect("decodes"),
@@ -471,9 +657,10 @@ mod tests {
             .push(names.iter().map(|n| (n.as_str(), n.as_bytes())))
             .expect("fits");
         writer.push([("after", &b"still fine"[..])]).expect("fits");
-        let bytes = writer.finish();
+        let bytes = writer.finish().expect("fits");
         let store = Reader::new(&bytes).expect("reads");
-        let record = store.get(0).expect("is there");
+        let mut scratch = Scratch::new();
+        let record = store.get(0, &mut scratch).expect("is there");
         for name in &names {
             assert_eq!(
                 record.field(name).expect("decodes"),
@@ -481,9 +668,10 @@ mod tests {
                 "{name}"
             );
         }
+        let mut scratch = Scratch::new();
         assert_eq!(
             store
-                .get(1)
+                .get(1, &mut scratch)
                 .expect("is there")
                 .field("after")
                 .expect("decodes"),
@@ -492,21 +680,140 @@ mod tests {
     }
 
     #[test]
+    fn a_store_that_spans_many_blocks_reads_back_in_any_order() {
+        // Every document has to be findable through the directory, and the
+        // order they are asked for is the order a hit list arrives in, which is
+        // not the order they were written.
+        let bodies: Vec<String> = (0..2_000)
+            .map(|i| {
+                format!(
+                    "document {i} {}",
+                    "some fairly ordinary prose ".repeat(i % 40)
+                )
+            })
+            .collect();
+        let mut writer = Writer::new();
+        for body in &bodies {
+            writer
+                .push([("body", body.as_bytes())])
+                .expect("a couple of thousand documents fit");
+        }
+        let bytes = writer.finish().expect("fits");
+        let store = Reader::new(&bytes).expect("reads");
+        assert!(
+            store.blocks() > 20,
+            "{} blocks, which is not enough to be testing blocks",
+            store.blocks()
+        );
+
+        let mut scratch = Scratch::new();
+        // A shuffle without a random number generator: step through by a stride
+        // that shares no factor with the count, which visits every document.
+        let mut doc = 0usize;
+        for _ in 0..bodies.len() {
+            doc = (doc + 997) % bodies.len();
+            let record = store.get(doc as DocId, &mut scratch).expect("is there");
+            assert_eq!(
+                record.field("body").expect("decodes"),
+                Some(bodies[doc].as_bytes()),
+                "document {doc}"
+            );
+        }
+    }
+
+    #[test]
+    fn prose_is_smaller_in_the_store_than_it_was_outside_it() {
+        // The reason the store is blocked at all. If this stops holding, the
+        // compression is not earning the indirection.
+        let body = "the quick brown fox jumps over the lazy dog while the dog sleeps ";
+        let mut writer = Writer::new();
+        let mut raw = 0;
+        for i in 0..500 {
+            let text = format!("{body}{i}");
+            raw += text.len();
+            writer.push([("body", text.as_bytes())]).expect("fits");
+        }
+        let bytes = writer.finish().expect("fits");
+        assert!(
+            bytes.len() < raw / 4,
+            "{} bytes for {raw} bytes of text",
+            bytes.len()
+        );
+    }
+
+    #[test]
+    fn a_document_larger_than_a_block_is_a_block() {
+        let big = "x".repeat(BLOCK * 3);
+        let mut writer = Writer::new();
+        writer.push([("small", &b"before"[..])]).expect("fits");
+        writer.push([("big", big.as_bytes())]).expect("fits");
+        writer.push([("small", &b"after"[..])]).expect("fits");
+        let bytes = writer.finish().expect("fits");
+        let store = Reader::new(&bytes).expect("reads");
+        let mut scratch = Scratch::new();
+        assert_eq!(
+            store
+                .get(1, &mut scratch)
+                .expect("is there")
+                .field("big")
+                .expect("decodes"),
+            Some(big.as_bytes())
+        );
+        let mut scratch = Scratch::new();
+        assert_eq!(
+            store
+                .get(2, &mut scratch)
+                .expect("is there")
+                .field("small")
+                .expect("decodes"),
+            Some(&b"after"[..])
+        );
+    }
+
+    #[test]
+    fn a_scratch_holds_the_last_block_and_not_the_wrong_one() {
+        // Two stores number their blocks the same way, so a scratch that
+        // remembers only the number would answer the second store from the
+        // first store's bytes.
+        let first = build(&corpus());
+        let second = build(&[vec![("id", "z"), ("title", "elsewhere")]]);
+        let one = Reader::new(&first).expect("reads");
+        let two = Reader::new(&second).expect("reads");
+        let mut scratch = Scratch::new();
+        assert_eq!(
+            one.get(0, &mut scratch)
+                .expect("is there")
+                .field("id")
+                .expect("decodes"),
+            Some(&b"a"[..])
+        );
+        assert_eq!(
+            two.get(0, &mut scratch)
+                .expect("is there")
+                .field("id")
+                .expect("decodes"),
+            Some(&b"z"[..])
+        );
+    }
+
+    #[test]
     fn asking_for_a_document_that_is_not_there_is_an_error() {
         let bytes = build(&corpus());
         let store = Reader::new(&bytes).expect("reads");
-        assert!(store.get(3).is_err());
-        assert!(store.get(DocId::MAX).is_err());
+        let mut scratch = Scratch::new();
+        assert!(store.get(3, &mut scratch).is_err());
+        assert!(store.get(DocId::MAX, &mut scratch).is_err());
     }
 
     #[test]
     fn an_empty_store_is_valid() {
-        let bytes = Writer::new().finish();
+        let bytes = Writer::new().finish().expect("fits");
         let store = Reader::new(&bytes).expect("reads");
         assert!(store.is_empty());
         assert_eq!(store.len(), 0);
         assert!(store.names().is_empty());
-        assert!(store.get(0).is_err());
+        assert_eq!(store.blocks(), 0);
+        assert!(store.get(0, &mut Scratch::new()).is_err());
     }
 
     #[test]
@@ -516,11 +823,15 @@ mod tests {
             let Ok(store) = Reader::new(&bytes[..cut]) else {
                 continue;
             };
+            let mut scratch = Scratch::new();
             for doc in 0..4 {
-                let Ok(record) = store.get(doc) else { continue };
+                let Ok(record) = store.get(doc, &mut scratch) else {
+                    continue;
+                };
                 let _ = record.field("title");
                 let mut walk = record;
                 while let Ok(Some(_)) = walk.next_field() {}
+                scratch = Scratch::new();
             }
         }
     }

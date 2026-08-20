@@ -81,6 +81,8 @@ See the list below.
 **Flags, two bytes.**
 Reserved, written as zero.
 Per section compression will go here, which is the reason it is per section rather than per segment: a term dictionary and a block of quantised vectors do not want the same answer.
+The stored fields already compress, but they do it inside the section, because a store has to stay randomly addressable and that means the compression has to know where the record boundaries are.
+A section that can be decoded as a whole is the case this field is for.
 
 **Padding, four bytes.**
 It puts the offset and the length on an eight byte boundary within the entry, so reading the table costs no unaligned loads on the architectures that care and none of the compiler's alignment handling on the ones that do not.
@@ -95,7 +97,7 @@ Relative to the body means a writer can build the body before it knows where in 
 | --- | --- | --- |
 | 1 | terms | the term dictionary, in prefix folded blocks, and where each term's postings start |
 | 2 | postings | posting lists, packed in fixed size blocks, with term frequencies in a stream beside them |
-| 3 | fields | stored field values, returned with a hit rather than searched, with the names in a dictionary and one offset per document |
+| 3 | fields | stored field values, returned with a hit rather than searched, with the names in a dictionary and the records packed into compressed blocks |
 | 4 | vectors | quantised vectors, one per passage |
 | 5 | acl | the access control lists governing the documents in this segment |
 | 6 | columns | columnar values, for filters and facets |

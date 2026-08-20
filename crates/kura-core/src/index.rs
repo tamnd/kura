@@ -177,7 +177,7 @@ impl Writer {
         segment.add(kind::POSTINGS, blob)?;
         segment.add(kind::NORMS, norms)?;
         if self.stored {
-            segment.add(kind::FIELDS, self.store.finish())?;
+            segment.add(kind::FIELDS, self.store.finish()?)?;
         }
         Ok(segment.finish())
     }
@@ -566,8 +566,9 @@ mod tests {
         let index = Reader::open(&segment).expect("opens");
         let store = index.store().expect("the fields were stored");
         assert_eq!(store.len(), 2);
+        let mut scratch = store::Scratch::new();
         for (doc, want) in [(0, &b"a"[..]), (1, &b"b"[..])] {
-            let fields = store.get(doc).expect("reads");
+            let fields = store.get(doc, &mut scratch).expect("reads");
             assert_eq!(fields.field("id").expect("reads"), Some(want));
         }
     }
