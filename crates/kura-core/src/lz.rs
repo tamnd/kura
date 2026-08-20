@@ -255,6 +255,29 @@ pub fn decompress(input: &[u8], expect: usize, out: &mut Vec<u8>) -> Result<()> 
     filled
 }
 
+/// Decompresses a block into a buffer that is used again for the next one.
+///
+/// [`decompress`] appends, so a caller decoding one block after another has to
+/// empty the buffer first, and emptying it means the sizing below writes the
+/// whole block's worth of zeroes again before the decode overwrites every one
+/// of them. This replaces the buffer's contents instead, so the zeroing happens
+/// once, when the buffer grows, rather than once per block. On a store read,
+/// where a page of results is a handful of scattered blocks, that memset was a
+/// measurable share of what fetching the page cost.
+///
+/// # Errors
+///
+/// The same errors [`decompress`] returns, for the same reasons.
+pub fn decompress_into(input: &[u8], expect: usize, out: &mut Vec<u8>) -> Result<()> {
+    let need = expect + WIDE;
+    if out.len() < need {
+        out.resize(need, 0);
+    }
+    let filled = fill(input, out.get_mut(..need).unwrap_or_default(), expect);
+    out.truncate(if filled.is_ok() { expect } else { 0 });
+    filled
+}
+
 /// The body of a decode, working in a buffer that is already the right size.
 ///
 /// `dst` is `expect + WIDE` bytes long. Everything below relies on that, which
@@ -620,5 +643,41 @@ mod tests {
         decompress(&block, input.len(), &mut out).expect("decodes");
         assert_eq!(&out[..6], b"before");
         assert_eq!(&out[6..], &input[..]);
+    }
+
+    #[test]
+    fn a_reused_buffer_holds_the_block_it_was_last_given() {
+        // The buffer is not emptied between blocks, so the case worth checking
+        // is a long block followed by a short one, where whatever the long one
+        // left behind is still sitting past the end of the short one.
+        let long: Vec<u8> = (0..4_000u32).map(|i| (i % 251) as u8).collect();
+        let short = b"short".to_vec();
+        let mut buffer = Vec::new();
+
+        for input in [&long, &short, &long, &short] {
+            let mut block = Vec::new();
+            Compressor::new().compress(input, &mut block);
+            decompress_into(&block, input.len(), &mut buffer).expect("decodes");
+            assert_eq!(&buffer[..], &input[..]);
+        }
+    }
+
+    #[test]
+    fn a_reused_buffer_is_emptied_when_a_block_does_not_decode() {
+        let input = b"something that decoded once".to_vec();
+        let mut block = Vec::new();
+        Compressor::new().compress(&input, &mut block);
+        let mut buffer = Vec::new();
+        decompress_into(&block, input.len(), &mut buffer).expect("decodes");
+        assert_eq!(&buffer[..], &input[..]);
+
+        // The same block, told to expect a length it does not produce.
+        decompress_into(&block, input.len() + 1, &mut buffer)
+            .expect_err("a block that decodes to the wrong length is refused");
+        assert!(
+            buffer.is_empty(),
+            "a refused block left {} bytes behind for the next caller to read",
+            buffer.len()
+        );
     }
 }
