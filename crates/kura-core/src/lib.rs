@@ -24,6 +24,7 @@ pub mod checksum;
 pub mod codec;
 pub mod error;
 pub mod index;
+pub mod lz;
 pub mod posting;
 pub mod search;
 pub mod segment;

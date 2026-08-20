@@ -94,6 +94,11 @@ pub enum Error {
         length: u64,
     },
 
+    /// A compressed block did not decode to what its container said it holds,
+    /// which means the bytes are not the bytes that were written however well
+    /// formed the sequences in them look.
+    BadBlock,
+
     /// A segment is missing a section that the thing being read out of it
     /// cannot do without, which is a different fact from the segment being
     /// short or corrupt: the file is intact and holds something else.
@@ -156,6 +161,7 @@ impl fmt::Display for Error {
                     offset.saturating_add(*length)
                 )
             }
+            Self::BadBlock => f.write_str("a compressed block does not decode to what it should"),
             Self::MissingSection { kind } => {
                 write!(f, "the segment has no section of kind {kind}")
             }

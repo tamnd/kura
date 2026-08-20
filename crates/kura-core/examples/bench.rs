@@ -27,9 +27,11 @@ use kura_core::bitmap::Bitmap;
 use kura_core::bitpack;
 use kura_core::codec::{get_uvarint, put_uvarint};
 use kura_core::index;
+use kura_core::lz;
 use kura_core::posting::{Reader, Writer};
 use kura_core::search::Searcher;
 use kura_core::segment::{self, Segment};
+use kura_core::store;
 use kura_core::terms;
 use kura_core::vector::{Quantised, cosine, dot, normalise};
 
@@ -48,12 +50,92 @@ fn main() {
 
     let encoded = postings();
     engine();
+    stores();
     blocks();
     dictionary();
     bitmaps();
     varints();
     segments(&encoded);
     vectors();
+}
+
+/// The stored fields, which are most of what a segment weighs.
+///
+/// Three numbers. What the text costs on disk once it is blocked and
+/// compressed, because that is the whole reason the store is not a flat array
+/// of records. What it costs to get one document back, which is the price the
+/// query path pays for that. And the raw compression rate, which is what the
+/// first two are made of.
+///
+/// The corpus is generated, and generated text compresses better than real text
+/// because the vocabulary is smaller. The ratio here is a ceiling. The one that
+/// counts is measured against real documents in the benchmark suite.
+fn stores() {
+    let corpus = corpus(50_000);
+    let raw: usize = corpus.iter().map(String::len).sum();
+
+    let mut size = 0;
+    bench_rounds("store fifty thousand documents", 3, corpus.len(), || {
+        let mut writer = store::Writer::new();
+        for text in &corpus {
+            writer
+                .push([("body", text.as_bytes())])
+                .expect("fifty thousand documents fit");
+        }
+        let bytes = writer.finish().expect("what was written fits");
+        size = bytes.len();
+        black_box(&bytes);
+    });
+
+    let mut writer = store::Writer::new();
+    for text in &corpus {
+        writer.push([("body", text.as_bytes())]).expect("fits");
+    }
+    let bytes = writer.finish().expect("fits");
+    let reader = store::Reader::new(&bytes).expect("what was written reads");
+    println!(
+        "store: {:.1} MB of text in {:.1} MB, {:.2} of the input, {} blocks",
+        raw as f64 / 1e6,
+        size as f64 / 1e6,
+        size as f64 / raw as f64,
+        reader.blocks()
+    );
+
+    // The order is the one a hit list arrives in, which is scattered, so every
+    // lookup pays for a block that is not the one already in hand. Reading a
+    // page of ten hits that landed near each other is cheaper than this.
+    let mut scratch = store::Scratch::new();
+    let mut doc = 0usize;
+    bench("read one stored document at random", corpus.len(), || {
+        for _ in 0..corpus.len() {
+            doc = (doc + 30_011) % corpus.len();
+            let record = reader
+                .get(doc as DocId, &mut scratch)
+                .expect("the document is there");
+            black_box(record.field("body").expect("decodes"));
+        }
+    });
+
+    let text: String = corpus[..2_000].concat();
+    let mut compressed = Vec::new();
+    let mut compressor = lz::Compressor::new();
+    bench("compress a megabyte of text", text.len(), || {
+        compressed.clear();
+        compressor.compress(text.as_bytes(), &mut compressed);
+        black_box(&compressed);
+    });
+    let mut back = Vec::new();
+    bench("decompress it again", text.len(), || {
+        back.clear();
+        lz::decompress(&compressed, text.len(), &mut back).expect("what was written decodes");
+        black_box(&back);
+    });
+    println!(
+        "compress: {:.1} MB into {:.1} MB, {:.2} of the input",
+        text.len() as f64 / 1e6,
+        compressed.len() as f64 / 1e6,
+        compressed.len() as f64 / text.len() as f64,
+    );
 }
 
 /// The term dictionary, which every query walks once per term before it reads a
