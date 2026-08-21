@@ -340,6 +340,39 @@ impl<'a> Segment<'a> {
     ///
     /// As [`Segment::open`], minus what [`Segment::verify`] returns.
     pub fn open_without_checksum(bytes: &'a [u8]) -> Result<Self> {
+        Self::structure(bytes, FORMAT_VERSION)
+    }
+
+    /// Opens a segment written by any version this build can still migrate.
+    ///
+    /// This is for [`crate::migrate`] and for nothing else, and the distinction
+    /// it draws is worth saying out loud. Every other way in refuses a version
+    /// that is not this build's, because a reader that parsed an older layout
+    /// hopefully would hand back numbers that came out of the wrong bytes. What
+    /// makes this one safe is that it does not read any section: it checks the
+    /// container, which has not changed across any version this build knows, and
+    /// leaves deciding what the sections mean to a caller that has been told the
+    /// version and is written to know the difference.
+    ///
+    /// Everything structural still holds and every digest is still checked, so a
+    /// migration starts from a file that has been proved to be the file that was
+    /// written. A version newer than this build's is still refused, since there
+    /// is nothing to be done with a layout that had not been invented yet.
+    ///
+    /// # Errors
+    ///
+    /// As [`Segment::open`], except that
+    /// [`Error::UnsupportedVersion`] is only for a version outside
+    /// [`crate::OLDEST_VERSION`] to [`FORMAT_VERSION`].
+    pub fn open_for_migration(bytes: &'a [u8]) -> Result<Self> {
+        let segment = Self::structure(bytes, crate::OLDEST_VERSION)?;
+        segment.verify()?;
+        Ok(segment)
+    }
+
+    /// Every structural check, accepting any version from `oldest` up to this
+    /// build's.
+    fn structure(bytes: &'a [u8], oldest: u16) -> Result<Self> {
         let (header, rest) = split_at(bytes, HEADER_LEN)?;
 
         let (magic, header) = split_at(header, MAGIC.len())?;
@@ -347,7 +380,7 @@ impl<'a> Segment<'a> {
             return Err(Error::BadMagic);
         }
         let (version, header) = get_u16(header)?;
-        if version != FORMAT_VERSION {
+        if version < oldest || version > FORMAT_VERSION {
             return Err(Error::UnsupportedVersion {
                 found: version,
                 expected: FORMAT_VERSION,
@@ -580,8 +613,11 @@ impl<'a> Segment<'a> {
         self.body.get(start..end)
     }
 
-    /// The format version in the header, which is always [`FORMAT_VERSION`] for
-    /// a segment this build was willing to open.
+    /// The format version in the header.
+    ///
+    /// Always [`FORMAT_VERSION`], except for a segment opened by
+    /// [`Segment::open_for_migration`], which is the one way in that takes an
+    /// older one.
     #[must_use]
     pub const fn version(&self) -> u16 {
         self.version

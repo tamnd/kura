@@ -321,6 +321,31 @@ It prints what it would do and writes nothing until it is given `--commit`, and 
 
 It writes one manifest into the slot that is not the committed one, which is the path every ordinary commit takes, so the repair is itself recoverable: the manifest it replaced stays in the store until the commit after it.
 
+## Moving an index off an older format
+
+```sh
+./target/release/kura-cli migrate /tmp/docs.kura -o /tmp/docs-2.kura
+```
+
+A build refuses a format version it does not recognise rather than parsing it hopefully, which is the right refusal and is also the whole problem, because the build that can read your file is the build you have stopped running.
+`migrate` is the way across.
+
+```
+  segment 1 of 2         version 1 to 2, 62853 bytes to 63465
+  segment 2 of 2         version 1 to 2, 62853 bytes to 63465
+
+  wrote /tmp/docs-2.kura
+  2 segments, 800 documents, at epoch 2
+```
+
+It never writes in place and never writes over a file that is there.
+A migration that failed halfway through would leave a store that is neither version and that nothing will open, and a second file plus a rename by whoever is watching is cheaper than any amount of care inside the write.
+An index already in today's format is left alone and nothing is written.
+
+A migrated store is the same store, with the same identifier, so anything that recorded which store it was talking to still recognises it.
+Segments are migrated one version at a time, so the step from one version to the next is written once and an older file reaches today by going through the steps between.
+What comes out is byte for byte what this build would have written had it indexed the corpus itself, and that is a test rather than a claim: `testdata/format/v1` holds a segment as it came off the build before the term dictionary changed, and the test beside it migrates that segment and compares the result against the one this build writes.
+
 ## Calling it from C
 
 ```c

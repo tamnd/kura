@@ -31,6 +31,7 @@ pub mod lz;
 pub mod manifest;
 #[cfg(feature = "fs")]
 pub mod mapping;
+pub mod migrate;
 pub mod posting;
 pub mod residency;
 pub mod search;
@@ -61,7 +62,22 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 ///
 /// It is checked in the header of every file. A file with a version this build
 /// does not know is refused rather than parsed hopefully.
-pub const FORMAT_VERSION: u16 = 1;
+///
+/// Version 2 moved the term dictionary. Version 1 searched the block index by
+/// reading a term at every step of the binary search, and version 2 puts the
+/// first four bytes of each block's first term in an array of their own in front
+/// of the offsets and compares those instead. Nothing else about a file changed,
+/// and [`migrate`] is what turns one into the other.
+pub const FORMAT_VERSION: u16 = 2;
+
+/// The oldest format version this build can still make sense of.
+///
+/// Nothing opens a file this old for reading. [`migrate`] is the only thing that
+/// looks at one, and everything between this and [`FORMAT_VERSION`] is a step it
+/// knows how to take. Dropping support for a version is moving this number, and
+/// it should be moved on purpose rather than by a decoder quietly forgetting how
+/// to read something.
+pub const OLDEST_VERSION: u16 = 1;
 
 /// The magic bytes at the start of every file written by this engine.
 pub const MAGIC: [u8; 8] = *b"KURA\0\0\0\x01";

@@ -133,6 +133,18 @@ fn pin(name: &str, built: &[u8]) -> Vec<u8> {
         .unwrap_or_else(|error| panic!("{}: {error}, and KURA_BLESS is not set", path.display()))
 }
 
+/// Reads a fixture written by a build that is not this one.
+///
+/// These are not blessed and never will be, because nothing here can write
+/// them. They came off the commit before the layout changed and they are the
+/// only copy of what that build produced, so `testdata/format/v1` is read only
+/// in the sense that matters: a change that makes this build disagree with those
+/// bytes is a change to the migration, not to the fixture.
+fn older(name: &str) -> Vec<u8> {
+    let path = testdata().join(name);
+    std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+}
+
 #[test]
 fn this_build_writes_the_fixture_byte_for_byte() {
     let built = build();
@@ -230,6 +242,47 @@ fn this_build_reads_the_store_fixture() {
     drop(view);
     drop(store);
     let _ = std::fs::remove_file(&at);
+}
+
+#[test]
+fn the_version_one_fixture_migrates_to_the_fixture_beside_it() {
+    // The whole point of keeping the old fixture. A migration that only had to
+    // agree with a dictionary this test built for it would be a migration tested
+    // against this build's idea of what the old build wrote, which is the one
+    // thing it cannot be allowed to rest on.
+    let old = older("v1/segment.kura");
+    let migrated = kura_core::migrate::segment(&old)
+        .expect("the version 1 fixture opens")
+        .expect("the version 1 fixture is not already current");
+    let current = pin("segment.kura", &build());
+    assert_eq!(
+        migrated.len(),
+        current.len(),
+        "the migrated segment is a different size than the one this build writes"
+    );
+    assert!(
+        migrated == current,
+        "the migrated segment differs from the one this build writes at byte {}",
+        migrated
+            .iter()
+            .zip(&current)
+            .position(|(a, b)| a != b)
+            .unwrap_or(0)
+    );
+}
+
+#[test]
+fn the_version_one_fixture_is_refused_by_every_ordinary_way_in() {
+    // Migration is the only thing that reads an old file. A reader that took one
+    // would be reading a layout it does not know with a decoder that would not
+    // say so, and the answers it gave would look like answers.
+    let old = older("v1/segment.kura");
+    let expected = Err(kura_core::Error::UnsupportedVersion {
+        found: 1,
+        expected: kura_core::FORMAT_VERSION,
+    });
+    assert_eq!(Segment::open(&old), expected);
+    assert_eq!(Segment::open_without_checksum(&old), expected);
 }
 
 #[test]

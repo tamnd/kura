@@ -615,7 +615,11 @@ fn common(a: &[u8], b: &[u8]) -> (usize, std::cmp::Ordering) {
 /// A term shorter than four bytes is padded with zeros, which keeps the order:
 /// a term that runs out where another carries on sorts before it, and zero is
 /// below every byte the other one could have there.
-fn key(term: &[u8]) -> u32 {
+///
+/// [`crate::migrate`] needs it too, since a version 1 dictionary has no keys and
+/// the migration is largely working them out, and the two of them agreeing is
+/// the whole point of there being one of these rather than two.
+pub(crate) fn key(term: &[u8]) -> u32 {
     let mut bytes = [0u8; 4];
     let take = term.len().min(4);
     bytes[..take].copy_from_slice(&term[..take]);

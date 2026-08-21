@@ -59,6 +59,11 @@ Eight bytes rather than four because four byte magics collide across formats oft
 A build that does not recognise the version refuses the file instead of parsing it hopefully.
 Two bytes is far more than this format will ever need, and it keeps the fields that follow it aligned.
 
+The version is 2.
+Version 1 searched the term dictionary's block index by reading a term at every step of the binary search, and version 2 keeps the first four bytes of each block's first term in an array of its own in front of the block offsets and compares those instead.
+That is the whole difference between them, and `kura-cli migrate` is the way across.
+See [what holds the format still](#what-holds-the-format-still) for what a version change costs and what has to happen at one.
+
 **Section count, two bytes.**
 It bounds the table before a single entry is read, which is what lets the reader check that the table fits inside the body in one comparison rather than discovering it entry by entry.
 It also caps a segment at 65535 sections, which is several orders of magnitude more than any real one will hold.
@@ -156,7 +161,7 @@ Opening a segment is where the engine decides whether to trust a file, so it is 
 Each of these has its own error rather than one opaque failure, because a caller that is told the file is short can do something different from a caller that is told the checksum did not match.
 
 - Magic that is not this engine's.
-- A format version this build does not write.
+- A format version this build does not write, which includes an older one. `kura_core::migrate` is the only thing that reads one of those, and it does not read a section until it has been told which version it is looking at.
 - A file shorter than the header, or shorter than the body length the header claims, or with no room for a footer after the body.
 - A footer that does not end in the footer magic.
 - A header and a footer that disagree about the body length.
@@ -196,6 +201,10 @@ A writer that walked a hash map would pass every other test in the crate and fai
 A failure here is not a broken test.
 It is a format change, and the answer to it is to move the version, teach `kura-cli migrate` the step from the old version to the new one, keep the old fixture as the input to a test of that step, and write a new fixture beside it.
 `KURA_BLESS=1` writes the fixtures rather than checking them, which is how a new one is made, and it is deliberately awkward to reach for.
+
+That is not a description of a policy, it is a description of what happened.
+`testdata/format/v1` holds the same segment and the same store as they came off the build before the dictionary changed, and the test beside them migrates the version 1 segment and compares the result against the version 2 one byte for byte.
+The old fixtures are never blessed, because nothing in the tree can write them any more, and that is exactly what makes them worth keeping.
 
 ## Reading without the checksums
 
