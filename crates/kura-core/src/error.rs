@@ -140,6 +140,17 @@ pub enum Error {
         given: u32,
     },
 
+    /// One commit was handed two sets of deletions for the same segment.
+    ///
+    /// A set of deletions is the whole answer for a segment rather than a change
+    /// to it, so two of them for one segment is a caller that has not decided
+    /// which documents are deleted. Taking the last would lose the other set
+    /// quietly, and there is no order between them to take the union in.
+    RepeatedSegment {
+        /// Which segment of the manifest was named twice.
+        at: usize,
+    },
+
     /// A set of deletions names a document the segment it belongs to does not
     /// have, so the two came from different builds of the same store.
     NoSuchDocument {
@@ -334,6 +345,9 @@ impl fmt::Display for Error {
                     "a commit puts the segment at {offset} back to tombstone \
                      generation {given} from {committed}"
                 )
+            }
+            Self::RepeatedSegment { at } => {
+                write!(f, "one commit names segment {at} twice")
             }
             Self::NoSuchDocument { doc, documents } => {
                 write!(
