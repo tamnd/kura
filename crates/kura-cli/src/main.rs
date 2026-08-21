@@ -23,6 +23,7 @@
 //! engine. Argument parsing is forty lines and a crate is forever.
 
 mod eval;
+mod map;
 mod report;
 
 use std::fmt;
@@ -37,6 +38,8 @@ use kura_core::index::{Reader, Writer};
 use kura_core::search::Searcher;
 use kura_core::segment::Segment;
 use kura_core::store::Scratch;
+
+use crate::map::Map;
 
 /// How many results a command prints when nobody says otherwise.
 const DEFAULT_HITS: usize = 10;
@@ -82,6 +85,7 @@ options:
   --depth <n>   how deep a run file goes, for topics (default 1000)
   --tag <name>  what the run file calls this run (default kura)
   --field <f>   which stored field names a document (default path)
+  --verify      check the index checksum before querying, which reads all of it
   --complete    for eval, score every judged query and not only the answered ones
   --per-query   for eval, print a line per query as well as the averages
 
@@ -120,9 +124,11 @@ fn topics(args: &[String]) -> Result<(), Failure> {
     let mut depth = DEFAULT_DEPTH;
     let mut tag = DEFAULT_TAG.to_string();
     let mut field = PATH_FIELD.to_string();
+    let mut verify = false;
     let mut at = 0;
     while at < args.len() {
         match args[at].as_str() {
+            "--verify" => verify = true,
             "-o" => {
                 at += 1;
                 out = Some(PathBuf::from(want(args, at, "-o wants a file")?));
@@ -152,8 +158,8 @@ fn topics(args: &[String]) -> Result<(), Failure> {
     let out = out.ok_or_else(|| Failure::usage("no -o, so nowhere to write the run"))?;
 
     let index = Path::new(index);
-    let bytes = fs::read(index).map_err(|error| Failure::Io(index.to_path_buf(), error))?;
-    let segment = Segment::open(&bytes)?;
+    let bytes = Map::open(index).map_err(|error| Failure::Io(index.to_path_buf(), error))?;
+    let segment = open(&bytes, verify)?;
     let reader = Reader::open(&segment)?;
     let searcher = Searcher::new(&reader);
 
@@ -382,14 +388,44 @@ fn index(args: &[String]) -> Result<(), Failure> {
     Ok(())
 }
 
+/// Opens a mapped index, checking the checksum only when asked to.
+///
+/// The structural checks happen either way, so a section this hands back is
+/// inside the file whichever branch ran. What `verify` adds is a read of every
+/// byte to confirm that the contents are the contents that were written.
+///
+/// It is off by default, and that is a decision rather than an oversight.
+/// Verifying is linear in the size of the index, so on a mapped file it faults
+/// in the whole thing before the query starts, which is exactly the copy that
+/// mapping exists to avoid. On a 33.2 MB index that is the difference between
+/// touching a few hundred kilobytes and touching all of it, and the ratio only
+/// gets worse as an index grows, because a query touches the dictionary, one
+/// skip table per term and the blocks it does not step over.
+///
+/// A whole file check on every open is also the wrong shape for the job. It
+/// answers "was this file ever damaged" at a cost paid by every query, when the
+/// question a query needs answered is "is the block I am about to decode
+/// intact". Per section checksums are on the plan for the same reason, and when
+/// they land this stops being a trade and `--verify` goes back to being what it
+/// says: an explicit check of a file you have a reason to doubt.
+fn open(bytes: &[u8], verify: bool) -> Result<Segment<'_>, Failure> {
+    if verify {
+        Ok(Segment::open(bytes)?)
+    } else {
+        Ok(Segment::open_without_checksum(bytes)?)
+    }
+}
+
 /// Runs a query, and says what it did when `explaining`.
 fn query(args: &[String], explaining: bool) -> Result<(), Failure> {
     let mut positional: Vec<&str> = Vec::new();
     let mut k = DEFAULT_HITS;
     let mut with_total = false;
+    let mut verify = false;
     let mut at = 0;
     while at < args.len() {
         match args[at].as_str() {
+            "--verify" => verify = true,
             "-k" => {
                 at += 1;
                 let value = args
@@ -415,8 +451,11 @@ fn query(args: &[String], explaining: bool) -> Result<(), Failure> {
     let text = terms.join(" ");
 
     let path = Path::new(path);
-    let bytes = fs::read(path).map_err(|error| Failure::Io(path.to_path_buf(), error))?;
-    let segment = Segment::open(&bytes)?;
+    // Mapped rather than read. The whole point of `explain` is to say what a
+    // query cost, and reading the index first charges the query for a copy of
+    // an index it will touch a fraction of. See [`map`].
+    let bytes = Map::open(path).map_err(|error| Failure::Io(path.to_path_buf(), error))?;
+    let segment = open(&bytes, verify)?;
     let index = Reader::open(&segment)?;
     let searcher = Searcher::new(&index);
 
@@ -595,5 +634,46 @@ mod tests {
     #[test]
     fn an_empty_file_is_not_binary() {
         assert!(!looks_binary(""));
+    }
+
+    /// A small index, and the same index with one byte of its body flipped.
+    fn an_index_and_a_damaged_copy() -> (Vec<u8>, Vec<u8>) {
+        let mut writer = Writer::new();
+        for text in ["the quick brown fox", "jumps over the lazy dog"] {
+            writer.add(text).expect("two documents fit");
+        }
+        let good = writer.finish().expect("what was written decodes");
+
+        let mut damaged = good.clone();
+        // Past the header, so what is broken is a byte of content rather than
+        // a byte of structure. A structural break is caught either way and
+        // would not tell the two branches apart.
+        let at = damaged.len() / 2;
+        damaged[at] ^= 0x01;
+        (good, damaged)
+    }
+
+    #[test]
+    fn a_damaged_index_opens_without_verifying_and_does_not_with() {
+        // The whole difference the flag makes, in one test. Without it the
+        // structural checks run and the contents are taken on trust, which is
+        // what makes opening independent of the size of the index. With it the
+        // contents are read and the damage is found.
+        let (good, damaged) = an_index_and_a_damaged_copy();
+
+        assert!(open(&good, false).is_ok());
+        assert!(open(&good, true).is_ok());
+        assert!(open(&damaged, false).is_ok());
+        assert!(open(&damaged, true).is_err());
+    }
+
+    #[test]
+    fn a_file_that_is_not_an_index_is_refused_either_way() {
+        // Otherwise the default would be no check at all rather than a
+        // structural one, and the first thing anybody points this at by mistake
+        // is a file that is not an index.
+        let rubbish = vec![0x5a_u8; 4_096];
+        assert!(open(&rubbish, false).is_err());
+        assert!(open(&rubbish, true).is_err());
     }
 }
