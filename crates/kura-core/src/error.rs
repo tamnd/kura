@@ -81,6 +81,37 @@ pub enum Error {
         expected: u32,
     },
 
+    /// A log record's length field is not a length a record can have, so the
+    /// position it was read from is not the start of a record.
+    BadRecord {
+        /// The length the record claimed.
+        length: u32,
+    },
+
+    /// A record does not fit in what is left of the log ring.
+    ///
+    /// The caller flushes what the log already holds and truncates it, which
+    /// frees space and lets the append through. A record larger than the whole
+    /// ring never fits, and that is a configuration problem rather than a
+    /// transient one.
+    LogFull {
+        /// How many bytes the record needs, including any padding to the end of
+        /// the ring.
+        needed: u64,
+        /// How many bytes are free.
+        free: u64,
+    },
+
+    /// The log head and tail from the manifest cannot describe a ring, because
+    /// the tail is behind the head or there is more between them than the ring
+    /// holds.
+    BadPositions {
+        /// How far the log has been consumed.
+        head: u64,
+        /// How far the log has been written.
+        tail: u64,
+    },
+
     /// Two vectors of different lengths were compared, which is a caller bug
     /// rather than a data problem.
     DimensionMismatch {
@@ -183,6 +214,15 @@ impl fmt::Display for Error {
             }
             Self::UnsupportedPageSize { found, expected } => {
                 write!(f, "page size {found} is not the {expected} this build uses")
+            }
+            Self::BadRecord { length } => {
+                write!(f, "a log record cannot be {length} bytes long")
+            }
+            Self::LogFull { needed, free } => {
+                write!(f, "log record needs {needed} bytes and {free} are free")
+            }
+            Self::BadPositions { head, tail } => {
+                write!(f, "log head {head} and tail {tail} do not describe a ring")
             }
             Self::DimensionMismatch { left, right } => {
                 write!(f, "vectors of different lengths: {left} and {right}")
