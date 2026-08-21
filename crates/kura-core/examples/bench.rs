@@ -41,6 +41,7 @@ use std::time::{Duration, Instant};
 use kura_core::DocId;
 use kura_core::bitmap::Bitmap;
 use kura_core::bitpack;
+use kura_core::checksum::crc32;
 use kura_core::codec::{get_uvarint, put_uvarint};
 use kura_core::explain::Counters;
 use kura_core::index;
@@ -89,6 +90,7 @@ fn main() {
     bitmaps();
     varints();
     segments(&encoded);
+    checksums();
     vectors();
 
     if json {
@@ -768,6 +770,35 @@ fn segments(postings: &[u8]) {
         let opened = Segment::open_without_checksum(black_box(&bytes)).expect("open");
         black_box(opened.section(segment::kind::TERMS));
     });
+}
+
+/// The checksum on its own, at a size that does not fit in cache.
+///
+/// The pair above says what verifying costs against not verifying it on a
+/// segment of a few megabytes. This says what the rate is, which is the number
+/// that decides whether verifying a real index on open is a rounding error or a
+/// visible pause. Thirty two megabytes because a smaller buffer measures the
+/// last level cache rather than the loop.
+fn checksums() {
+    let data: Vec<u8> = (0..32u32 << 20)
+        .map(|i| (i.wrapping_mul(37) % 251) as u8)
+        .collect();
+    bench("checksum thirty two megabytes", data.len(), || {
+        black_box(crc32(black_box(&data)));
+    });
+
+    let mut best = Duration::MAX;
+    for _ in 0..5 {
+        let start = Instant::now();
+        black_box(crc32(&data));
+        best = best.min(start.elapsed());
+    }
+    let rate = data.len() as f64 / best.as_secs_f64() / 1e6;
+    fact(
+        "checksum",
+        &format!("checksum: {rate:.0} MB/s"),
+        vec![("bytes", data.len() as f64), ("mb_per_second", rate)],
+    );
 }
 
 /// Similarity, at full width and quantised, which is the memory for time trade
