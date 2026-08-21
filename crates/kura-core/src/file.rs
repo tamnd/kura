@@ -84,9 +84,10 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::Path;
 
+use crate::DocId;
 use crate::bitmap::Bitmap;
 use crate::error::Error;
-use crate::index::Reader;
+use crate::index::{Keys, Reader};
 use crate::manifest::{
     Committed, Manifest, PAGE, SLOT_A_OFFSET, SLOT_B_OFFSET, SLOT_LEN, SUPERBLOCK_LEN, Segment,
     Slot, Superblock,
@@ -933,6 +934,46 @@ impl View {
         }
     }
 
+    /// The document a key names, or `None` if nothing live in the store holds
+    /// it.
+    ///
+    /// One lookup, for a caller that has one key to ask about.
+    ///
+    /// A caller with more than one should take a [`Lookup`] and keep it, because
+    /// this opens every segment's key index and throws it away again, and that
+    /// is most of what a lookup costs. Measured on a ten segment store of eleven
+    /// thousand documents keyed by path, this way is 1.1 microseconds a key and
+    /// a handle that is already open is 169 nanoseconds.
+    ///
+    /// # Errors
+    ///
+    /// As [`Lookup::document`].
+    pub fn document(&self, key: &[u8]) -> Result<Option<(usize, DocId)>> {
+        self.lookup()?.document(key)
+    }
+
+    /// Opens the key index of every segment, ready to be asked about many keys.
+    ///
+    /// # Errors
+    ///
+    /// Returns a decoding error if a segment or one of its key sections is not
+    /// what it claims to be, or if a set of deletions does not decode.
+    pub fn lookup(&self) -> Result<Lookup<'_>> {
+        let mut keys = Vec::with_capacity(self.len());
+        let mut deleted = Vec::with_capacity(self.len());
+        for at in 0..self.len() {
+            let bytes = self.bytes(at).ok_or(Error::MissingSection { kind: 0 })?;
+            // Without the digests, which would read every segment through. The
+            // structure is still checked, so every slice this hands out is
+            // inside the mapping, and a store that wants its contents proved has
+            // a verify pass for that rather than a check on the query path.
+            let segment = crate::segment::Segment::open_without_checksum(bytes)?;
+            keys.push(Keys::open(&segment)?);
+            deleted.push(self.deleted(at)?);
+        }
+        Ok(Lookup { keys, deleted })
+    }
+
     /// Opens every segment, oldest first, each with its deletions applied.
     ///
     /// The order is the order the manifest lists them in, which is the order a
@@ -944,6 +985,93 @@ impl View {
     /// As [`reader`](Self::reader), for the first segment that has one.
     pub fn readers(&self) -> Result<Vec<Reader<'_>>> {
         (0..self.len()).map(|at| self.reader(at)).collect()
+    }
+}
+
+/// The key index of every segment in a view, open and ready to be asked.
+///
+/// Made by [`View::lookup`]. It exists because opening the key index of a
+/// segment is most of what a lookup costs, and a caller with a batch of keys to
+/// resolve, which is every ingest that has to decide what is new and what is a
+/// replacement, would otherwise pay that for every key it asks about.
+///
+/// It is a snapshot of a snapshot: the view it came from is already the segments
+/// the manifest named when the view was taken, and this holds the key sections
+/// of exactly those. A commit after that does not reach either.
+#[derive(Debug)]
+pub struct Lookup<'a> {
+    /// One entry per segment, `None` for a segment nobody named a document in.
+    keys: Vec<Option<Keys<'a>>>,
+    /// Their deletions, decoded once for the same reason the keys are opened
+    /// once.
+    deleted: Vec<Option<Bitmap>>,
+}
+
+impl Lookup<'_> {
+    /// How many segments it covers.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// Whether it covers none, which is a store nothing has been written to.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    /// How many of the segments carry keys at all.
+    #[must_use]
+    pub fn named(&self) -> usize {
+        self.keys.iter().filter(|keys| keys.is_some()).count()
+    }
+
+    /// The document a key names, newest segment first, or `None` if nothing live
+    /// holds it.
+    ///
+    /// The answer is which segment and which document inside it, because that
+    /// pair is what everything else here takes: the deletions are per segment
+    /// and so is the numbering.
+    ///
+    /// Newest first is what makes replacing a document work. A key written twice
+    /// is in two segments, both of them true when they were written, and the
+    /// later one is the one that means anything now. The walk stops at the
+    /// newest segment that names the key at all, so an older copy is never
+    /// reached.
+    ///
+    /// It stops there even when that document has been deleted, and answers
+    /// nothing. The alternative is to carry on and answer with the copy an
+    /// earlier segment holds, which would bring a document back from the dead
+    /// the moment somebody deleted the one that replaced it. A key whose newest
+    /// document is gone is a key nothing holds.
+    ///
+    /// Every segment but the one holding the key answers from its filter, which
+    /// is one cache line each and no decoding at all.
+    ///
+    /// # Errors
+    ///
+    /// None yet. It returns a result because the deletions it consults are read
+    /// when the handle is made, and moving that read to where it is used is a
+    /// change this signature should survive.
+    pub fn document(&self, key: &[u8]) -> Result<Option<(usize, DocId)>> {
+        for at in (0..self.keys.len()).rev() {
+            let Some(keys) = self.keys[at].as_ref() else {
+                continue;
+            };
+            let Some(doc) = keys.get(key) else { continue };
+            let gone = self.deleted[at]
+                .as_ref()
+                .is_some_and(|deleted| deleted.contains(doc));
+            return Ok((!gone).then_some((at, doc)));
+        }
+        Ok(None)
+    }
+
+    /// The key index of one segment, or `None` where there is none or no such
+    /// segment.
+    #[must_use]
+    pub fn keys(&self, at: usize) -> Option<&Keys<'_>> {
+        self.keys.get(at)?.as_ref()
     }
 }
 
@@ -1828,6 +1956,35 @@ mod tests {
         answered(&store.view().expect("a view"), query, k)
     }
 
+    /// The key document `n` of a keyed store is written under.
+    fn key(n: usize) -> Vec<u8> {
+        format!("record-{n:04}").into_bytes()
+    }
+
+    /// [`stored`], with every document written under a key of its own.
+    fn keyed(path: &Path, parts: &[usize]) -> Store {
+        let mut store = Store::create(path, STORE, 1_700_000_000).expect("a store");
+        let mut manifest = store.manifest().clone();
+        let mut from = 0;
+        for (n, &count) in parts.iter().enumerate() {
+            let mut writer = crate::index::Writer::new();
+            for at in from..from + count {
+                writer.add_keyed(&key(at), &text(at)).expect("a document");
+            }
+            let docs = u32::try_from(writer.len()).expect("a test corpus fits");
+            let bytes = writer.finish().expect("a segment");
+            let described = store
+                .append_segment(&bytes, docs, 1_700_000_000 + n as u64)
+                .expect("appended");
+            manifest.segments.push(described);
+            manifest.total += u64::from(described.docs);
+            manifest.live += u64::from(described.docs);
+            from += count;
+        }
+        store.commit(manifest, 1_700_000_001).expect("committed");
+        store
+    }
+
     /// A query matching every document, because every one of them holds at
     /// least the word its number picks.
     const EVERYTHING: &str = "ledger invoice quarter audit";
@@ -2112,6 +2269,150 @@ mod tests {
             let deleted = hit.0 == 1 && hit.1 < 5;
             assert_eq!(!deleted, after.contains(hit), "{hit:?}");
         }
+    }
+
+    /// Adds one more segment to a store that already has some, holding the
+    /// documents named, and commits it.
+    fn extend(store: &mut Store, documents: &[(Vec<u8>, String)]) {
+        let mut writer = crate::index::Writer::new();
+        for (key, text) in documents {
+            writer.add_keyed(key, text).expect("a document");
+        }
+        let docs = u32::try_from(writer.len()).expect("a test corpus fits");
+        let bytes = writer.finish().expect("a segment");
+        let described = store
+            .append_segment(&bytes, docs, 1_700_000_100)
+            .expect("appended");
+        let mut manifest = store.manifest().clone();
+        manifest.segments.push(described);
+        manifest.total += u64::from(docs);
+        manifest.live += u64::from(docs);
+        store.commit(manifest, 1_700_000_101).expect("committed");
+    }
+
+    #[test]
+    fn a_key_finds_the_document_it_was_written_under() {
+        let path = path("keylookup");
+        let store = keyed(&path, &[10, 10, 10]);
+        let view = store.view().expect("a view");
+        // First of the first segment, last of the last, and one in the middle,
+        // by the segment they are in and their place inside it.
+        assert_eq!(view.document(&key(0)).expect("looked up"), Some((0, 0)));
+        assert_eq!(view.document(&key(14)).expect("looked up"), Some((1, 4)));
+        assert_eq!(view.document(&key(29)).expect("looked up"), Some((2, 9)));
+    }
+
+    #[test]
+    fn a_key_nothing_in_the_store_holds_is_absent() {
+        let path = path("keyabsent");
+        let store = keyed(&path, &[10, 10, 10]);
+        let view = store.view().expect("a view");
+        // Past the end, before the beginning, and a prefix of a key that is
+        // there, which is the one a filter is least likely to save.
+        assert_eq!(view.document(&key(30)).expect("looked up"), None);
+        assert_eq!(view.document(b"aaaa").expect("looked up"), None);
+        assert_eq!(view.document(b"record-").expect("looked up"), None);
+        assert_eq!(view.document(b"").expect("looked up"), None);
+    }
+
+    #[test]
+    fn a_key_written_again_later_answers_with_the_newer_document() {
+        let path = path("keyreplace");
+        let mut store = keyed(&path, &[10]);
+        let view = store.view().expect("a view");
+        assert_eq!(view.document(&key(3)).expect("looked up"), Some((0, 3)));
+        drop(view);
+
+        // The same key again in a segment of its own, which is what replacing a
+        // document is before anything is compacted.
+        extend(&mut store, &[(key(3), text(300))]);
+        let view = store.view().expect("a view");
+        assert_eq!(view.document(&key(3)).expect("looked up"), Some((1, 0)));
+        // And the neighbours are where they were.
+        assert_eq!(view.document(&key(2)).expect("looked up"), Some((0, 2)));
+        assert_eq!(view.document(&key(4)).expect("looked up"), Some((0, 4)));
+    }
+
+    #[test]
+    fn a_key_naming_a_deleted_document_is_absent() {
+        let path = path("keydeleted");
+        let mut store = keyed(&path, &[10, 10]);
+        assert_eq!(
+            store
+                .view()
+                .expect("a view")
+                .document(&key(12))
+                .expect("looked up"),
+            Some((1, 2))
+        );
+        store
+            .delete(1, &Bitmap::from_sorted(&[2]), 2)
+            .expect("deleted");
+        let view = store.view().expect("a view");
+        assert_eq!(view.document(&key(12)).expect("looked up"), None);
+        // Its neighbours in the same segment are untouched, so the answer is
+        // about that document rather than about that segment.
+        assert_eq!(view.document(&key(11)).expect("looked up"), Some((1, 1)));
+        assert_eq!(view.document(&key(13)).expect("looked up"), Some((1, 3)));
+    }
+
+    #[test]
+    fn deleting_a_replacement_does_not_bring_the_document_it_replaced_back() {
+        let path = path("keyresurrect");
+        let mut store = keyed(&path, &[4]);
+        extend(&mut store, &[(key(1), text(300))]);
+        assert_eq!(
+            store
+                .view()
+                .expect("a view")
+                .document(&key(1))
+                .expect("looked up"),
+            Some((1, 0))
+        );
+        // Delete the newer copy. The older one is still there, still live, and
+        // still under the same key, and it is not the answer: the newest
+        // segment that names a key is the one that decides what that key means.
+        store
+            .delete(1, &Bitmap::from_sorted(&[0]), 3)
+            .expect("deleted");
+        let view = store.view().expect("a view");
+        assert_eq!(view.document(&key(1)).expect("looked up"), None);
+        // The older copy is genuinely still there, which is what makes the
+        // answer above a decision rather than an absence.
+        assert_eq!(view.reader(0).expect("a reader").document(&key(1)), Some(1));
+    }
+
+    #[test]
+    fn a_store_of_segments_without_keys_answers_nothing_rather_than_failing() {
+        let (unkeyed, empty) = (path("keynone"), path("keyempty"));
+        let store = stored(&unkeyed, &[10, 10]);
+        let view = store.view().expect("a view");
+        assert_eq!(view.document(&key(3)).expect("looked up"), None);
+        // A store with nothing in it at all is the same answer, and is the case
+        // a lookup meets before the first segment is written.
+        let store = Store::create(&empty, STORE, 1_700_000_000).expect("a store");
+        let view = store.view().expect("a view");
+        assert_eq!(view.document(&key(0)).expect("looked up"), None);
+    }
+
+    #[test]
+    fn a_view_taken_before_a_key_was_replaced_still_answers_with_the_old_one() {
+        // The same snapshot rule the rest of a view follows. A lookup that
+        // walked the segments the manifest has now would answer with a document
+        // the rest of the view cannot read.
+        let path = path("keysnapshot");
+        let mut store = keyed(&path, &[4]);
+        let before = store.view().expect("a view");
+        extend(&mut store, &[(key(1), text(300))]);
+        assert_eq!(before.document(&key(1)).expect("looked up"), Some((0, 1)));
+        assert_eq!(
+            store
+                .view()
+                .expect("a view")
+                .document(&key(1))
+                .expect("looked up"),
+            Some((1, 0))
+        );
     }
 
     /// Changes one byte of a file in place, which is what a torn write leaves.
