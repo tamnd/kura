@@ -20,6 +20,7 @@
 pub mod analysis;
 pub mod bitmap;
 pub mod bitpack;
+pub mod bound;
 pub mod checksum;
 pub mod codec;
 pub mod error;
