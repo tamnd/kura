@@ -123,6 +123,8 @@ pub trait Tally {
     fn opened(&mut self, terms: u32, postings: u64, blocks: u64);
     /// A document was scored.
     fn scored(&mut self);
+    /// A block of documents was scored, all of them at once.
+    fn scored_many(&mut self, documents: u64);
     /// A document was passed over because it has been deleted.
     fn hidden(&mut self);
     /// A cursor was moved somewhere the walk named.
@@ -147,6 +149,8 @@ impl Tally for Off {
     #[inline]
     fn scored(&mut self) {}
     #[inline]
+    fn scored_many(&mut self, _documents: u64) {}
+    #[inline]
     fn hidden(&mut self) {}
     #[inline]
     fn sought(&mut self) {}
@@ -167,6 +171,11 @@ impl Tally for Counters {
     #[inline]
     fn scored(&mut self) {
         self.documents_scored += 1;
+    }
+
+    #[inline]
+    fn scored_many(&mut self, documents: u64) {
+        self.documents_scored += documents;
     }
 
     #[inline]
