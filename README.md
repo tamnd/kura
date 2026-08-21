@@ -174,26 +174,26 @@ Without a budget an index run keeps every posting in memory until the last file 
 
 The budget is in the same units the run reports, which is what the writer holds, and the writer is asked after every document.
 That makes it a floor rather than a ceiling: the writer stops when it has crossed the budget, not before, so what it holds at its largest is the budget plus whatever the document that crossed it added.
-Usually that is small and once it is not, which is the 8m row below, and the reason is written under the table.
+A document cannot be split across two segments, so that last part is not something a budget can take away.
 
-The Go source tree at go1.26.6, which is 10,888 text files and 106.4 MB, on an M4 with the files already in page cache, three runs each:
+The Go source tree at go1.26.6, which is 10,888 text files and 106.4 MB, on an M4 with the files already in page cache, a warm up run and then three timed runs each:
 
 | `--memory` | segments | held at most | peak RSS | wall |
 | --- | --- | --- | --- | --- |
-| none | 1 | 60.7 MB | 91 to 110 MB | 0.92 to 0.95 s |
-| 128m | 1 | 60.7 MB | 103 to 119 MB | 0.95 to 1.0 s |
-| 64m | 1 | 60.7 MB | 98 to 106 MB | 0.96 to 1.0 s |
-| 32m | 2 | 32.0 MB | 64 to 94 MB | 0.95 to 0.98 s |
-| 16m | 5 | 16.5 MB | 71 to 85 MB | 0.98 to 1.0 s |
-| 8m | 9 | 16.3 MB | 54 to 67 MB | 1.0 s |
+| none | 1 | 53.2 MB | 93 to 99 MB | 0.96 to 0.97 s |
+| 128m | 1 | 53.2 MB | 99 to 103 MB | 0.96 to 0.99 s |
+| 64m | 1 | 53.2 MB | 91 to 92 MB | 0.97 to 1.0 s |
+| 32m | 2 | 36.1 MB | 66 to 89 MB | 0.97 to 1.0 s |
+| 16m | 4 | 16.9 MB | 62 to 88 MB | 0.99 to 1.0 s |
+| 8m | 9 | 12.2 MB | 56 to 59 MB | 1.0 to 1.1 s |
 
 Two things to read out of that.
 
-A budget is honoured within a document at every size except 8m, where the writer ends up holding twice what it was told.
-That is the tables that grow by doubling.
-There are seven vectors with an entry per term beside the postings, and a term dictionary, and all of them double, so a document that arrives when they are full takes the writer from just under the budget to well over it in a single step.
-Counted on a synthetic corpus of 200,000 documents each carrying a term nothing else has, the largest step one document took was 4.7 MB, of which 3.7 MB was those seven vectors growing together and 1.0 MB was the dictionary.
-It is the same problem the posting arena had before it was changed to grow in blocks, and it is worth fixing the same way.
+What a run holds is the budget plus one document, and one document on this tree is worth up to 6.3 MB.
+Every array with an entry per term grows by adding a block rather than by doubling, so nothing a term is counted in can take a step that depends on how much has been indexed already, and the largest step one document takes is the same at the end of a large corpus as at the start.
+The largest step over the whole tree is 6.3 MB and it is one file, `debug/buildinfo/testdata/go117/go117.base64`, which is 1.3 MB of base64 in which almost every token is a term nothing else in the tree holds.
+That is why the 8m row lands at 12.2 MB and the 32m row at 36.1 MB.
+The arrays used to double, and then the same run took a 8.9 MB step, an ordinary 100 KB source file could cost 4.7 MB on its own, and the step grew with the corpus rather than staying put.
 
 The process holds about 40 MB more than the writer says it holds, at every budget.
 That is the allocator's slack, the file being read, and the segment going down, and it is additive rather than proportional, so a machine with 200 MB to spare can be told 150m and be believed.
@@ -206,10 +206,10 @@ The same tree, five runs each and the range across them:
 
 | `--flush-every` | segments | wall | peak RSS |
 | --- | --- | --- | --- |
-| none | 1 | 0.92 to 0.95 s | 91 to 110 MB |
-| 32m | 4 | 0.93 to 0.95 s | 69 to 102 MB |
-| 8m | 14 | 1.0 to 1.1 s | 47 to 59 MB |
-| 2m | 49 | 1.3 to 1.4 s | 45 to 49 MB |
+| none | 1 | 0.96 to 1.0 s | 92 to 98 MB |
+| 32m | 4 | 0.98 to 1.0 s | 62 to 82 MB |
+| 8m | 14 | 1.1 s | 47 to 62 MB |
+| 2m | 49 | 1.4 s | 37 to 50 MB |
 
 It is a trade and the table is the shape of it.
 A budget near the corpus size costs nothing measurable and takes off about a third of the memory.
@@ -226,7 +226,7 @@ Every index run also says how much the writer held and what it was holding.
 
 ```
 indexed 10888 documents, 106.4 MB of text into /tmp/docs.kura, 14.4 MB in 0.9s
-held at most 60.7 MB at once, 43.0 MB postings, 17.0 MB vocabulary, 653.3 KB stored fields, 64.0 KB lengths
+held at most 53.2 MB at once, 39.7 MB postings, 12.8 MB vocabulary, 653.3 KB stored fields, 64.0 KB lengths
 ```
 
 That is the largest a single writer got, so on a run with `--flush-every` it is the peak of one segment rather than of the corpus.
@@ -234,17 +234,17 @@ The same tree at four budgets, three runs each, and the held numbers were identi
 
 | budget | segments | held | postings | vocabulary | stored fields | peak RSS |
 | --- | --- | --- | --- | --- | --- | --- |
-| none | 1 | 60.7 MB | 43.0 MB | 17.0 MB | 653.3 KB | 91 to 110 MB |
-| 32m | 4 | 27.4 MB | 19.4 MB | 7.5 MB | 415.1 KB | 69 to 102 MB |
-| 8m | 14 | 12.7 MB | 8.6 MB | 3.8 MB | 354.3 KB | 47 to 59 MB |
-| 2m | 49 | 8.9 MB | 5.6 MB | 3.0 MB | 353.1 KB | 45 to 49 MB |
+| none | 1 | 53.2 MB | 39.7 MB | 12.8 MB | 653.3 KB | 92 to 98 MB |
+| 32m | 4 | 23.5 MB | 17.5 MB | 5.6 MB | 415.1 KB | 62 to 82 MB |
+| 8m | 14 | 10.5 MB | 7.3 MB | 2.9 MB | 354.3 KB | 47 to 62 MB |
+| 2m | 49 | 8.3 MB | 5.3 MB | 2.6 MB | 353.1 KB | 37 to 50 MB |
 
 The postings are about three quarters of what a writer holds and the vocabulary is most of the rest, so a change that made the stored fields cheaper would be a change nobody could measure.
 
 What the writer holds is also well under what the process holds, and a third line says where the difference is.
 
 ```
-peak resident 109.5 MB, of which 83.9 MB by the last document, 19.3 MB more merging the postings, 6.3 MB more writing the segment
+peak resident 97.8 MB, of which 69.2 MB by the last document, 22.3 MB more merging the postings, 6.3 MB more writing the segment
 ```
 
 That is the high water mark of the whole process, the same number `/usr/bin/time` reports, read at three points and reported as what each step added.
@@ -253,14 +253,14 @@ Five runs of the tree above with no budget, so one segment:
 
 | | total | by the last document | merging the postings | writing the segment |
 | --- | --- | --- | --- | --- |
-| run 1 | 109.5 MB | 83.9 MB | 19.3 MB | 6.3 MB |
-| run 2 | 108.1 MB | 78.7 MB | 23.1 MB | 6.3 MB |
-| run 3 | 103.6 MB | 95.1 MB | 2.2 MB | 6.3 MB |
-| run 4 | 107.9 MB | 77.2 MB | 24.4 MB | 6.3 MB |
-| run 5 | 92.1 MB | 66.9 MB | 18.9 MB | 6.3 MB |
+| run 1 | 97.8 MB | 69.2 MB | 22.3 MB | 6.3 MB |
+| run 2 | 93.4 MB | 69.7 MB | 17.3 MB | 6.4 MB |
+| run 3 | 95.6 MB | 68.6 MB | 20.7 MB | 6.3 MB |
+| run 4 | 94.2 MB | 64.7 MB | 23.1 MB | 6.4 MB |
+| run 5 | 92.2 MB | 71.0 MB | 15.0 MB | 6.3 MB |
 
 Most of it is there by the last document, which is the writer plus the allocator plus the buffer each file is read into.
-Merging the postings costs 2 to 25 MB, which is the encoded lists and the term dictionary being built while the writer that fed them is still holding everything, and it varies that much because a run that had already been pushed high by the reading pays less for the merge.
+Merging the postings costs 15 to 24 MB, which is the encoded lists and the term dictionary being built while the writer that fed them is still holding everything, and it varies that much because a run that had already been pushed high by the reading pays less for the merge.
 Writing the segment costs 6.3 MB and costs it on every run, because it is not the allocator being lucky, it is the pages of a file whose size the corpus decided.
 
 That last number used to be 20.6 MB higher.
