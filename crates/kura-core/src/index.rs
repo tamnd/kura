@@ -22,7 +22,7 @@ use crate::codec::{get_u32, get_u64, get_uvarint, put_u32, put_u64, put_uvarint}
 use crate::error::{Error, Result};
 use crate::search::{B, K1};
 use crate::segment::{Segment, Writer as SegmentWriter, kind};
-use crate::{DocId, bound, posting, store, terms};
+use crate::{DocId, bitmap::Bitmap, bound, posting, store, terms};
 
 /// The size of one link in a term's posting chain, in bytes.
 ///
@@ -965,6 +965,15 @@ pub struct Reader<'a> {
     store: Option<store::Reader<'a>>,
     documents: u32,
     total: u64,
+    /// Which of this segment's documents have been deleted, if any.
+    ///
+    /// A segment is immutable and a deletion is not, so the set lives beside the
+    /// segment rather than in it, and a reader is told about it rather than
+    /// finding it. Nothing here removes a posting: a deleted document is still
+    /// in every list it was in, still has a length, and still has an identifier
+    /// that the numbering across segments depends on. What changes is that it is
+    /// no longer an answer.
+    deleted: Option<Bitmap>,
 }
 
 impl<'a> Reader<'a> {
@@ -1007,13 +1016,91 @@ impl<'a> Reader<'a> {
             store,
             documents,
             total,
+            deleted: None,
         })
     }
 
-    /// How many documents the index holds.
+    /// Hides the documents in `deleted` from everything that asks this reader a
+    /// question.
+    ///
+    /// The set is the segment's own numbering, which is what a tombstone bitmap
+    /// beside a segment holds, and it replaces whatever the reader was hiding
+    /// before rather than adding to it. That is what makes a newer generation of
+    /// tombstones simply a newer set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NoSuchDocument`] if the set names a document this
+    /// segment does not have. That is a manifest pointing at the wrong bitmap or
+    /// a bitmap left over from a build with more documents in it, and either way
+    /// the deletions being applied are not this segment's, so applying the part
+    /// of them that happens to fit would hide the wrong documents.
+    pub fn hide(&mut self, deleted: Bitmap) -> Result<()> {
+        if let Some(doc) = deleted.max()
+            && doc >= self.documents
+        {
+            return Err(Error::NoSuchDocument {
+                doc,
+                documents: self.documents,
+            });
+        }
+        self.deleted = (!deleted.is_empty()).then_some(deleted);
+        Ok(())
+    }
+
+    /// The same thing [`hide`](Self::hide) does, for a reader being built up.
+    ///
+    /// # Errors
+    ///
+    /// The same one, for the same reason.
+    pub fn hiding(mut self, deleted: Bitmap) -> Result<Self> {
+        self.hide(deleted)?;
+        Ok(self)
+    }
+
+    /// Which of this segment's documents are deleted, if any were.
+    #[must_use]
+    pub const fn deleted(&self) -> Option<&Bitmap> {
+        self.deleted.as_ref()
+    }
+
+    /// Whether anything in this segment has been deleted.
+    ///
+    /// Worth asking on its own, because a walk over a segment with nothing
+    /// deleted keeps every shortcut that counts documents without looking at
+    /// them, and a walk over one with a deletion in it cannot.
+    #[must_use]
+    pub const fn any_deleted(&self) -> bool {
+        self.deleted.is_some()
+    }
+
+    /// Whether a document is still an answer.
+    ///
+    /// True for an identifier past the end of the segment, which cannot come out
+    /// of a posting list and so is not worth an answer of its own.
+    #[must_use]
+    pub fn is_live(&self, doc: DocId) -> bool {
+        self.deleted.as_ref().is_none_or(|gone| !gone.contains(doc))
+    }
+
+    /// How many documents the index holds, deleted ones included.
+    ///
+    /// This is the width of the segment's numbering rather than a count of
+    /// answers, which is why deleting does not move it. A hit carries an
+    /// identifier that says which document it is, and that identifier is worked
+    /// out by adding up the segments before it, so a number that moved when
+    /// something was deleted would move every hit in every segment after it.
     #[must_use]
     pub const fn documents(&self) -> u32 {
         self.documents
+    }
+
+    /// How many of them are still answers.
+    #[must_use]
+    pub fn live(&self) -> u32 {
+        let gone = self.deleted.as_ref().map_or(0, Bitmap::len);
+        self.documents
+            .saturating_sub(u32::try_from(gone).unwrap_or(u32::MAX))
     }
 
     /// Whether the index holds no documents.
@@ -1706,5 +1793,105 @@ mod tests {
         writer.add(DOCS[0]).expect("adds");
         assert!(writer.is_full());
         assert_eq!(writer.len(), 1);
+    }
+
+    #[test]
+    fn a_reader_told_what_is_gone_says_which_documents_are_left() {
+        let bytes = build(&DOCS);
+        let segment = Segment::open(&bytes).expect("opens");
+        let mut index = Reader::open(&segment).expect("opens");
+        assert!(!index.any_deleted());
+        assert_eq!(index.deleted(), None);
+        assert_eq!(index.live(), 4);
+        assert!((0..4).all(|doc| index.is_live(doc)));
+
+        index.hide(Bitmap::from_sorted(&[1, 3])).expect("hides");
+        assert!(index.any_deleted());
+        assert_eq!(index.deleted().map(Bitmap::len), Some(2));
+        assert_eq!(index.live(), 2);
+        assert_eq!(
+            (0..4).filter(|&doc| index.is_live(doc)).collect::<Vec<_>>(),
+            [0, 2]
+        );
+        // The count the numbering is built from does not move, because it is
+        // about how many documents the segment was written with.
+        assert_eq!(index.documents(), 4);
+    }
+
+    #[test]
+    fn hiding_nothing_leaves_the_reader_as_it_was() {
+        // Worth saying out loud, because every shortcut that counts documents
+        // without decoding them is turned off by a set being present rather
+        // than by it holding anything.
+        let bytes = build(&DOCS);
+        let segment = Segment::open(&bytes).expect("opens");
+        let index = Reader::open(&segment)
+            .expect("opens")
+            .hiding(Bitmap::new())
+            .expect("hides nothing");
+        assert!(!index.any_deleted());
+        assert_eq!(index.live(), 4);
+    }
+
+    #[test]
+    fn hiding_again_replaces_what_was_hidden_rather_than_adding_to_it() {
+        // A set of deletions is the whole answer for a segment at one moment,
+        // not a change to be applied, so handing over a smaller one brings
+        // documents back.
+        let bytes = build(&DOCS);
+        let segment = Segment::open(&bytes).expect("opens");
+        let mut index = Reader::open(&segment).expect("opens");
+        index.hide(Bitmap::from_sorted(&[0, 1, 2])).expect("hides");
+        assert_eq!(index.live(), 1);
+        index.hide(Bitmap::from_sorted(&[2])).expect("hides");
+        assert_eq!(index.live(), 3);
+        assert!(index.is_live(0));
+        index.hide(Bitmap::new()).expect("hides");
+        assert_eq!(index.live(), 4);
+        assert!(!index.any_deleted());
+    }
+
+    #[test]
+    fn a_deletion_naming_a_document_that_is_not_there_is_refused() {
+        // The set and the segment came from different builds of the store, and
+        // going on would hide whichever documents happen to hold those numbers
+        // now, which is a wrong answer with nothing to notice it by.
+        let bytes = build(&DOCS);
+        let segment = Segment::open(&bytes).expect("opens");
+        let mut index = Reader::open(&segment).expect("opens");
+        let error = index
+            .hide(Bitmap::from_sorted(&[0, 4]))
+            .expect_err("four documents are numbered zero to three");
+        assert!(matches!(
+            error,
+            Error::NoSuchDocument {
+                doc: 4,
+                documents: 4
+            }
+        ));
+        // And it was refused rather than half applied.
+        assert!(!index.any_deleted());
+        assert_eq!(index.live(), 4);
+    }
+
+    #[test]
+    fn every_document_deleted_leaves_a_reader_that_still_answers() {
+        let bytes = build(&DOCS);
+        let segment = Segment::open(&bytes).expect("opens");
+        let index = Reader::open(&segment)
+            .expect("opens")
+            .hiding(Bitmap::from_sorted(&[0, 1, 2, 3]))
+            .expect("hides");
+        assert_eq!(index.live(), 0);
+        assert_eq!(index.documents(), 4);
+        assert!((0..4).all(|doc| !index.is_live(doc)));
+        // The lists are untouched by a deletion, which is the whole trade: the
+        // reader still holds everything it was written with.
+        assert!(
+            index
+                .postings(b"quick")
+                .expect("decodes")
+                .is_some_and(|list| list.len() == 2)
+        );
     }
 }

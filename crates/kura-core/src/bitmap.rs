@@ -267,6 +267,18 @@ impl Bitmap {
         self.chunks.is_empty()
     }
 
+    /// The largest ordinal in the set, or nothing if it holds none.
+    ///
+    /// Cheap whatever shape the last chunk is in, which is what makes it worth
+    /// having: a set of deletions can be checked against the size of what it
+    /// deletes from without walking it.
+    #[must_use]
+    pub fn max(&self) -> Option<DocId> {
+        let chunk = self.chunks.last()?;
+        let low = chunk.store.last()?;
+        Some(DocId::from(chunk.key) << 16 | DocId::from(low))
+    }
+
     /// Returns roughly what the set costs in memory, in bytes.
     ///
     /// This is the number the whole module is about, so it is readable rather
@@ -867,6 +879,23 @@ impl Store {
                 .iter()
                 .map(|run| usize::from(run.last) - usize::from(run.start) + 1)
                 .sum(),
+        }
+    }
+
+    /// The largest member of the chunk, or nothing if it holds none.
+    fn last(&self) -> Option<u16> {
+        match self {
+            Self::Array(list) => list.last().copied(),
+            Self::Bits(words) => words
+                .bits
+                .iter()
+                .rposition(|&word| word != 0)
+                .and_then(|at| {
+                    let highest = words.bits[at].ilog2();
+                    let at = u32::try_from(at).ok()?;
+                    u16::try_from(at * 64 + highest).ok()
+                }),
+            Self::Runs(runs) => runs.last().map(|run| run.last),
         }
     }
 
@@ -2140,5 +2169,41 @@ mod tests {
             }
             bytes[at] = was;
         }
+    }
+
+    #[test]
+    fn the_largest_member_comes_back_from_every_shape() {
+        assert_eq!(Bitmap::new().max(), None);
+        assert_eq!(sparse(&[3]).max(), Some(3));
+        assert_eq!(sparse(&[0, 1, 9, 63, 64, 4096]).max(), Some(4096));
+        // A word block, where the answer is in the last word that is not zero
+        // rather than in the last word.
+        let scattered = Bitmap::from_sorted(&(0..30_000).step_by(3).collect::<Vec<_>>());
+        assert_eq!(shape(&scattered, 0), "bits");
+        assert_eq!(scattered.max(), Some(29_999 - 29_999 % 3));
+        // Runs, and a run that ends at the top of its chunk.
+        let chunk = DocId::try_from(CHUNK).expect("a chunk is sixty five thousand wide");
+        let full = dense(chunk);
+        assert_eq!(shape(&full, 0), "runs");
+        assert_eq!(full.max(), Some(chunk - 1));
+        // Several chunks, where the answer is in the last of them and not in
+        // the largest of them.
+        let mut many = Bitmap::from_sorted(&(0..1_000).collect::<Vec<_>>());
+        many.insert(u32::MAX);
+        assert_eq!(many.max(), Some(u32::MAX));
+    }
+
+    #[test]
+    fn the_largest_member_survives_what_was_taken_out() {
+        let mut map = Bitmap::from_sorted(&[1, 2, 3, 900, 70_000]);
+        assert_eq!(map.max(), Some(70_000));
+        map.remove(70_000);
+        assert_eq!(map.max(), Some(900));
+        map.remove(900);
+        map.remove(3);
+        assert_eq!(map.max(), Some(2));
+        map.remove(2);
+        map.remove(1);
+        assert_eq!(map.max(), None);
     }
 }

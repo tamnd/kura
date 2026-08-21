@@ -1373,6 +1373,7 @@ fn queries(searcher: &Searcher<'_, '_>) {
                 blocks_skipped: counting.blocks_skipped + searching.blocks_skipped,
                 postings_decoded: counting.postings_decoded + searching.postings_decoded,
                 documents_scored: counting.documents_scored + searching.documents_scored,
+                documents_hidden: counting.documents_hidden + searching.documents_hidden,
                 seeks: counting.seeks + searching.seeks,
                 advances: counting.advances + searching.advances,
                 // Neither walk was probed, and two readings would not add up

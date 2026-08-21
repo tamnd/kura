@@ -66,6 +66,14 @@ pub struct Counters {
     pub postings_decoded: u64,
     /// How many documents had a score computed for them.
     pub documents_scored: u64,
+    /// How many documents the walk stepped over because they were deleted.
+    ///
+    /// A deletion is not a hole in the lists, so the walk meets a deleted
+    /// document the way it meets any other and then declines to answer with it.
+    /// This is what that cost, and it is also the only way to see from outside
+    /// that a segment is carrying deletions at all. A store where it is a large
+    /// fraction of the postings decoded is a store that wants compacting.
+    pub documents_hidden: u64,
     /// How many times a cursor was moved somewhere the walk named, rather than
     /// to the next thing in front of it.
     ///
@@ -115,6 +123,8 @@ pub trait Tally {
     fn opened(&mut self, terms: u32, postings: u64, blocks: u64);
     /// A document was scored.
     fn scored(&mut self);
+    /// A document was passed over because it has been deleted.
+    fn hidden(&mut self);
     /// A cursor was moved somewhere the walk named.
     fn sought(&mut self);
     /// A cursor was moved to its next document.
@@ -137,6 +147,8 @@ impl Tally for Off {
     #[inline]
     fn scored(&mut self) {}
     #[inline]
+    fn hidden(&mut self) {}
+    #[inline]
     fn sought(&mut self) {}
     #[inline]
     fn advanced(&mut self) {}
@@ -155,6 +167,11 @@ impl Tally for Counters {
     #[inline]
     fn scored(&mut self) {
         self.documents_scored += 1;
+    }
+
+    #[inline]
+    fn hidden(&mut self) {
+        self.documents_hidden += 1;
     }
 
     #[inline]

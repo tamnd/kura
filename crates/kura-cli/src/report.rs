@@ -179,6 +179,12 @@ pub fn counters(
         Some(counters.blocks),
     )?;
     line(out, "documents scored", counters.documents_scored, None)?;
+    // Only when there are any, because a store with nothing deleted in it would
+    // otherwise carry a zero that reads as a measurement rather than as a line
+    // that does not apply.
+    if counters.documents_hidden > 0 {
+        line(out, "documents hidden", counters.documents_hidden, None)?;
+    }
     line(out, "cursor seeks", counters.seeks, None)?;
     line(out, "cursor advances", counters.advances, None)?;
     writeln!(out)?;
@@ -344,6 +350,7 @@ mod tests {
             blocks_skipped: 6,
             postings_decoded: 256,
             documents_scored: 256,
+            documents_hidden: 0,
             seeks: 6,
             advances: 256,
             residency: None,
@@ -422,6 +429,7 @@ mod tests {
             blocks_skipped: 0,
             postings_decoded: 10_710,
             documents_scored: 247,
+            documents_hidden: 0,
             seeks: 41,
             advances: 10_567,
             residency: None,
