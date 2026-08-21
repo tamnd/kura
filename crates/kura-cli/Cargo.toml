@@ -11,17 +11,17 @@ categories.workspace = true
 keywords.workspace = true
 description = "Command line access to a kura index, and the tool that says what a query did."
 
-# The binary is `kura`. The crate is `kura-cli` because `kura` is the name the
-# library will want on crates.io.
+# The binary is `kura-cli` and not `kura` because the FFI crate's library target
+# is already called `kura`. Two targets with one name write one file, and on
+# Windows that file is target/debug/kura.pdb, which both link steps then race
+# for. The loser fails with LNK1201 and the build is red for a reason that has
+# nothing to do with the change that triggered it.
 #
-# `doc = false` because the FFI crate's library target is also called `kura`, and
-# two targets of the same name write the same file under target/doc. The build
-# outputs do not collide, only the documentation does, and nobody reads rustdoc
-# for a binary.
+# The library had the name first and a C caller links it by that name, so the
+# binary is the one that moves.
 [[bin]]
-name = "kura"
+name = "kura-cli"
 path = "src/main.rs"
-doc = false
 
 [dependencies]
 kura-core = { path = "../kura-core", version = "0.1.0" }

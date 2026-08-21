@@ -72,7 +72,7 @@ Anything linked into this engine is linked into every host that uses it.
 ```
 crates/kura-core   the engine, no dependencies, no unsafe on the decode paths
 crates/kura-ffi    the C ABI, built as a static and shared library
-crates/kura-cli    the `kura` binary, and where `explain` lives
+crates/kura-cli    the `kura-cli` binary, and where `explain` lives
 include/kura.h     the header, written by hand and checked in
 examples/c         a C caller, compiled and run in CI on every platform
 docs/format.md     the on disk format
@@ -92,8 +92,8 @@ The release build produces `target/release/libkura.a` and a shared library besid
 
 ```sh
 cargo build --release -p kura-cli
-./target/release/kura index ./docs -o /tmp/docs.kura
-./target/release/kura explain /tmp/docs.kura "block max wand"
+./target/release/kura-cli index ./docs -o /tmp/docs.kura
+./target/release/kura-cli explain /tmp/docs.kura "block max wand"
 ```
 
 `explain` runs the query and prints what the engine did to answer it, which is the part a timing cannot tell you.
