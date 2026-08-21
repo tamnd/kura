@@ -385,6 +385,22 @@ impl<'a> Reader<'a> {
         self.block_count
     }
 
+    /// How many blocks a walk over this list steps through, counting the
+    /// leftovers at the end as one.
+    ///
+    /// This is the number of ceilings a segment stores for the list, and a
+    /// caller that means to address blocks by index wants this rather than
+    /// [`Reader::blocks`], which stops at the last whole one.
+    #[must_use]
+    pub const fn steps(&self) -> usize {
+        let packed = self.block_count * BLOCK;
+        if self.count as usize > packed {
+            self.block_count + 1
+        } else {
+            self.block_count
+        }
+    }
+
     /// An upper bound on the frequencies in one block, without decoding it.
     ///
     /// Exact for every frequency a real corpus produces. Above what one byte
@@ -746,6 +762,58 @@ impl Cursor<'_> {
         self.block
     }
 
+    /// How many blocks the list this cursor walks steps through, counting the
+    /// leftovers at the end as one.
+    ///
+    /// See [`Reader::steps`], which is where the answer comes from.
+    #[must_use]
+    pub const fn steps(&self) -> usize {
+        self.list.steps()
+    }
+
+    /// Moves the cursor onto block `index`, decoding that block and nothing
+    /// before it.
+    ///
+    /// [`Cursor::seek`] and [`Cursor::advance`] both only go forward, because a
+    /// walk that visits documents in order never needs to go back. A walk that
+    /// visits *blocks* in order of what they could score does, and the blocks
+    /// worth reading are scattered through the list rather than at the front of
+    /// it, which is the whole point of ordering them that way.
+    ///
+    /// The block the cursor is already on costs nothing, which is what makes the
+    /// first block of a list free: opening a list decodes it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the block is truncated.
+    pub fn jump(&mut self, index: usize) -> Result<()> {
+        if self.started && !self.done && self.block == index {
+            self.at = 0;
+            return Ok(());
+        }
+        // A cursor that ran off the end is not spent, it is somewhere else. The
+        // walk that jumps is the one deciding where to look next, so the end of
+        // the list is not the end of its work.
+        self.done = false;
+        self.started = true;
+        self.load(index)
+    }
+
+    /// The postings of the block the cursor is on, as documents and the
+    /// frequencies beside them.
+    ///
+    /// Both empty once the cursor is past the end. A caller that means to read
+    /// every posting in one block wants these rather than a loop over
+    /// [`Cursor::advance`], which would step off the end of the block and decode
+    /// the next one to find that out.
+    #[must_use]
+    pub fn block_postings(&self) -> (&[DocId], &[u32]) {
+        if self.done || !self.started {
+            return (&[], &[]);
+        }
+        (&self.docs[..self.len], &self.freqs[..self.len])
+    }
+
     /// How many documents are left in the block the cursor is in, counting the
     /// one it is sitting on.
     ///
@@ -1047,6 +1115,76 @@ mod tests {
     }
 
     #[test]
+    fn the_step_count_covers_the_leftovers_and_a_whole_list_does_not_pretend_to_have_any() {
+        let whole = encode_with(&postings(BLOCK * 3));
+        assert_eq!(Reader::new(&whole).expect("header").steps(), 3);
+        let ragged = encode_with(&postings(BLOCK * 3 + 1));
+        assert_eq!(Reader::new(&ragged).expect("header").steps(), 4);
+        let short = encode_with(&postings(BLOCK - 1));
+        assert_eq!(Reader::new(&short).expect("header").steps(), 1);
+    }
+
+    #[test]
+    fn a_cursor_jumps_to_a_block_behind_it_and_reads_the_whole_of_it() {
+        let input = postings(BLOCK * 4 + 9);
+        let encoded = encode_with(&input);
+        let reader = Reader::new(&encoded).expect("header");
+        let mut cursor = reader.cursor();
+
+        // Backwards, which is the whole reason this is not a seek. Blocks are
+        // visited in the order of what they could score and that order has
+        // nothing to do with where the documents are.
+        for block in [3usize, 1, 0, 2] {
+            cursor.jump(block).expect("decodes");
+            let (docs, freqs) = cursor.block_postings();
+            let expected = &input[block * BLOCK..(block + 1) * BLOCK];
+            assert_eq!(docs.len(), BLOCK, "block {block}");
+            assert!(
+                docs.iter()
+                    .zip(freqs)
+                    .eq(expected.iter().map(|(d, f)| (d, f))),
+                "block {block}"
+            );
+        }
+
+        // The leftovers are the last step, and they are shorter than a block.
+        cursor.jump(4).expect("decodes");
+        let (docs, freqs) = cursor.block_postings();
+        assert_eq!(docs.len(), 9);
+        assert!(
+            docs.iter()
+                .zip(freqs)
+                .eq(input[BLOCK * 4..].iter().map(|(d, f)| (d, f)))
+        );
+
+        // Past the end is empty rather than an error, and the cursor is still
+        // usable afterwards, because a walk that jumps is the thing deciding
+        // where to look and the end of the list is not the end of its work.
+        cursor.jump(9).expect("decodes");
+        assert_eq!(cursor.block_postings().0.len(), 0);
+        cursor.jump(2).expect("decodes");
+        assert_eq!(cursor.block_postings().0.len(), BLOCK);
+    }
+
+    #[test]
+    fn jumping_to_the_block_a_cursor_is_already_on_decodes_nothing() {
+        let encoded = encode_with(&postings(BLOCK * 3));
+        let reader = Reader::new(&encoded).expect("header");
+        let mut cursor = reader.cursor();
+
+        cursor.advance().expect("decodes");
+        assert_eq!(cursor.decoded().0, 1);
+        // Which is what makes the first block of a list free to the walk that
+        // orders blocks by their ceiling: opening the list already paid for it.
+        cursor.jump(0).expect("decodes");
+        assert_eq!(cursor.decoded().0, 1);
+        cursor.jump(2).expect("decodes");
+        assert_eq!(cursor.decoded().0, 2);
+        cursor.jump(2).expect("decodes");
+        assert_eq!(cursor.decoded().0, 2);
+    }
+
+    #[test]
     fn a_truncated_list_is_an_error_not_a_panic() {
         let encoded = encode_with(&postings(BLOCK * 2 + 5));
         for len in 0..encoded.len() {
@@ -1059,6 +1197,11 @@ mod tests {
                 while let Ok(Some(_)) = cursor.advance() {}
                 let mut cursor = reader.cursor();
                 let _ = cursor.seek(1_000);
+                let mut cursor = reader.cursor();
+                for block in 0..reader.steps() + 2 {
+                    let _ = cursor.jump(block);
+                    let _ = cursor.block_postings();
+                }
             }
         }
     }

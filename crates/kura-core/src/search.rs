@@ -615,10 +615,113 @@ impl<'a, 'b> Searcher<'a, 'b> {
     ///
     /// One term is the commonest query there is and it has no pivot to find:
     /// every document in the list is a candidate and the only question is which
-    /// of them score. What is left of the pruning is the block bound, which
-    /// still steps over a whole block whose best posting cannot displace the
-    /// worst hit in hand.
+    /// of them score.
+    ///
+    /// Two walks, and which one runs depends on whether the segment carries
+    /// ceilings for this list. See [`Searcher::page_of_one_by_bound`] for the
+    /// one that does, which is the one that matters, and read on for the one
+    /// that is left when it cannot.
     fn page_of_one<T: Tally>(
+        &self,
+        shard: &mut Shard<'a, 'b>,
+        norm: Norm,
+        top: &mut TopK,
+        tally: &mut T,
+    ) -> Result<()> {
+        if self.page_of_one_by_bound(shard, norm, top, tally)? {
+            return Ok(());
+        }
+        self.page_of_one_by_document(shard, norm, top, tally)
+    }
+
+    /// The best documents in one segment, taking its blocks in the order of what
+    /// they could score.
+    ///
+    /// A walk in document order can only ever ask "can this block beat what I
+    /// have", and early on it has nothing, so it reads the front of the list in
+    /// full and the pruning only starts working once the page has something good
+    /// in it. Worse, stepping over a block still costs the decode: the walk
+    /// seeks past the block's last document and the seek lands in the next
+    /// block, which loads it.
+    ///
+    /// Taking the blocks in descending order of their ceiling fixes both. The
+    /// block holding the best document in the list is read first, so the
+    /// threshold is nearly its final value after a handful of blocks, and every
+    /// block from the first one whose ceiling falls under the threshold onwards
+    /// can be dropped without being looked at, because they are ordered and so
+    /// are lower still. That is a `break` rather than a `continue`, and it is
+    /// the whole gain.
+    ///
+    /// The answer is the same either way. The heap orders hits by score and
+    /// breaks ties by document id, so what comes out of it does not depend on
+    /// what went in first, and a block dropped here is a block whose best
+    /// possible document could not have displaced the worst hit in hand.
+    ///
+    /// Returns whether it ran. It cannot when the segment has no ceilings for
+    /// this list, which is a list shorter than a block, a segment written before
+    /// the section existed, or a query scoring with parameters other than the
+    /// ones the ceilings assume.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "the same bound as block_bound, on the same quantity"
+    )]
+    fn page_of_one_by_bound<T: Tally>(
+        &self,
+        shard: &mut Shard<'a, 'b>,
+        norm: Norm,
+        top: &mut TopK,
+        tally: &mut T,
+    ) -> Result<bool> {
+        let Shard { index, base, lists } = shard;
+        let ceilings = lists.ceilings[0];
+        // A directory that does not describe this list is a file that has been
+        // damaged or built by something else. Neither is worth a wrong answer,
+        // and a walk that has already started is not the place to find out.
+        if ceilings.is_empty() || ceilings.len() != lists.cursors[0].steps() {
+            return Ok(false);
+        }
+
+        let idf = lists.heads[0].idf;
+        let bound = lists.heads[0].bound;
+        let scale = lists.scale;
+        let k1 = self.k1;
+        for &step in &order_by_ceiling(ceilings) {
+            let quantum = ceilings[step as usize];
+            // `bound` is the term's `idf * (k1 + 1)`, which is what it
+            // contributes when the saturation is one, so a saturation ceiling
+            // scales it directly. Clamped at one because the correction for a
+            // different average length can push a ceiling past the most a term
+            // can ever contribute.
+            let ceiling = bound * (bound::ceiling(quantum) * scale).min(1.0);
+            if ceiling <= top.threshold() {
+                break;
+            }
+            tally.sought();
+            lists.cursors[0].jump(step as usize)?;
+            let (docs, freqs) = lists.cursors[0].block_postings();
+            for (&doc, &frequency) in docs.iter().zip(freqs) {
+                let frequency = frequency as f32;
+                let score = idf * (frequency * (k1 + 1.0)) / (frequency + norm.of(index, doc));
+                tally.scored();
+                top.push(Hit {
+                    doc: base.saturating_add(doc),
+                    score,
+                });
+            }
+        }
+        // The cursor is left somewhere in the middle of the list rather than off
+        // the end of it, and the only thing that touches it afterwards is the
+        // report of what it decoded, which does not care.
+        Ok(true)
+    }
+
+    /// The best documents in one segment, in document order.
+    ///
+    /// What is left of the pruning without ceilings to order by: the block bound
+    /// from the maximum frequency the posting format stores, which still steps
+    /// over a block whose best posting cannot displace the worst hit in hand,
+    /// and still pays to decode the block it lands in.
+    fn page_of_one_by_document<T: Tally>(
         &self,
         shard: &mut Shard<'a, 'b>,
         norm: Norm,
@@ -984,6 +1087,43 @@ fn analyse(query: &str) -> Vec<Vec<u8>> {
     words.sort_unstable();
     words.dedup();
     words
+}
+
+/// The blocks of one list, ordered by their ceiling, largest first.
+///
+/// A counting sort rather than a comparison sort, because the thing being sorted
+/// on is a byte. Two passes over the blocks and one over the two hundred and
+/// fifty six buckets, against the block count times its logarithm a comparison
+/// sort would cost on a list of a few thousand blocks.
+///
+/// Ties keep the blocks in document order, which is not needed for the answer to
+/// be right but does mean a walk over blocks that all look alike reads the file
+/// forwards rather than at random.
+fn order_by_ceiling(ceilings: &[u8]) -> Vec<u32> {
+    let mut counts = [0u32; 256];
+    for &quantum in ceilings {
+        counts[quantum as usize] += 1;
+    }
+    // Running total from the top down, so the bucket of the largest ceiling
+    // starts at nothing and each one after it starts where the last ended.
+    let mut at = 0u32;
+    let mut start = [0u32; 256];
+    for quantum in (0..256).rev() {
+        start[quantum] = at;
+        at += counts[quantum];
+    }
+    let mut order = vec![0u32; ceilings.len()];
+    for (block, &quantum) in ceilings.iter().enumerate() {
+        let slot = &mut start[quantum as usize];
+        // The counting pass above is what makes every subscript here one the
+        // vector has, and a block count that fits a list this build opened is a
+        // block count that fits a u32.
+        if let Some(place) = order.get_mut(*slot as usize) {
+            *place = u32::try_from(block).unwrap_or(u32::MAX);
+        }
+        *slot += 1;
+    }
+    order
 }
 
 /// The first list whose cumulative bound could beat the threshold.
@@ -1505,7 +1645,14 @@ mod tests {
             counters.blocks_decoded,
             counters.blocks
         );
-        assert_eq!(counters.advances + counters.seeks, 6_000);
+        // One term is walked a block at a time in the order the ceilings put the
+        // blocks in, so nothing advances a document at a time and every step is
+        // the walk naming a block. Every posting in a block it reads is scored,
+        // and the block the cursor unpacked when the list was opened is the only
+        // one that can be decoded without being scored.
+        assert_eq!(counters.advances, 0);
+        assert_eq!(counters.seeks, counters.blocks_decoded);
+        assert_eq!(counters.documents_scored, counters.postings_decoded);
     }
 
     #[test]
@@ -1573,12 +1720,14 @@ mod tests {
         // One block scored and nine stepped over. Without the ceilings this is
         // all 1280, which is the test below.
         assert_eq!(counters.documents_scored, BLOCK_SIZE as u64);
-        // The blocks are still unpacked, though nothing in them is scored,
-        // because the walk steps over a block by seeking past its last document
-        // and the seek lands in the next block and decodes it. Getting that back
-        // is the next item on this milestone and not this one, and the number is
-        // asserted here so that it is a measurement rather than an oversight.
-        assert_eq!(counters.blocks_skipped, 0);
+        // And nine of the ten never unpacked, which is the half of this that
+        // costs the time. The walk takes the blocks in the order of what they
+        // could score, so the block of short documents is read first, the top
+        // ten fills with it, and the next block in that order is already under
+        // the threshold. Everything behind that one is ordered and so is lower
+        // still, which is why nine blocks go without being looked at.
+        assert_eq!(counters.blocks_decoded, 1);
+        assert_eq!(counters.blocks_skipped, 9);
         // And the answer is still the answer, which is the half of this that
         // matters. A bound that skipped one block too many would look like a
         // faster query and be a wrong one.
@@ -1972,6 +2121,82 @@ mod tests {
                 hit.doc
             );
         }
+    }
+
+    #[test]
+    fn the_blocks_come_back_largest_ceiling_first_and_ties_in_document_order() {
+        let order = order_by_ceiling(&[3, 200, 7, 200, 0, 255]);
+        assert_eq!(order, [5, 1, 3, 2, 0, 4]);
+        assert_eq!(order_by_ceiling(&[]), Vec::<u32>::new());
+        assert_eq!(order_by_ceiling(&[9]), [0]);
+        // Every block once and none of them twice, which is what the walk
+        // relies on to score every document in a block it does not prune.
+        let ceilings: Vec<u8> = (0..1_000u32)
+            .map(|i| u8::try_from((i * 37) % 256).expect("a remainder of 256 is a byte"))
+            .collect();
+        let mut seen = order_by_ceiling(&ceilings);
+        assert_eq!(seen.len(), 1_000);
+        seen.sort_unstable();
+        assert!(seen.iter().copied().eq(0..1_000));
+    }
+
+    #[test]
+    fn taking_the_blocks_by_bound_finds_what_taking_them_in_order_finds() {
+        // The bound ordered walk visits blocks out of document order and stops
+        // early, and the answer has to be the answer either way. Checked against
+        // the scorer by hand rather than against the other walk, so a change to
+        // both of them at once is still caught.
+        //
+        // Two corpora, because they fail differently. The skewed one has a
+        // winner in every block, so nothing is pruned and this is a check that
+        // visiting blocks out of order loses nothing. The other one prunes nine
+        // blocks in ten, so it is a check that what was pruned deserved it.
+        let corpora = [
+            skewed(200),
+            skewed(1_000),
+            skewed(2_049),
+            same_frequency_different_lengths(1_280, BLOCK_SIZE),
+            same_frequency_different_lengths(2_000, 300),
+        ];
+        for docs in &corpora {
+            let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+            let bytes = build(&refs);
+            let segment = Segment::open(&bytes).expect("opens");
+            let index = Reader::open(&segment).expect("opens");
+            let searcher = Searcher::new(&index);
+            let wanted = by_hand(&index, &[b"common"], K1, B);
+            for k in [1usize, 3, 10, 50] {
+                let hits = searcher.search("common", k).expect("searches");
+                same(&hits, &wanted[..k.min(wanted.len())]);
+            }
+        }
+    }
+
+    #[test]
+    fn a_segment_without_ceilings_still_answers_the_same_query() {
+        // The fallback, reached here by scoring with parameters the ceilings
+        // were not computed under, which is the same door a segment written
+        // before the section existed comes through. It takes the document
+        // ordered walk, and it has to rank what the other walk ranks.
+        let docs = skewed(1_000);
+        let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+        let bytes = build(&refs);
+        let segment = Segment::open(&bytes).expect("opens");
+        let index = Reader::open(&segment).expect("opens");
+
+        let with = Searcher::new(&index)
+            .search("common", 10)
+            .expect("searches");
+        let without = Searcher::with_parameters(&index, K1 + 0.25, B)
+            .search("common", 10)
+            .expect("searches");
+        same(&without, &by_hand(&index, &[b"common"], K1 + 0.25, B)[..10]);
+        // Different parameters, so the scores differ, but the same documents in
+        // the same order on a corpus where nothing is close enough for a quarter
+        // of a k1 to reorder it.
+        let ranked: Vec<DocId> = with.iter().map(|hit| hit.doc).collect();
+        let fallback: Vec<DocId> = without.iter().map(|hit| hit.doc).collect();
+        assert_eq!(ranked, fallback);
     }
 
     #[test]
