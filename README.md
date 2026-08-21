@@ -188,6 +188,27 @@ Ranking does not change.
 Ten queries at depth 100 against the same corpus in one segment and in fourteen produced the same 1000 lines, the same documents in the same order with the same scores at every rank.
 Querying is not slower either, and on this corpus the fourteen segment version was slightly faster, 262 to 312 microseconds a query against 298 to 568.
 
+Every index run also says how much the writer held and what it was holding.
+
+```
+indexed 10888 documents, 106.4 MB of text into /tmp/docs.kura, 14.3 MB in 1.9s
+held at most 63.7 MB at once, 46.3 MB postings, 17.0 MB vocabulary, 397.3 KB stored fields, 64.0 KB lengths
+```
+
+That is the largest a single writer got, so on a run with `--flush-every` it is the peak of one segment rather than of the corpus.
+The same tree at four budgets, three runs each, and the numbers were identical on every run because they depend on what was indexed and not on the machine:
+
+| budget | segments | held | postings | vocabulary | stored fields | peak RSS |
+| --- | --- | --- | --- | --- | --- | --- |
+| none | 1 | 63.7 MB | 46.3 MB | 17.0 MB | 397.3 KB | 109 to 130 MB |
+| 32m | 4 | 30.9 MB | 23.3 MB | 7.5 MB | 159.1 KB | 73 to 86 MB |
+| 8m | 14 | 15.6 MB | 11.8 MB | 3.8 MB | 114.3 KB | 60 to 67 MB |
+| 2m | 49 | 9.1 MB | 6.0 MB | 3.0 MB | 97.1 KB | 43 to 45 MB |
+
+Two things fall out of that table.
+The postings are about three quarters of what a writer holds and the vocabulary is most of the rest, so a change that made the stored fields cheaper would be a change nobody could measure.
+And what the writer holds is only about half of what the process holds, at every budget, so the other half is the finish that turns a writer into a segment plus the pages of the store being written, and neither of those is bounded by `--flush-every` at all.
+
 ## Looking at the file itself
 
 ```sh
