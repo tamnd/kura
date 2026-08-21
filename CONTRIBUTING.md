@@ -47,6 +47,22 @@ Run it on an idle machine and say which machine it was.
 A laptop under load reports numbers three to four times worse across every row at once, which is easy to mistake for a regression in whichever row you happened to be looking at.
 If the whole table moved by the same factor, the machine moved, not the code.
 
+## Relevance
+
+A change to the scorer needs a number, not a story about what ought to rank higher.
+
+```sh
+cargo build --release -p kura-cli
+./target/release/kura-cli topics index.kura topics.tsv -o run.txt
+./target/release/kura-cli eval qrels.txt run.txt
+```
+
+That prints nDCG@10, recall@100 and MRR@10, named and computed the way `trec_eval` names and computes them so a number from here goes in the same table as a published one.
+Run it before and after and put both in the pull request, the same way you would with the benchmark.
+
+Say which collection you ran on and say how many queries were scored.
+Three queries moving in the right direction is an anecdote.
+
 ## Dependencies
 
 The core crate has none and the FFI crate depends only on the core crate.
