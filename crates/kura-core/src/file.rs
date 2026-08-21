@@ -180,6 +180,12 @@ pub struct Store {
 /// entries out of the middle, so the end of the list is not the end of the
 /// region.
 ///
+/// A segment's deletions are in the region too, appended after the segment they
+/// belong to and usually after every segment there is, so they count for this as
+/// much as a segment does. A store opened without them counted puts its next
+/// segment over the deletions of the session before it, which is a store that
+/// was intact when it was closed and is not when it is opened.
+///
 /// Rounded up to a page, and the gap that leaves is not reclaimed. It is at most
 /// a page against a segment measured in megabytes, and every structural offset
 /// in this format is page aligned so that a mapping of one does not begin in the
@@ -188,6 +194,11 @@ fn end_of(superblock: &Superblock, manifest: &Manifest) -> u64 {
     let mut end = superblock.segments_offset;
     for segment in &manifest.segments {
         end = end.max(segment.offset.saturating_add(segment.len));
+        end = end.max(
+            segment
+                .tombstones_offset
+                .saturating_add(u64::from(segment.tombstones_len)),
+        );
     }
     end.next_multiple_of(u64::from(PAGE))
 }
@@ -725,6 +736,33 @@ impl Store {
         deletions: &[(usize, Bitmap)],
         written: u64,
     ) -> Result<u64> {
+        let segment = segment.map(|(bytes, docs)| {
+            let write = move |into: &mut Appending<'_>| io::Write::write_all(into, bytes);
+            (docs, write)
+        });
+        self.publish_with(segment, created, deletions, written)
+    }
+
+    /// [`publish`](Self::publish), with the segment written by a closure.
+    ///
+    /// The same thing as the difference between
+    /// [`append_segment`](Self::append_segment) and
+    /// [`append_segment_with`](Self::append_segment_with), and for the same
+    /// reason: a caller holding a segment that has not been laid out yet can lay
+    /// it out where it is going instead of into a vector first, and the vector is
+    /// a copy of the largest thing an index run makes.
+    ///
+    /// # Errors
+    ///
+    /// As [`publish`](Self::publish), and [`Trouble::Io`] with whatever the
+    /// closure failed with.
+    pub fn publish_with(
+        &mut self,
+        segment: Option<(u32, impl FnOnce(&mut Appending<'_>) -> io::Result<()>)>,
+        created: u64,
+        deletions: &[(usize, Bitmap)],
+        written: u64,
+    ) -> Result<u64> {
         // The segment being added answers to the position it is about to take,
         // and there is nothing committed there to read a count back from.
         let adding = self.manifest.segments.len();
@@ -755,8 +793,8 @@ impl Store {
         }
 
         let mut manifest = self.manifest.clone();
-        if let Some((bytes, docs)) = segment {
-            let described = self.append_segment(bytes, docs, created)?;
+        if let Some((docs, write)) = segment {
+            let described = self.append_segment_with(docs, created, write)?;
             manifest.segments.push(described);
             manifest.total = manifest.total.saturating_add(u64::from(docs));
             manifest.live = manifest.live.saturating_add(u64::from(docs));
@@ -2713,6 +2751,40 @@ mod tests {
         assert_eq!(counted(&store), 21);
         let view = store.view().expect("a view");
         assert_eq!(view.deleted(0).expect("read").expect("a set").len(), 3);
+    }
+
+    #[test]
+    fn a_segment_appended_after_a_reopen_goes_past_the_deletions_that_were_there() {
+        // The deletions of a commit are appended after the last segment, so a
+        // store that works out where to append from the segments alone puts its
+        // next segment on top of them. It was intact when it was closed, every
+        // check passes on the way back in, and the first thing that reads a set
+        // of deletions finds a segment header where the set used to be.
+        let path = path("reopenappend");
+        let mut store = stored(&path, &[10, 10]);
+        store
+            .publish(None, 0, &[(0, Bitmap::from_sorted(&[0, 1, 2]))], 7)
+            .expect("published");
+        let deletions = store.manifest().segments[0].tombstones_offset;
+        assert!(deletions > 0);
+        drop(store);
+
+        let mut store = Store::open(&path).expect("a store");
+        let (bytes, docs) = built(100, 4);
+        store
+            .publish(Some((&bytes, docs)), 1_700_000_100, &[], 8)
+            .expect("published");
+        let added = store.manifest().segments[2];
+        assert!(
+            added.offset >= deletions + 4,
+            "the segment went in at {} and the deletions are at {deletions}",
+            added.offset
+        );
+
+        let view = store.view().expect("a view");
+        assert_eq!(view.deleted(0).expect("read").expect("a set").len(), 3);
+        assert_eq!(view.reader(0).expect("a reader").documents(), 10);
+        assert_eq!(store.manifest().live, 21);
     }
 
     #[test]
