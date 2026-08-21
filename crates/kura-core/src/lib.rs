@@ -29,6 +29,8 @@ pub mod explain;
 pub mod file;
 pub mod filter;
 pub mod index;
+#[cfg(feature = "fs")]
+pub mod ingest;
 pub mod keys;
 pub mod lz;
 pub mod manifest;

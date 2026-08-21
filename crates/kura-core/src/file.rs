@@ -702,6 +702,13 @@ impl Store {
     /// what deleting several documents that happen to live in different segments
     /// looks like.
     ///
+    /// A set may name the segment this commit adds, which is the position one
+    /// past the last committed one. That is what a batch holding the same key
+    /// twice needs: both copies are in the segment being written, only the later
+    /// one is what the key points at, and the earlier one has to stop answering
+    /// queries at the moment the segment appears rather than in a commit after
+    /// it.
+    ///
     /// # Errors
     ///
     /// Returns [`Trouble::Format`] with [`Error::RepeatedSegment`] if two sets
@@ -718,11 +725,19 @@ impl Store {
         deletions: &[(usize, Bitmap)],
         written: u64,
     ) -> Result<u64> {
+        // The segment being added answers to the position it is about to take,
+        // and there is nothing committed there to read a count back from.
+        let adding = self.manifest.segments.len();
+        let limit = if segment.is_some() {
+            adding + 1
+        } else {
+            adding
+        };
         for (n, (at, _)) in deletions.iter().enumerate() {
             if deletions[..n].iter().any(|(earlier, _)| earlier == at) {
                 return Err(Trouble::Format(Error::RepeatedSegment { at: *at }));
             }
-            if *at >= self.manifest.segments.len() {
+            if *at >= limit {
                 return Err(Trouble::Format(Error::MissingSection { kind: 0 }));
             }
         }
@@ -732,7 +747,11 @@ impl Store {
         // batch should not have moved it.
         let mut before = Vec::with_capacity(deletions.len());
         for (at, _) in deletions {
-            before.push(self.committed_deletions(&self.manifest.segments[*at])?);
+            before.push(if *at == adding {
+                0
+            } else {
+                self.committed_deletions(&self.manifest.segments[*at])?
+            });
         }
 
         let mut manifest = self.manifest.clone();
@@ -743,7 +762,9 @@ impl Store {
             manifest.live = manifest.live.saturating_add(u64::from(docs));
         }
         for ((at, deleted), was) in deletions.iter().zip(before) {
-            let described = self.manifest.segments[*at];
+            // Out of the manifest being built rather than the committed one, so
+            // that a set naming the segment this commit adds finds it.
+            let described = manifest.segments[*at];
             let next = self.append_tombstones(&described, deleted)?;
             manifest.segments[*at] = next;
             manifest.live = manifest
@@ -801,6 +822,7 @@ impl Store {
         let deletions = crate::manifest::tombstones(&self.superblock, &self.manifest, map.len())?;
         Ok(View {
             map,
+            epoch: self.manifest.epoch,
             segments: self.manifest.segments.clone(),
             ranges,
             deletions,
@@ -922,6 +944,9 @@ impl Store {
 pub struct View {
     /// The whole store file.
     map: Map,
+    /// Which commit this is a view of, so a writer that read the store here can
+    /// tell whether the store has moved since.
+    epoch: u64,
     /// The segments the manifest named when this was taken.
     segments: Vec<Segment>,
     /// Where each of them sits in the mapping, checked once when the view was
@@ -937,6 +962,17 @@ impl View {
     #[must_use]
     pub fn len(&self) -> usize {
         self.segments.len()
+    }
+
+    /// The commit this is a view of.
+    ///
+    /// A reader has no use for it. A writer does: a batch that worked out what
+    /// to delete from what it read here is only right about the store it read,
+    /// and comparing this against the store's epoch is how it finds out that
+    /// something was committed in between.
+    #[must_use]
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     /// Whether there are none, which is a store nothing has been written to.
@@ -2566,6 +2602,50 @@ mod tests {
         ));
         assert_eq!(store.manifest().epoch, epoch);
         assert_eq!(store.manifest().live, 20);
+    }
+
+    #[test]
+    fn a_publish_can_delete_from_the_segment_it_is_adding() {
+        // A batch that wrote the same key twice has both copies in the segment
+        // being written, and the one that lost has to stop answering queries at
+        // the moment the segment appears.
+        let path = path("publishself");
+        let mut store = stored(&path, &[10]);
+        let (bytes, docs) = built(100, 4);
+        store
+            .publish(
+                Some((&bytes, docs)),
+                1_700_000_100,
+                &[(1, Bitmap::from_sorted(&[0, 2]))],
+                7,
+            )
+            .expect("published");
+        assert_eq!(store.manifest().segments.len(), 2);
+        assert_eq!(store.manifest().total, 14);
+        assert_eq!(store.manifest().live, 12);
+        assert_eq!(counted(&store), 12);
+
+        let view = store.view().expect("a view");
+        assert_eq!(view.deleted(0).expect("read"), None);
+        assert_eq!(view.deleted(1).expect("read").expect("a set").len(), 2);
+    }
+
+    #[test]
+    fn only_the_segment_a_publish_adds_can_be_named_past_the_end() {
+        let path = path("publishpast");
+        let mut store = stored(&path, &[10]);
+        let (bytes, docs) = built(100, 4);
+        let outcome = store.publish(
+            Some((&bytes, docs)),
+            1_700_000_100,
+            &[(2, Bitmap::from_sorted(&[0]))],
+            7,
+        );
+        assert!(matches!(
+            outcome,
+            Err(Trouble::Format(Error::MissingSection { kind: 0 }))
+        ));
+        assert_eq!(store.manifest().segments.len(), 1);
     }
 
     #[test]
