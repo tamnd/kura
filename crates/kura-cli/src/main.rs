@@ -40,7 +40,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(failure) => {
-            eprintln!("kura: {failure}");
+            eprintln!("kura-cli: {failure}");
             if let Failure::Usage(_) = failure {
                 eprintln!();
                 eprintln!("{USAGE}");
@@ -52,9 +52,9 @@ fn main() -> ExitCode {
 
 const USAGE: &str = "\
 usage:
-  kura index <path>... -o <index>   index files and directories into <index>
-  kura search <index> <query>       print the best matches
-  kura explain <index> <query>      print what the query did to find them
+  kura-cli index <path>... -o <index>   index files and directories into <index>
+  kura-cli search <index> <query>       print the best matches
+  kura-cli explain <index> <query>      print what the query did to find them
 
 options:
   -k <n>        how many results, for search and explain (default 10)
