@@ -143,6 +143,9 @@ pub mod kind {
     /// How long each document is, and how long they are on average, which is
     /// what a ranking function divides by.
     pub const NORMS: u16 = 9;
+    /// What each block of postings can score at best, which is what block max
+    /// pruning compares against.
+    pub const BOUNDS: u16 = 10;
 }
 
 /// Builds a segment.
