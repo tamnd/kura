@@ -19,28 +19,71 @@
 //!   0..8    magic, the same eight bytes in every file this engine writes
 //!   8..10   format version, u16
 //!   10..12  section count, u16
-//!   12..16  checksum of the body, u32
+//!   12..16  reserved, written as zero and ignored on read
 //!   16..24  body length, u64
 //!   24..32  reserved, written as zero and ignored on read
 //!
 //! body
-//!   section table, 24 bytes per entry
+//!   section table, 40 bytes per entry
 //!     0..2    kind, u16
 //!     2..4    flags, u16, reserved
 //!     4..8    padding, u32
 //!     8..16   offset from the start of the body, u64
 //!     16..24  length, u64
+//!     24..40  xxh3-128 of the payload, u128
 //!   section payloads, in the order the writer added them
+//!
+//! footer, 32 bytes
+//!   0..16   xxh3-128 of the section table, u128
+//!   16..24  body length, u64, the same number the header carries
+//!   24..32  footer magic
 //! ```
+//!
+//! # Why the checksums are where they are
+//!
+//! There is no checksum over the segment as a whole, and that is the point.
+//!
+//! One digest over everything answers "was this file ever damaged" and cannot
+//! answer "which part of it". Measured on a 68.7 KB index, a byte flipped at two
+//! of five offsets was caught by the whole file digest and by nothing else,
+//! because the bytes went on to decode into a well formed posting list of the
+//! right length in ascending order. The report for those two could only say that
+//! something somewhere was wrong.
+//!
+//! A digest per section plus a digest over the table says the same thing and
+//! says where. The table digest covers the offsets and lengths, so a table that
+//! has been edited is caught before any of them is used to slice anything. Each
+//! section digest covers that section's bytes, so damage is attributed to the
+//! section it is in and every other section is still known good.
+//!
+//! Together they cover every byte of the body exactly once, so nothing is lost
+//! by there being no digest over the lot. The composition is also what lets a
+//! reader check one section without reading the rest, which is what
+//! [`Segment::verify_section`] is for and what a repair would need.
+//!
+//! # Why there is a footer
+//!
+//! The table digest cannot go in the header, because the header is written
+//! first and the table is not known until every payload has been hashed. It
+//! could be worked out in an extra pass, which is what the previous format did
+//! for its whole body checksum, and a footer is the cheaper answer: it is
+//! written last, when the number is already in hand.
+//!
+//! The footer also repeats the body length. A file whose two ends disagree
+//! about how long it is has been damaged in a way that neither end can detect
+//! alone, and a manifest entry carries a hash of the footer, so a store can tell
+//! whether a segment is the one it committed without reading the segment
+//! through.
 //!
 //! # What the reader refuses
 //!
 //! Opening a segment is where the engine decides whether to trust a file, so it
 //! is deliberately unforgiving. Wrong magic, a version this build does not
-//! write, a body that is shorter than the header says, a section table that runs
-//! past the end, a section whose bytes lie outside the body, two sections of the
-//! same kind, or a checksum that does not match, are all errors with their own
-//! variant rather than one opaque failure.
+//! write, a body that is shorter than the header says, a missing or wrong
+//! footer, two ends that disagree about the body length, a section table that
+//! runs past the end, a section whose bytes lie outside the body, two sections
+//! of the same kind, or a digest that does not match, are all errors with their
+//! own variant rather than one opaque failure.
 //!
 //! An unknown *section kind* is the one thing that is not an error. A reader
 //! skips a section it does not recognise, which is what lets a later build add a
@@ -48,16 +91,29 @@
 //! is a refusal, kind is a shrug, and the difference is the whole forward
 //! compatibility story.
 
-use crate::checksum::{Crc32, crc32};
-use crate::codec::{get_u16, get_u32, get_u64, put_u16, put_u32, put_u64, split_at};
+use crate::codec::{
+    get_u16, get_u32, get_u64, get_u128, put_u16, put_u32, put_u64, put_u128, split_at,
+};
 use crate::error::{Error, Result};
+use crate::xxh3;
 use crate::{FORMAT_VERSION, MAGIC};
 
 /// The fixed size of a segment header.
 pub const HEADER_LEN: usize = 32;
 
+/// The fixed size of a segment footer.
+pub const FOOTER_LEN: usize = 32;
+
+/// The eight bytes that end every segment.
+///
+/// Different from the header magic on purpose. A tool scanning a file for
+/// segments finds the start of one and the end of one with different needles,
+/// and a header magic at the tail would make a truncated file look like the
+/// beginning of another segment.
+pub const FOOTER_MAGIC: [u8; 8] = *b"KURAFOOT";
+
 /// The size of one entry in the section table.
-const ENTRY_LEN: usize = 24;
+const ENTRY_LEN: usize = 40;
 
 /// The most sections one segment can hold, from the width of the count field.
 pub const MAX_SECTIONS: usize = u16::MAX as usize;
@@ -161,7 +217,7 @@ impl Writer {
     #[must_use]
     pub fn size(&self) -> usize {
         let payload: usize = self.sections.iter().map(|(_, bytes)| bytes.len()).sum();
-        HEADER_LEN + self.sections.len() * ENTRY_LEN + payload
+        HEADER_LEN + self.sections.len() * ENTRY_LEN + payload + FOOTER_LEN
     }
 
     /// Writes the segment to `out`.
@@ -172,10 +228,13 @@ impl Writer {
     /// a real corpus is a few hundred megabytes of resident memory spent to say
     /// what is already said.
     ///
-    /// The sections are hashed before they are written rather than as they are
-    /// written, because the checksum sits in the header and the header goes out
-    /// first. That is one more pass over memory that is already warm, against a
-    /// seek back over a file that may not be seekable.
+    /// Each section is hashed once, on the way into the table entry that
+    /// describes it, so the only pass over a payload is the one that was going
+    /// to happen anyway. The table digest goes in the footer rather than the
+    /// header because the table is not finished until every payload has been
+    /// hashed, and a footer is written when that number is already in hand
+    /// instead of after a second walk or a seek back over a file that may not be
+    /// seekable.
     ///
     /// # Errors
     ///
@@ -185,7 +244,7 @@ impl Writer {
     ///
     /// If the section count does not fit the header field, which [`Writer::add`]
     /// makes impossible. The alternative is writing a header that disagrees with
-    /// the body and still passes its own checksum.
+    /// the body and still passes its own checks.
     pub fn write_to(self, out: &mut impl std::io::Write) -> std::io::Result<()> {
         let table_len = self.sections.len() * ENTRY_LEN;
 
@@ -199,18 +258,13 @@ impl Writer {
             put_u32(&mut table, 0); // padding, keeps the entry eight byte aligned
             put_u64(&mut table, offset);
             put_u64(&mut table, payload.len() as u64);
+            put_u128(&mut table, xxh3::hash128(payload));
             offset += payload.len() as u64;
-        }
-
-        let mut hasher = Crc32::new();
-        hasher.update(&table);
-        for (_, payload) in &self.sections {
-            hasher.update(payload);
         }
 
         // The count fits because add refuses to go past MAX_SECTIONS, which is
         // exactly the range of the field. Writing a wrong count here would give
-        // a file that passes its own checksum and still decodes to the wrong
+        // a file that passes its own checks and still decodes to the wrong
         // thing, so this is one of the few places worth failing loudly.
         let count = u16::try_from(self.sections.len()).expect("add bounds the section count");
 
@@ -218,7 +272,7 @@ impl Writer {
         header.extend_from_slice(&MAGIC);
         put_u16(&mut header, FORMAT_VERSION);
         put_u16(&mut header, count);
-        put_u32(&mut header, hasher.finish());
+        put_u32(&mut header, 0); // reserved
         put_u64(&mut header, offset);
         header.resize(HEADER_LEN, 0); // the reserved tail
 
@@ -227,8 +281,18 @@ impl Writer {
         for (_, payload) in &self.sections {
             out.write_all(payload)?;
         }
+        out.write_all(&footer_bytes(&table, offset))?;
         Ok(())
     }
+}
+
+/// The footer for a body of `body_len` bytes whose table is `table`.
+fn footer_bytes(table: &[u8], body_len: u64) -> Vec<u8> {
+    let mut footer = Vec::with_capacity(FOOTER_LEN);
+    put_u128(&mut footer, xxh3::hash128(table));
+    put_u64(&mut footer, body_len);
+    footer.extend_from_slice(&FOOTER_MAGIC);
+    footer
 }
 
 /// A segment opened for reading.
@@ -244,10 +308,12 @@ pub struct Segment<'a> {
     table: &'a [u8],
     /// Everything after the header, which is what the offsets are relative to.
     body: &'a [u8],
+    /// The digest of the table, out of the footer.
+    table_digest: u128,
 }
 
 impl<'a> Segment<'a> {
-    /// Opens a segment and verifies it completely, checksum included.
+    /// Opens a segment and verifies it completely, checksums included.
     ///
     /// This is the one to use unless there is a measured reason not to.
     ///
@@ -257,26 +323,22 @@ impl<'a> Segment<'a> {
     /// documentation for the list.
     pub fn open(bytes: &'a [u8]) -> Result<Self> {
         let segment = Self::open_without_checksum(bytes)?;
-        let stored = stored_checksum(bytes)?;
-        let computed = crc32(segment.body);
-        if stored != computed {
-            return Err(Error::ChecksumMismatch { stored, computed });
-        }
+        segment.verify()?;
         Ok(segment)
     }
 
     /// Opens a segment and verifies its structure but not its contents.
     ///
-    /// The checksum is the only check skipped, and skipping it costs a read of
-    /// the whole file at open time. That is worth doing for a large segment that
-    /// was verified when it was published and has not been touched since, and it
-    /// is not worth doing for a file that arrived from somewhere else. The
-    /// structural checks still hold, so a section slice returned by this segment
-    /// is still inside the input.
+    /// The digests are the only checks skipped, and they are what costs a read
+    /// of the whole file at open time. That is worth skipping for a large
+    /// segment that was verified when it was published and has not been touched
+    /// since, and it is not worth skipping for a file that arrived from
+    /// somewhere else. Everything structural still holds, the footer included,
+    /// so a section slice returned by this segment is still inside the input.
     ///
     /// # Errors
     ///
-    /// As [`Segment::open`], minus [`Error::ChecksumMismatch`].
+    /// As [`Segment::open`], minus what [`Segment::verify`] returns.
     pub fn open_without_checksum(bytes: &'a [u8]) -> Result<Self> {
         let (header, rest) = split_at(bytes, HEADER_LEN)?;
 
@@ -292,12 +354,12 @@ impl<'a> Segment<'a> {
             });
         }
         let (count, header) = get_u16(header)?;
-        let (_checksum, header) = get_u32(header)?;
-        let (body_len, _) = get_u64(header)?;
+        let (_reserved, header) = get_u32(header)?;
+        let (declared, _) = get_u64(header)?;
 
         // The body length is a claim by the file about itself, so it is checked
         // against the bytes actually present rather than used to size anything.
-        let body_len = usize::try_from(body_len).map_err(|_| Error::Truncated {
+        let body_len = usize::try_from(declared).map_err(|_| Error::Truncated {
             needed: usize::MAX,
             available: rest.len(),
         })?;
@@ -308,6 +370,22 @@ impl<'a> Segment<'a> {
             });
         }
         let body = &rest[..body_len];
+
+        // The footer sits immediately after the body, which is what lets a
+        // segment be one record inside a larger file: everything past the footer
+        // belongs to whoever put it there.
+        let (footer, _) = split_at(&rest[body_len..], FOOTER_LEN)?;
+        let (table_digest, footer) = get_u128(footer)?;
+        let (footer_len, magic) = get_u64(footer)?;
+        if magic != FOOTER_MAGIC {
+            return Err(Error::BadFooter);
+        }
+        if footer_len != declared {
+            return Err(Error::BodyLengthMismatch {
+                header: declared,
+                footer: footer_len,
+            });
+        }
 
         let count = usize::from(count);
         let table_len = count
@@ -320,9 +398,109 @@ impl<'a> Segment<'a> {
             count,
             table,
             body,
+            table_digest,
         };
         segment.validate_table()?;
         Ok(segment)
+    }
+
+    /// Checks every digest the segment carries.
+    ///
+    /// The table first and then each section, which is the order they have to be
+    /// checked in: the digests the sections are compared against are in the
+    /// table, so a table nobody has checked is a set of comparisons against
+    /// numbers that could themselves be wrong.
+    ///
+    /// This is what [`Segment::open`] does once the structure holds. It is
+    /// public so that a caller who opened without it can pay for it later,
+    /// during a compaction or a scrub rather than in front of somebody waiting
+    /// for a query.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Xxh3Mismatch`] if the section table has been changed, and
+    /// [`Error::SectionChecksumMismatch`] naming the first section whose bytes
+    /// are not the bytes that were written.
+    pub fn verify(&self) -> Result<()> {
+        self.verify_table()?;
+        for index in 0..self.count {
+            self.verify_at(index)?;
+        }
+        Ok(())
+    }
+
+    /// Checks the section table against the digest in the footer.
+    ///
+    /// Thirty two bytes per section and nothing else, so this is the one check
+    /// whose cost does not depend on how large the segment is. A tool that walks
+    /// a directory of segments to see which ones are worth reading starts here.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Xxh3Mismatch`] if the offsets, the lengths or the digests in the
+    /// table are not the ones that were written.
+    pub fn verify_table(&self) -> Result<()> {
+        let computed = xxh3::hash128(self.table);
+        if computed == self.table_digest {
+            return Ok(());
+        }
+        Err(Error::Xxh3Mismatch {
+            stored: self.table_digest,
+            computed,
+        })
+    }
+
+    /// Checks one section against its own digest, reading no other section.
+    ///
+    /// A reader that only wants the term dictionary can pay for the term
+    /// dictionary, which on a segment whose postings are most of the file is a
+    /// different order of cost. It is also the question a repair asks: the first
+    /// thing worth knowing about a damaged file is which parts of it are still
+    /// good.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::MissingSection`] if the segment does not carry that kind, and
+    /// [`Error::SectionChecksumMismatch`] if the bytes are not the bytes that
+    /// were written. The table digest is not checked here, because a caller
+    /// asking about one section has usually already opened the segment, which
+    /// checks it.
+    pub fn verify_section(&self, kind: u16) -> Result<()> {
+        for index in 0..self.count {
+            if self
+                .entry(index)
+                .is_some_and(|section| section.kind == kind)
+            {
+                return self.verify_at(index);
+            }
+        }
+        Err(Error::MissingSection { kind })
+    }
+
+    /// Checks the section at one position in the table.
+    fn verify_at(&self, index: usize) -> Result<()> {
+        // Neither of these can happen for a segment that came out of open,
+        // because validate_table proved every entry decodes and every slice
+        // fits. They are errors rather than expects because this is a decode
+        // path and nothing on a decode path panics.
+        let section = self.entry(index).ok_or(Error::Truncated {
+            needed: self.count * ENTRY_LEN,
+            available: self.table.len(),
+        })?;
+        let bytes = self.slice(section).ok_or(Error::SectionOutOfRange {
+            kind: section.kind,
+            offset: section.offset,
+            length: section.length,
+        })?;
+        let computed = xxh3::hash128(bytes);
+        if computed != section.digest {
+            return Err(Error::SectionChecksumMismatch {
+                kind: section.kind,
+                stored: section.digest,
+                computed,
+            });
+        }
+        Ok(())
     }
 
     /// Checks every entry before any caller can ask for a section, so that a
@@ -338,33 +516,36 @@ impl<'a> Segment<'a> {
         let mut seen = [0u64; (u16::MAX as usize + 1) / 64];
 
         for index in 0..self.count {
-            let (kind, offset, length) = self.entry(index).ok_or(Error::Truncated {
+            let section = self.entry(index).ok_or(Error::Truncated {
                 needed: table_len,
                 available: self.table.len(),
             })?;
 
-            let start = usize::try_from(offset).ok();
-            let end =
-                start.and_then(|s| usize::try_from(length).ok().and_then(|l| s.checked_add(l)));
+            let start = usize::try_from(section.offset).ok();
+            let end = start.and_then(|s| {
+                usize::try_from(section.length)
+                    .ok()
+                    .and_then(|l| s.checked_add(l))
+            });
             let fits = match (start, end) {
                 (Some(start), Some(end)) => start >= table_len && end <= self.body.len(),
                 _ => false,
             };
             if !fits {
                 return Err(Error::SectionOutOfRange {
-                    kind,
-                    offset,
-                    length,
+                    kind: section.kind,
+                    offset: section.offset,
+                    length: section.length,
                 });
             }
 
             // Duplicates are rejected on write, but a file can arrive from
             // anywhere, and a reader that silently picks the first of two
             // sections is a reader whose answer depends on write order.
-            let word = usize::from(kind) / 64;
-            let bit = 1u64 << (u32::from(kind) % 64);
+            let word = usize::from(section.kind) / 64;
+            let bit = 1u64 << (u32::from(section.kind) % 64);
             if seen[word] & bit != 0 {
-                return Err(Error::DuplicateSection { kind });
+                return Err(Error::DuplicateSection { kind: section.kind });
             }
             seen[word] |= bit;
         }
@@ -372,15 +553,31 @@ impl<'a> Segment<'a> {
     }
 
     /// Reads one table entry in place.
-    fn entry(&self, index: usize) -> Option<(u16, u64, u64)> {
+    fn entry(&self, index: usize) -> Option<Section> {
         let start = index.checked_mul(ENTRY_LEN)?;
         let bytes = self.table.get(start..start.checked_add(ENTRY_LEN)?)?;
         let (kind, rest) = get_u16(bytes).ok()?;
         let (_flags, rest) = get_u16(rest).ok()?;
         let (_padding, rest) = get_u32(rest).ok()?;
         let (offset, rest) = get_u64(rest).ok()?;
-        let (length, _) = get_u64(rest).ok()?;
-        Some((kind, offset, length))
+        let (length, rest) = get_u64(rest).ok()?;
+        let (digest, _) = get_u128(rest).ok()?;
+        Some(Section {
+            kind,
+            offset,
+            length,
+            digest,
+        })
+    }
+
+    /// The bytes one table entry describes.
+    ///
+    /// `None` only for an entry that has not been through `validate_table`,
+    /// which is no entry a caller can reach.
+    fn slice(&self, section: Section) -> Option<&'a [u8]> {
+        let start = usize::try_from(section.offset).ok()?;
+        let end = start.checked_add(usize::try_from(section.length).ok()?)?;
+        self.body.get(start..end)
     }
 
     /// The format version in the header, which is always [`FORMAT_VERSION`] for
@@ -408,21 +605,19 @@ impl<'a> Segment<'a> {
     #[must_use]
     pub fn section(&self, kind: u16) -> Option<&'a [u8]> {
         for index in 0..self.count {
-            let (found, offset, length) = self.entry(index)?;
-            if found != kind {
+            let section = self.entry(index)?;
+            if section.kind != kind {
                 continue;
             }
             // validate_table already proved these convert and fit.
-            let start = usize::try_from(offset).ok()?;
-            let end = start.checked_add(usize::try_from(length).ok()?)?;
-            return self.body.get(start..end);
+            return self.slice(section);
         }
         None
     }
 
     /// Iterates the section kinds present, in the order they were written.
     pub fn kinds(&self) -> impl Iterator<Item = u16> + '_ {
-        (0..self.count).filter_map(move |index| self.entry(index).map(|(kind, _, _)| kind))
+        self.sections().map(|section| section.kind)
     }
 
     /// Iterates the section table, in the order it was written.
@@ -431,13 +626,7 @@ impl<'a> Segment<'a> {
     /// prints a file's layout needs. Every entry was checked at open, so an
     /// offset and a length here are known to fit inside the body.
     pub fn sections(&self) -> impl Iterator<Item = Section> + '_ {
-        (0..self.count).filter_map(move |index| {
-            self.entry(index).map(|(kind, offset, length)| Section {
-                kind,
-                offset,
-                length,
-            })
-        })
+        (0..self.count).filter_map(move |index| self.entry(index))
     }
 }
 
@@ -454,6 +643,13 @@ pub struct Section {
     pub offset: u64,
     /// How many bytes it holds.
     pub length: u64,
+    /// The xxh3-128 of those bytes, as the writer computed it.
+    ///
+    /// [`Segment::verify_section`] is what compares this against the bytes that
+    /// are there. It is public because a tool that copies a section out, or a
+    /// store deciding whether two segments hold the same dictionary, can use the
+    /// number without reading the payload at all.
+    pub digest: u128,
 }
 
 /// The name a person knows a section kind by.
@@ -475,15 +671,6 @@ pub const fn name(kind: u16) -> Option<&'static str> {
         kind::NORMS => Some("norms"),
         _ => None,
     }
-}
-
-/// Reads the checksum field out of a header that has already been length
-/// checked by the caller.
-fn stored_checksum(bytes: &[u8]) -> Result<u32> {
-    let (header, _) = split_at(bytes, HEADER_LEN)?;
-    let (_, rest) = split_at(header, MAGIC.len() + 2 + 2)?;
-    let (checksum, _) = get_u32(rest)?;
-    Ok(checksum)
 }
 
 #[cfg(test)]
@@ -610,11 +797,7 @@ mod tests {
         // a broken writer somewhere else would look like.
         let mut body = Vec::new();
         for _ in 0..2 {
-            put_u16(&mut body, kind::TERMS);
-            put_u16(&mut body, 0);
-            put_u32(&mut body, 0);
-            put_u64(&mut body, (2 * ENTRY_LEN) as u64);
-            put_u64(&mut body, 1);
+            row(&mut body, kind::TERMS, (2 * ENTRY_LEN) as u64, 1);
         }
         body.push(b'x');
 
@@ -655,14 +838,125 @@ mod tests {
             assert!(
                 matches!(
                     err,
-                    Error::ChecksumMismatch { .. }
+                    Error::SectionChecksumMismatch { .. }
+                        | Error::Xxh3Mismatch { .. }
                         | Error::SectionOutOfRange { .. }
                         | Error::DuplicateSection { .. }
+                        | Error::BodyLengthMismatch { .. }
+                        | Error::BadFooter
                         | Error::Truncated { .. }
                 ),
                 "byte {index}: {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn damage_is_attributed_to_the_section_it_landed_in() {
+        // The whole reason there is a digest per section. One digest over the
+        // file can say that a byte somewhere is wrong and stop there, and a
+        // person holding a damaged index wants to know whether it is the term
+        // dictionary or a section they can rebuild.
+        let clean = sample();
+        let acl = Segment::open(&clean)
+            .expect("open")
+            .sections()
+            .find(|section| section.kind == kind::ACL)
+            .expect("the sample carries an acl");
+
+        let mut bytes = clean.clone();
+        bytes[HEADER_LEN + usize::try_from(acl.offset).expect("fits")] ^= 0xff;
+
+        assert!(matches!(
+            Segment::open(&bytes),
+            Err(Error::SectionChecksumMismatch {
+                kind: kind::ACL,
+                ..
+            })
+        ));
+
+        // And every other section is still known good, which is the half of the
+        // answer a single digest cannot give at all.
+        let segment = Segment::open_without_checksum(&bytes).expect("the structure is untouched");
+        assert_eq!(segment.verify_section(kind::TERMS), Ok(()));
+        assert_eq!(segment.verify_section(kind::POSTINGS), Ok(()));
+        assert!(segment.verify_section(kind::ACL).is_err());
+        assert_eq!(
+            segment.verify_section(kind::VECTORS),
+            Err(Error::MissingSection {
+                kind: kind::VECTORS
+            })
+        );
+    }
+
+    #[test]
+    fn an_edited_table_is_caught_before_the_sections_it_describes() {
+        // The digest one entry holds, changed. The structure still checks out
+        // and the section it points at is untouched, so nothing but the digest
+        // over the table can catch this, and it has to catch it before any
+        // section is compared against a number that is now made up.
+        let mut bytes = sample();
+        bytes[HEADER_LEN + 24] ^= 0xff;
+
+        assert!(matches!(
+            Segment::open(&bytes),
+            Err(Error::Xxh3Mismatch { .. })
+        ));
+        assert!(Segment::open_without_checksum(&bytes).is_ok());
+    }
+
+    #[test]
+    fn a_segment_ends_in_a_footer() {
+        let bytes = sample();
+        assert_eq!(
+            &bytes[bytes.len() - FOOTER_MAGIC.len()..],
+            &FOOTER_MAGIC[..]
+        );
+        // Not the header magic, so that a tool scanning a file for the start of
+        // a segment cannot find one at the end of the segment before it.
+        assert_ne!(FOOTER_MAGIC, MAGIC);
+    }
+
+    #[test]
+    fn a_missing_footer_is_refused() {
+        let mut bytes = sample();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        assert_eq!(Segment::open(&bytes), Err(Error::BadFooter));
+        // Structural rather than a digest, so skipping the digests does not skip
+        // this: a file that does not end in a footer is not a segment.
+        assert_eq!(
+            Segment::open_without_checksum(&bytes),
+            Err(Error::BadFooter)
+        );
+    }
+
+    #[test]
+    fn two_ends_that_disagree_about_the_length_are_refused() {
+        // The header says one thing and the footer says another. Damage that
+        // changed only one of them would be invisible to a reader that only
+        // reads the other, which is why the number is written twice.
+        let mut bytes = sample();
+        let at = bytes.len() - FOOTER_LEN + 16;
+        bytes[at..at + 8].copy_from_slice(&7u64.to_le_bytes());
+
+        let body_len = (bytes.len() - HEADER_LEN - FOOTER_LEN) as u64;
+        assert_eq!(
+            Segment::open(&bytes),
+            Err(Error::BodyLengthMismatch {
+                header: body_len,
+                footer: 7,
+            })
+        );
+    }
+
+    #[test]
+    fn the_size_a_writer_promises_is_the_size_it_writes() {
+        let mut writer = Writer::new();
+        writer.add(kind::TERMS, vec![1; 40]).expect("adds");
+        writer.add(kind::POSTINGS, vec![2; 4_000]).expect("adds");
+        let size = writer.size();
+        assert_eq!(writer.finish().len(), size);
     }
 
     #[test]
@@ -684,11 +978,8 @@ mod tests {
     #[test]
     fn a_section_that_points_outside_the_segment_is_refused() {
         let mut body = Vec::new();
-        put_u16(&mut body, kind::TERMS);
-        put_u16(&mut body, 0);
-        put_u32(&mut body, 0);
-        put_u64(&mut body, ENTRY_LEN as u64);
-        put_u64(&mut body, u64::MAX); // a length no allocation should be sized from
+        // A length no allocation should be sized from.
+        row(&mut body, kind::TERMS, ENTRY_LEN as u64, u64::MAX);
 
         let bytes = wrap(&body, 1);
         assert_eq!(
@@ -704,11 +995,7 @@ mod tests {
     #[test]
     fn a_section_that_overlaps_the_table_is_refused() {
         let mut body = Vec::new();
-        put_u16(&mut body, kind::TERMS);
-        put_u16(&mut body, 0);
-        put_u32(&mut body, 0);
-        put_u64(&mut body, 0); // inside the table itself
-        put_u64(&mut body, 4);
+        row(&mut body, kind::TERMS, 0, 4); // inside the table itself
         body.extend_from_slice(b"tail");
 
         let bytes = wrap(&body, 1);
@@ -746,11 +1033,7 @@ mod tests {
     #[test]
     fn skipping_the_checksum_still_refuses_a_corrupt_table() {
         let mut body = Vec::new();
-        put_u16(&mut body, kind::TERMS);
-        put_u16(&mut body, 0);
-        put_u32(&mut body, 0);
-        put_u64(&mut body, 1 << 40);
-        put_u64(&mut body, 8);
+        row(&mut body, kind::TERMS, 1 << 40, 8);
 
         let bytes = wrap(&body, 1);
         assert!(matches!(
@@ -762,27 +1045,48 @@ mod tests {
     #[test]
     fn skipping_the_checksum_accepts_a_body_the_checksum_would_reject() {
         let mut bytes = sample();
-        let last = bytes.len() - 1;
-        bytes[last] ^= 0xff;
+        let postings = Segment::open(&bytes)
+            .expect("open")
+            .sections()
+            .find(|section| section.kind == kind::POSTINGS)
+            .expect("the sample carries postings");
+        bytes[HEADER_LEN + usize::try_from(postings.offset).expect("fits")] ^= 0xff;
 
         assert!(matches!(
             Segment::open(&bytes),
-            Err(Error::ChecksumMismatch { .. })
+            Err(Error::SectionChecksumMismatch { .. })
         ));
+        // The damage is inside a payload, and a payload is exactly what the
+        // structural checks never look at.
         assert!(Segment::open_without_checksum(&bytes).is_ok());
     }
 
-    /// Puts a valid header in front of a hand built body, so that a test about
-    /// a corrupt section table is not also a test about the header.
+    /// One hand built table entry, for the tables a writer would refuse to
+    /// produce. The digest is left at zero because every test that builds a
+    /// table this way is about a structural check, which happens first.
+    fn row(out: &mut Vec<u8>, kind: u16, offset: u64, length: u64) {
+        put_u16(out, kind);
+        put_u16(out, 0);
+        put_u32(out, 0);
+        put_u64(out, offset);
+        put_u64(out, length);
+        put_u128(out, 0);
+    }
+
+    /// Puts a valid header and footer around a hand built body, so that a test
+    /// about a corrupt section table is not also a test about the two ends.
     fn wrap(body: &[u8], sections: u16) -> Vec<u8> {
-        let mut out = Vec::with_capacity(HEADER_LEN + body.len());
+        let mut out = Vec::with_capacity(HEADER_LEN + body.len() + FOOTER_LEN);
         out.extend_from_slice(&MAGIC);
         put_u16(&mut out, FORMAT_VERSION);
         put_u16(&mut out, sections);
-        put_u32(&mut out, crc32(body));
+        put_u32(&mut out, 0); // reserved
         put_u64(&mut out, body.len() as u64);
         out.resize(HEADER_LEN, 0);
         out.extend_from_slice(body);
+
+        let table = &body[..usize::from(sections) * ENTRY_LEN];
+        out.extend_from_slice(&footer_bytes(table, body.len() as u64));
         out
     }
 }

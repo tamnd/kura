@@ -45,7 +45,7 @@ The crate holds the pieces the rest is built out of, and each one is tested and 
 - **Vectors.** Cosine similarity, unit normalisation and eight bit quantisation with a per vector scale, which cuts the memory a corpus costs by four with a bounded error.
   Scoring keeps eight partial sums rather than one so the reduction vectorises, and at that point it is bandwidth bound, which is why the quantised form is another four times faster than the full width one.
 - **A C ABI.** A static and shared library with a hand written header, so a host in another language can use the engine without a socket and without copying the data.
-- **Segments.** The on disk container, holding a header, a section table and the section payloads, checksummed and verified on open.
+- **Segments.** The on disk container, holding a header, a section table, the section payloads and a footer, with an xxh3-128 per section rather than one over the file, so damage is attributed to the section it is in and every other section stays known good.
   It is documented in [docs/format.md](docs/format.md), field by field and with the reason for each one.
 
 The columnar layer and the graph layer are next.

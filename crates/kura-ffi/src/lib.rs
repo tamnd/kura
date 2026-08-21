@@ -706,7 +706,12 @@ fn status_of(err: &Error) -> i32 {
         Error::Overflow => KURA_ERR_OVERFLOW,
         Error::BadMagic => KURA_ERR_BAD_MAGIC,
         Error::UnsupportedVersion { .. } => KURA_ERR_UNSUPPORTED_VERSION,
-        Error::ChecksumMismatch { .. } => KURA_ERR_CHECKSUM,
+        // Three variants and one code, because the caller's question is whether
+        // the bytes are the bytes that were written. Which digest answered it is
+        // a detail of the format, and the message carries it.
+        Error::ChecksumMismatch { .. }
+        | Error::Xxh3Mismatch { .. }
+        | Error::SectionChecksumMismatch { .. } => KURA_ERR_CHECKSUM,
         Error::DimensionMismatch { .. } => KURA_ERR_DIMENSION_MISMATCH,
         Error::NotSorted { .. } => KURA_ERR_NOT_SORTED,
         // The error type is non exhaustive on purpose, so a new variant has to

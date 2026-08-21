@@ -26,18 +26,24 @@ header, 32 bytes
   0..8    magic
   8..10   format version, u16
   10..12  section count, u16
-  12..16  checksum of the body, u32
+  12..16  reserved, written as zero
   16..24  body length, u64
   24..32  reserved, written as zero
 
 body
-  section table, 24 bytes per entry, section count entries
+  section table, 40 bytes per entry, section count entries
     0..2    kind, u16
     2..4    flags, u16
     4..8    padding, u32
     8..16   offset from the start of the body, u64
     16..24  length, u64
+    24..40  xxh3-128 of the payload, u128
   section payloads, in the order the writer added them
+
+footer, 32 bytes
+  0..16   xxh3-128 of the section table, u128
+  16..24  body length, u64, the same number the header carries
+  24..32  footer magic, the eight bytes KURAFOOT
 ```
 
 Every integer is little endian.
@@ -56,14 +62,6 @@ Two bytes is far more than this format will ever need, and it keeps the fields t
 **Section count, two bytes.**
 It bounds the table before a single entry is read, which is what lets the reader check that the table fits inside the body in one comparison rather than discovering it entry by entry.
 It also caps a segment at 65535 sections, which is several orders of magnitude more than any real one will hold.
-
-**Checksum of the body, four bytes.**
-CRC-32 with the IEEE polynomial, the same one zlib, gzip and PNG use.
-It answers one question: are these the bytes that were written.
-It is not a hash and it defends against nobody, and the code says so where it is defined.
-
-The checksum covers the body and not the header, because the header holds the checksum.
-Checksumming the body alone means a writer can assemble the body, checksum it, and then stamp the header over a reservation it made at the start, in one pass and with no second buffer.
 
 **Body length, eight bytes.**
 This is what makes a segment a record rather than a file.
@@ -91,6 +89,48 @@ It puts the offset and the length on an eight byte boundary within the entry, so
 Where the section is and how long it is, with the offset relative to the start of the body rather than the start of the file.
 Relative to the body means a writer can build the body before it knows where in a file the segment will land.
 
+**Digest, sixteen bytes.**
+The xxh3-128 of that section's payload and nothing else.
+See below for why it is per section, and `docs/` has nothing to add about xxh3 itself beyond that it is a hash for detecting damage and not a defence against anybody who wants to change a file.
+
+**Footer, thirty two bytes.**
+The digest of the section table, the body length again, and eight magic bytes that are not the header's.
+
+The table digest cannot live in the header, because the header is written first and the table is not finished until every payload has been hashed.
+The previous format worked its whole body checksum out in a second pass to get around exactly this.
+A footer is written when the number is already in hand, which costs nothing and needs no seek back over a file that may not be seekable.
+
+The body length is repeated because a file whose two ends disagree about how long it is has been damaged in a way that neither end can detect alone.
+The footer magic differs from the header magic so that a tool scanning a file for the start of a segment and a tool scanning for the end of one are looking for different needles, and so that a truncated file does not look like the beginning of another segment.
+
+## Why the checksums are where they are
+
+There is no checksum over the segment as a whole, and that is the point.
+
+One digest over everything answers "was this file ever damaged" and cannot answer "which part of it".
+Measured on a 68.7 KB index, a byte flipped at two of five offsets was caught by the whole file digest and by nothing else, because the bytes went on to decode into a well formed posting list of the right length in ascending order.
+The report for those two could only say that something somewhere was wrong.
+
+A digest per section plus a digest over the table says the same thing and says where.
+The table digest covers the offsets and the lengths, so a table that has been edited is caught before any of them is used to slice anything.
+Each section digest covers that section's bytes, so damage is attributed to the section it is in and every other section is still known good.
+
+Together they cover every byte of the body exactly once, so nothing is lost by there being no digest over the lot.
+The composition is also what lets a reader check one section without reading the rest, which is what `Segment::verify_section` is for and what a repair would need.
+
+This is what `kura-cli verify` prints for an index with a byte flipped inside the postings.
+
+```
+  ok       checksum table
+  ok       checksum terms
+  FAILED   checksum postings
+      section kind 2 does not match its checksum: stored 0xaad0..., computed 0xaab4...
+  ok       checksum norms
+  ok       checksum fields
+```
+
+The dictionary and the stored fields are intact, the postings are not, and that is the difference between rebuilding one section and restoring the file from backup.
+
 ## Section kinds
 
 | Kind | Name | What it holds |
@@ -117,11 +157,14 @@ Each of these has its own error rather than one opaque failure, because a caller
 
 - Magic that is not this engine's.
 - A format version this build does not write.
-- A file shorter than the header, or shorter than the body length the header claims.
+- A file shorter than the header, or shorter than the body length the header claims, or with no room for a footer after the body.
+- A footer that does not end in the footer magic.
+- A header and a footer that disagree about the body length.
 - A section table that does not fit inside the body.
 - A section whose offset and length do not lie inside the body, or that overlaps the table.
 - Two sections claiming the same kind.
-- A checksum that does not match the body.
+- A section table that does not match the digest in the footer.
+- A section whose bytes do not match the digest in its table entry.
 
 None of these allocate anything sized from a number in the file, which is the rule that makes a hostile 32 byte header stay a hostile 32 byte header instead of becoming a request for four exabytes of memory.
 
@@ -138,35 +181,39 @@ That is the whole forward compatibility story.
 A later build can add a section kind, and every file it writes stays readable by every build that came before.
 The version is a refusal and the kind is a shrug, and keeping those two apart is what makes it possible to add to the format without a migration.
 
-## Reading without the checksum
+## Reading without the checksums
 
 `Segment::open` verifies everything.
 It is the one to use unless there is a measured reason not to.
 
-`Segment::open_without_checksum` skips the checksum and nothing else.
-The structural checks still run, so a section slice it hands back is still inside the input, and a corrupt section table is still refused.
+`Segment::open_without_checksum` skips the digests and nothing else.
+Every structural check still runs, the footer included, so a section slice it hands back is still inside the input and a corrupt section table is still refused.
+
+`Segment::verify` is the digests on their own, for a caller that opened without them and wants to pay later.
+`Segment::verify_table` is the footer digest by itself, which is thirty two bytes per section and no payload at all.
+`Segment::verify_section` is one section, for a reader that wants the dictionary checked and does not want to read the postings to get it.
 
 The distinction matters, and it is worth more than an argument from first principles, so here is the measurement.
-The segment holds a million document posting list and a megabyte term section, and the machine is an idle Intel i9-13900K running Windows.
-It came to 2.1 MB when this was taken.
-The posting format has since roughly halved that, which moves the verified figure down with it and leaves the skipped one exactly where it is, because one of them reads the data and the other reads the table.
+The segment holds a million document posting list and a megabyte term section, and the machine is an idle Apple M4 running macOS 15.7.
 
 ```
-open a segment, checksum verified               3479.9 us
-open a segment, checksum skipped                   100 ns
+open a segment, checksum verified                 91.8 us
+open a segment, checksum skipped                    83 ns
 ```
 
 Run it yourself with `cargo run --release --example bench`.
 
-The verified figure is stable to within a microsecond across runs.
-The skipped figure sits at the resolution of the platform timer, so read it as under a microsecond rather than as exactly 100 ns.
-Either way the gap is around four orders of magnitude, and it grows with the size of the segment, because one side is a walk of a two entry table and the other is a pass over every byte.
+The verified figure was 425.6 us on the same machine when the body was checksummed as a whole with CRC-32.
+It is a third of a millisecond quicker per segment for a strictly better answer, because xxh3 is around six times the rate and the pass over the payloads is the same pass.
+
+The skipped figure sits near the resolution of the platform timer, so read it as under a microsecond rather than as exactly 83 ns.
+Either way the gap is around three orders of magnitude, and it grows with the size of the segment, because one side is a walk of a two entry table and the other is a pass over every byte.
 That is the shape you want: opening should cost what the table costs, and verifying should cost what the data costs.
 
 For a memory mapped file the difference is larger still, since verifying means faulting in every page rather than the one the table lives on.
 That trade is worth making for a segment this process wrote and published and has not touched since.
 It is not worth making for a file that arrived from somewhere else.
 
-The checksum runs at about 610 MB/s, which is what a byte at a time table driven CRC-32 gets.
-A slice by eight implementation would be several times quicker, and it is the obvious thing to do if checksumming ever shows up in a profile.
-It has not yet, so it has not been written.
+Verifying runs at about 19 GB/s on that machine, which is what xxh3-128 gets on thirty two megabytes that do not fit in cache.
+The CRC-32 it replaced gets about 3 GB/s, and got 538 MB/s before it was rewritten to consume sixteen bytes at a time.
+Those two numbers are why the format hashes each section rather than picking one digest and hoping it is never in the way.
