@@ -1233,6 +1233,60 @@ mod tests {
     }
 
     #[test]
+    fn every_block_is_either_read_or_stepped_over() {
+        // Blocks skipped is worked out by subtraction, so this is the identity
+        // that makes the number mean anything. It has to hold for a query that
+        // prunes, a query that cannot, a query over a term nobody has, and both
+        // walks, because a walk that decoded a block twice or lost one would
+        // show up here and nowhere else.
+        let docs = skewed(6_000);
+        let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+        let bytes = build(&refs);
+        let segment = Segment::open(&bytes).expect("opens");
+        let index = Reader::open(&segment).expect("opens");
+        let searcher = Searcher::new(&index);
+
+        for query in [
+            "common",
+            "rare",
+            "rare common",
+            "word7 common rare",
+            "word7",
+            "aardvark",
+            "aardvark common",
+        ] {
+            for k in [1, 10, 1_000] {
+                let (_, counters) = searcher.search_explained(query, k).expect("searches");
+                assert_eq!(
+                    counters.blocks_decoded + counters.blocks_skipped,
+                    counters.blocks,
+                    "{query} at k {k}"
+                );
+                assert!(
+                    counters.blocks_decoded <= counters.blocks,
+                    "{query} at k {k} read more blocks than the lists hold"
+                );
+
+                let (_, _, counters) = searcher
+                    .search_and_count_explained(query, k)
+                    .expect("searches");
+                assert_eq!(
+                    counters.blocks_decoded + counters.blocks_skipped,
+                    counters.blocks,
+                    "{query} at k {k}, page and total"
+                );
+            }
+
+            let (_, counters) = searcher.count_explained(query).expect("counts");
+            assert_eq!(
+                counters.blocks_decoded + counters.blocks_skipped,
+                counters.blocks,
+                "{query}, total only"
+            );
+        }
+    }
+
+    #[test]
     fn asking_for_nothing_returns_nothing() {
         let bytes = build(&DOCS);
         let segment = Segment::open(&bytes).expect("opens");
