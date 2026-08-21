@@ -72,6 +72,7 @@ Anything linked into this engine is linked into every host that uses it.
 ```
 crates/kura-core   the engine, no dependencies, no unsafe on the decode paths
 crates/kura-ffi    the C ABI, built as a static and shared library
+crates/kura-cli    the `kura` binary, and where `explain` lives
 include/kura.h     the header, written by hand and checked in
 examples/c         a C caller, compiled and run in CI on every platform
 docs/format.md     the on disk format
@@ -86,6 +87,42 @@ cargo build --release -p kura-ffi
 ```
 
 The release build produces `target/release/libkura.a` and a shared library beside it.
+
+## Asking what a query did
+
+```sh
+cargo build --release -p kura-cli
+./target/release/kura index ./docs -o /tmp/docs.kura
+./target/release/kura explain /tmp/docs.kura "block max wand"
+```
+
+`explain` runs the query and prints what the engine did to answer it, which is the part a timing cannot tell you.
+
+```
+query    block max wand pruning
+terms    4 of 4 in the index
+
+  term                        documents     blocks
+  block                            4671         37
+  max                              5407         43
+  pruning                           452          4
+  wand                              180          2
+
+walk     page, block-max WAND
+
+  postings decoded                 5624  of 10710         52.5%
+  blocks decoded                     45  of 86            52.3%
+  blocks skipped                     41  of 86            47.7%
+  documents scored                  247
+  cursor seeks                      477
+  cursor advances                   803
+
+took     86.000µs, and 47.5% of the postings were never read
+```
+
+A query where blocks skipped is zero over a long list is a query where the pruning did not fire, and that is a different bug from a query that skipped almost everything and was still slow.
+The default explains the walk that produces a page of results.
+Pass `--total` to explain the walk that produces a page and the total count instead, which has to visit every match and so skips much less by construction.
 
 ## Calling it from C
 

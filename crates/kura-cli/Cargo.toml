@@ -1,0 +1,30 @@
+[package]
+name = "kura-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+categories.workspace = true
+keywords.workspace = true
+description = "Command line access to a kura index, and the tool that says what a query did."
+
+# The binary is `kura`. The crate is `kura-cli` because `kura` is the name the
+# library will want on crates.io.
+#
+# `doc = false` because the FFI crate's library target is also called `kura`, and
+# two targets of the same name write the same file under target/doc. The build
+# outputs do not collide, only the documentation does, and nobody reads rustdoc
+# for a binary.
+[[bin]]
+name = "kura"
+path = "src/main.rs"
+doc = false
+
+[dependencies]
+kura-core = { path = "../kura-core", version = "0.1.0" }
+
+[lints]
+workspace = true
