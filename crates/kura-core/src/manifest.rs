@@ -670,23 +670,87 @@ pub fn locate_each(
     manifest
         .segments
         .iter()
+        .map(|segment| region(superblock, len, segment.offset, segment.len))
+        .collect()
+}
+
+/// Where a stretch of the segment region sits in a file of `len` bytes.
+///
+/// The check itself, with nothing about segments in it, because a tombstone
+/// bitmap lives in the same region under the same two rules and a second copy of
+/// them is a second thing to get wrong.
+fn region(
+    superblock: &Superblock,
+    len: usize,
+    offset: u64,
+    length: u64,
+) -> Result<core::ops::Range<usize>> {
+    if offset < superblock.segments_offset {
+        return Err(Error::SectionOutOfRange {
+            kind: 0,
+            offset,
+            length,
+        });
+    }
+    let start = index_of(offset, len)?;
+    let end = index_of(offset.saturating_add(length), len)?;
+    if end > len {
+        return Err(Error::Truncated {
+            needed: end,
+            available: len,
+        });
+    }
+    Ok(start..end)
+}
+
+/// Where each segment's tombstone bitmap sits, or `None` where a segment has
+/// none.
+///
+/// The same check as [`locate`], for the other thing a descriptor points at. A
+/// segment with nothing deleted carries a zero offset and a zero length, and
+/// anything else with one of the two at zero is a descriptor that was half
+/// written or half cleared, which is refused rather than read as an empty set:
+/// an empty set of deletions and a set that could not be found are different
+/// answers and only one of them is safe to search with.
+///
+/// # Errors
+///
+/// As [`locate`], and [`Error::SectionOutOfRange`] for a descriptor with only
+/// one of its two halves set.
+pub fn tombstones(
+    superblock: &Superblock,
+    manifest: &Manifest,
+    len: usize,
+) -> Result<Vec<Option<core::ops::Range<usize>>>> {
+    tombstones_each(superblock, manifest, len)
+        .into_iter()
+        .collect()
+}
+
+/// Where each segment's tombstone bitmap sits, one answer per segment.
+///
+/// [`tombstones`] is this with the failures collapsed, and the two exist for the
+/// same reason [`locate`] and [`locate_each`] do.
+#[must_use]
+pub fn tombstones_each(
+    superblock: &Superblock,
+    manifest: &Manifest,
+    len: usize,
+) -> Vec<Result<Option<core::ops::Range<usize>>>> {
+    manifest
+        .segments
+        .iter()
         .map(|segment| {
-            if segment.offset < superblock.segments_offset {
-                return Err(Error::SectionOutOfRange {
+            let length = u64::from(segment.tombstones_len);
+            match (segment.tombstones_offset, length) {
+                (0, 0) => Ok(None),
+                (0, _) | (_, 0) => Err(Error::SectionOutOfRange {
                     kind: 0,
-                    offset: segment.offset,
-                    length: segment.len,
-                });
+                    offset: segment.tombstones_offset,
+                    length,
+                }),
+                (offset, length) => region(superblock, len, offset, length).map(Some),
             }
-            let start = index_of(segment.offset, len)?;
-            let end = index_of(segment.offset.saturating_add(segment.len), len)?;
-            if end > len {
-                return Err(Error::Truncated {
-                    needed: end,
-                    available: len,
-                });
-            }
-            Ok(start..end)
         })
         .collect()
 }
@@ -1084,6 +1148,89 @@ mod tests {
             locate(&block, &state, bytes.len()),
             Err(Error::SectionOutOfRange { .. })
         ));
+    }
+
+    #[test]
+    fn a_segment_with_nothing_deleted_points_at_no_bitmap() {
+        // Not an empty range, which would be a bitmap of no bytes and a
+        // different thing to have to decode. A segment with nothing deleted has
+        // nowhere to look, and that is the answer.
+        let bytes = store_of(&[b"first", b"second"]);
+        let (block, state) = front(&bytes).expect("a front");
+        let found = tombstones(&block, &state, bytes.len()).expect("tombstones");
+        assert_eq!(found, vec![None, None]);
+    }
+
+    #[test]
+    fn a_tombstone_bitmap_is_found_where_the_descriptor_says() {
+        let bytes = store_of(&[b"first"]);
+        let (block, mut state) = front(&bytes).expect("a front");
+        // Beside the segment, in the same region, which is where a delete puts
+        // it.
+        let offset = state.segments[0].offset + 64;
+        state.segments[0].tombstones_offset = offset;
+        state.segments[0].tombstones_len = 16;
+        let found = tombstones(&block, &state, bytes.len()).expect("tombstones");
+        assert_eq!(found, vec![Some(as_index(offset)..as_index(offset) + 16)]);
+    }
+
+    #[test]
+    fn a_tombstone_bitmap_pointing_at_the_manifest_is_refused() {
+        let bytes = store_of(&[b"first"]);
+        let (block, mut state) = front(&bytes).expect("a front");
+        state.segments[0].tombstones_offset = SLOT_A_OFFSET;
+        state.segments[0].tombstones_len = 16;
+        assert!(matches!(
+            tombstones(&block, &state, bytes.len()),
+            Err(Error::SectionOutOfRange { .. })
+        ));
+    }
+
+    #[test]
+    fn a_tombstone_bitmap_reaching_past_the_end_of_the_file_is_refused() {
+        let bytes = store_of(&[b"first"]);
+        let (block, mut state) = front(&bytes).expect("a front");
+        state.segments[0].tombstones_offset = state.segments[0].offset;
+        state.segments[0].tombstones_len = 8192;
+        assert!(matches!(
+            tombstones(&block, &state, bytes.len()),
+            Err(Error::Truncated { .. })
+        ));
+    }
+
+    #[test]
+    fn a_half_written_tombstone_descriptor_is_refused_rather_than_read_as_empty() {
+        // Either half on its own is a descriptor nobody meant to write, and
+        // reading it as no deletions is the one wrong answer available: it
+        // brings back documents somebody deleted.
+        let bytes = store_of(&[b"first"]);
+        let (block, state) = front(&bytes).expect("a front");
+        for (offset, len) in [(state.segments[0].offset, 0), (0, 16)] {
+            let mut state = state.clone();
+            state.segments[0].tombstones_offset = offset;
+            state.segments[0].tombstones_len = len;
+            assert!(
+                matches!(
+                    tombstones(&block, &state, bytes.len()),
+                    Err(Error::SectionOutOfRange { .. })
+                ),
+                "offset {offset} and length {len}"
+            );
+        }
+    }
+
+    #[test]
+    fn one_bad_tombstone_descriptor_leaves_the_others_readable() {
+        // The reason there are two of these: a repair has to be able to say
+        // which segment is the problem, and the collected version only says
+        // that one of them is.
+        let bytes = store_of(&[b"first", b"second"]);
+        let (block, mut state) = front(&bytes).expect("a front");
+        state.segments[0].tombstones_offset = SLOT_A_OFFSET;
+        state.segments[0].tombstones_len = 16;
+        let each = tombstones_each(&block, &state, bytes.len());
+        assert!(each[0].is_err());
+        assert_eq!(each[1].as_ref().expect("the second"), &None);
     }
 
     #[test]

@@ -65,12 +65,28 @@
 //! store that comes back pointing at a hole, where segment bytes that no
 //! manifest names are bytes nothing will ever read. One of those is a lost
 //! store and the other is wasted space.
+//!
+//! # Deletions arrive the same way, and never in place
+//!
+//! A set of deletions is the one thing about a segment that changes after it is
+//! written, so it does not live in the segment. It lives in the same region,
+//! beside it, and the manifest points at it. A newer set is appended somewhere
+//! else and the manifest is pointed at that, which is the same order as a
+//! segment and buys the same property: a machine that stops halfway comes back
+//! either to the new set or to the old one.
+//!
+//! It also buys copy on write for free. A [`View`] holds the mapping and the
+//! offsets it was made with, so a query already running is reading bytes no
+//! writer will touch, and the space the older set is in comes back when a
+//! compaction rewrites the segment rather than when the newer set is written.
 
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::Path;
 
+use crate::bitmap::Bitmap;
 use crate::error::Error;
+use crate::index::Reader;
 use crate::manifest::{
     Committed, Manifest, PAGE, SLOT_A_OFFSET, SLOT_B_OFFSET, SLOT_LEN, SUPERBLOCK_LEN, Segment,
     Slot, Superblock,
@@ -388,11 +404,13 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`Trouble::Format`] if the manifest is too large for a slot, and
-    /// [`Trouble::Io`] if the write or the sync fails. In either case the store
-    /// is still at the state it was at, because the slot being written is the
-    /// one nothing is reading.
+    /// Returns [`Trouble::Format`] if the manifest is too large for a slot or if
+    /// it puts a segment's deletions back to an older generation than the
+    /// committed one, and [`Trouble::Io`] if the write or the sync fails. In
+    /// every case the store is still at the state it was at, because the slot
+    /// being written is the one nothing is reading.
     pub fn commit(&mut self, manifest: Manifest, written: u64) -> Result<u64> {
+        Self::deletions_only_accumulate(&self.manifest, &manifest)?;
         let mut next = manifest;
         next.epoch = self.manifest.epoch.saturating_add(1);
         next.written = written;
@@ -409,6 +427,38 @@ impl Store {
         self.manifest = next;
         self.slot = slot;
         Ok(self.manifest.epoch)
+    }
+
+    /// Refuses a commit that puts a segment's deletions back to an older set.
+    ///
+    /// A segment is matched by where it is and by the digest of its own footer,
+    /// so the check is about the same segment rather than about the same place
+    /// in the file: a compaction that dropped a segment and an append that later
+    /// reused the space is a different segment starting again at nothing, which
+    /// is not a step backwards.
+    ///
+    /// Deletions only accumulate until a compaction rewrites the segment, so a
+    /// generation that goes backwards means two writers hold different ideas of
+    /// what is deleted, and committing the older one brings documents back from
+    /// the dead. Refusing costs a walk of two short lists per commit.
+    fn deletions_only_accumulate(committed: &Manifest, next: &Manifest) -> Result<()> {
+        for segment in &next.segments {
+            let Some(was) = committed
+                .segments
+                .iter()
+                .find(|old| old.offset == segment.offset && old.footer == segment.footer)
+            else {
+                continue;
+            };
+            if segment.generation < was.generation {
+                return Err(Trouble::Format(Error::StaleGeneration {
+                    offset: segment.offset,
+                    committed: was.generation,
+                    given: segment.generation,
+                }));
+            }
+        }
+        Ok(())
     }
 
     /// Where a segment appended now would start.
@@ -511,6 +561,130 @@ impl Store {
         })
     }
 
+    /// Writes a set of deletions for a segment and says where it went.
+    ///
+    /// The set goes into the segment region beside the segment it is about,
+    /// because a segment is immutable and a set of deletions is the opposite: it
+    /// is the one thing about a segment that changes after it is written. What
+    /// comes back is the descriptor to commit, which is the one handed in with
+    /// the tombstone fields pointing at the bytes just written and the
+    /// generation moved on by one.
+    ///
+    /// Nothing is overwritten, ever. A newer set is written somewhere else and
+    /// the manifest is pointed at it, which is what makes a delete atomic and
+    /// what makes it safe for a query that is already running: a view holds the
+    /// mapping and the offsets it was made with, so the bytes underneath it are
+    /// ones no writer will touch again. The space the older set is in comes back
+    /// when a compaction rewrites the segment, and not before.
+    ///
+    /// An empty set clears the descriptor rather than writing nothing down, so a
+    /// segment whose deletions were all undone by a compaction is a segment with
+    /// no tombstones rather than one pointing at an empty bitmap.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Trouble::Format`] with [`Error::NoSuchDocument`] if the set
+    /// names a document the segment does not have, which means it was built
+    /// against a different segment, and [`Trouble::Io`] if the write or the sync
+    /// fails. Nothing is committed either way.
+    pub fn append_tombstones(&mut self, segment: &Segment, deleted: &Bitmap) -> Result<Segment> {
+        if let Some(doc) = deleted.max()
+            && doc >= segment.docs
+        {
+            return Err(Trouble::Format(Error::NoSuchDocument {
+                doc,
+                documents: segment.docs,
+            }));
+        }
+        let mut next = *segment;
+        next.generation = segment.generation.saturating_add(1);
+        if deleted.is_empty() {
+            next.tombstones_offset = 0;
+            next.tombstones_len = 0;
+            next.first_live = 0;
+            return Ok(next);
+        }
+
+        let mut bytes = Vec::with_capacity(deleted.size());
+        deleted.write_to(&mut bytes);
+        let offset = self.segments;
+        write_at(&self.file, &bytes, offset)?;
+        // Everything and not just the data, for the reason the segment append
+        // gives: the file has grown and its length has to survive with the
+        // bytes.
+        self.file.sync_all()?;
+        let len = bytes.len() as u64;
+        self.segments = offset.saturating_add(len).next_multiple_of(u64::from(PAGE));
+
+        next.tombstones_offset = offset;
+        next.tombstones_len = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+        next.first_live = deleted.first_absent().min(segment.docs);
+        Ok(next)
+    }
+
+    /// Deletes documents from one segment and commits it.
+    ///
+    /// The set is the whole answer for that segment rather than a change to it,
+    /// which is what a set of deletions is on disk, so a caller that wants to
+    /// delete one more document passes the set it had with one more in it. That
+    /// is the only version that is idempotent: replaying the same call twice
+    /// leaves the same store, where applying a change twice would not.
+    ///
+    /// The write and the commit are the two halves of the same promise and this
+    /// does both, which is why it is here rather than left to a caller holding
+    /// [`append_tombstones`](Self::append_tombstones): the bitmap is on the
+    /// platter before the manifest points at it, and the manifest pointing at it
+    /// is one fsync of one slot, so a machine that stops anywhere in here comes
+    /// back either to the deletions or to the ones before them.
+    ///
+    /// The live count is kept honest across the call, because that is what a
+    /// compaction decides from and what a store reports when asked how many
+    /// documents it holds. It is worked out from what the segment had deleted
+    /// before, which means reading the older set back, and that is a few
+    /// kilobytes against a commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Trouble::Format`] with [`Error::MissingSection`] if there is no
+    /// such segment, [`Error::NoSuchDocument`] if the set names a document the
+    /// segment does not have, a decoding error if the set already committed
+    /// cannot be read back, and [`Trouble::Io`] if any of the writes fail.
+    pub fn delete(&mut self, at: usize, deleted: &Bitmap, written: u64) -> Result<u64> {
+        let segment = self
+            .manifest
+            .segments
+            .get(at)
+            .copied()
+            .ok_or(Error::MissingSection { kind: 0 })?;
+        let before = self.committed_deletions(&segment)?;
+        let next = self.append_tombstones(&segment, deleted)?;
+        let mut manifest = self.manifest.clone();
+        manifest.segments[at] = next;
+        // Back out what this segment used to hide and take off what it hides
+        // now, rather than counting the whole store again. Saturating on both
+        // sides because a manifest that was already wrong about its own count is
+        // not worth turning into a panic.
+        manifest.live = manifest
+            .live
+            .saturating_add(before)
+            .saturating_sub(deleted.len() as u64);
+        self.commit(manifest, written)
+    }
+
+    /// How many documents a committed descriptor says are deleted.
+    ///
+    /// Read back rather than remembered, because the store does not hold the
+    /// sets and a process that opened the file a moment ago has no idea what the
+    /// last one did.
+    fn committed_deletions(&self, segment: &Segment) -> Result<u64> {
+        if segment.tombstones_offset == 0 || segment.tombstones_len == 0 {
+            return Ok(0);
+        }
+        let mut bytes = vec![0u8; segment.tombstones_len as usize];
+        read_at(&self.file, &mut bytes, segment.tombstones_offset)?;
+        Ok(Bitmap::read(&bytes)?.len() as u64)
+    }
+
     /// Maps the store and hands back the bytes of every segment in it.
     ///
     /// This is how a query gets at a store. The mapping is of the whole file,
@@ -529,7 +703,10 @@ impl Store {
     /// Returns [`Trouble::Io`] if the file cannot be mapped, and
     /// [`Trouble::Format`] with [`Error::Truncated`] if a segment the manifest
     /// names is not entirely inside the file, or [`Error::SectionOutOfRange`] if
-    /// one starts before the segment region does.
+    /// one starts before the segment region does. The same two apply to the
+    /// tombstone bitmaps, which are checked here for the same reason and at the
+    /// same time: a view that exists is one where every slice it can hand out is
+    /// known to be inside the mapping and inside the segment region.
     pub fn view(&self) -> Result<View> {
         let map = Map::of(&self.file)?;
         // The same check a reader with only the bytes has to make, out of the
@@ -538,10 +715,12 @@ impl Store {
         // disagree eventually, and the way they would disagree is that one of
         // them lets a bad descriptor through.
         let ranges = crate::manifest::locate(&self.superblock, &self.manifest, map.len())?;
+        let deletions = crate::manifest::tombstones(&self.superblock, &self.manifest, map.len())?;
         Ok(View {
             map,
             segments: self.manifest.segments.clone(),
             ranges,
+            deletions,
         })
     }
 
@@ -647,7 +826,7 @@ impl Store {
 /// Made by [`Store::view`]. It holds the mapping, so the slices it hands out
 /// live exactly as long as it does, which is the chain a query is built on: the
 /// view owns the bytes, a [`Segment`](crate::segment::Segment) borrows a slice
-/// of them, a [`Reader`](crate::index::Reader) borrows the segment, and a
+/// of them, a [`Reader`] borrows the segment, and a
 /// [`Searcher`](crate::search::Searcher) borrows the readers. None of it is
 /// copied and none of it can outlive the mapping underneath.
 ///
@@ -665,6 +844,9 @@ pub struct View {
     /// Where each of them sits in the mapping, checked once when the view was
     /// taken so that every slice below is known to be inside it.
     ranges: Vec<core::ops::Range<usize>>,
+    /// Where each segment's deletions sit, for the segments that have any,
+    /// checked at the same time and against the same rules.
+    deletions: Vec<Option<core::ops::Range<usize>>>,
 }
 
 impl View {
@@ -699,6 +881,65 @@ impl View {
     /// Every segment's bytes, oldest first.
     pub fn all(&self) -> impl Iterator<Item = &[u8]> {
         (0..self.len()).filter_map(|at| self.bytes(at))
+    }
+
+    /// The bytes of one segment's deletions, or `None` where it has none.
+    ///
+    /// Infallible for the same reason [`bytes`](Self::bytes) is: the descriptor
+    /// was checked against the mapping when the view was taken.
+    #[must_use]
+    pub fn tombstones(&self, at: usize) -> Option<&[u8]> {
+        self.map.get(self.deletions.get(at)?.clone()?)
+    }
+
+    /// Which of one segment's documents are deleted, or `None` where none are.
+    ///
+    /// # Errors
+    ///
+    /// Returns a decoding error if the bytes the descriptor points at are not a
+    /// bitmap. That is a store that has been damaged, and reading it as no
+    /// deletions would answer with documents somebody deleted.
+    pub fn deleted(&self, at: usize) -> Result<Option<Bitmap>> {
+        match self.tombstones(at) {
+            Some(bytes) => Ok(Some(Bitmap::read(bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Opens one segment for searching, with its deletions already applied.
+    ///
+    /// This is the way to get a reader out of a store, and the reason it exists
+    /// rather than leaving the caller to open the bytes is that applying the
+    /// deletions is then not a step anybody can forget. A reader that came from
+    /// here cannot answer with a document the store says is gone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Trouble::Format`] if there is no such segment, if the bytes are
+    /// not a segment or not an index, if the deletions do not decode, or if they
+    /// name a document the segment does not have, which means the manifest is
+    /// pointing at a bitmap belonging to something else.
+    pub fn reader(&self, at: usize) -> Result<Reader<'_>> {
+        let bytes = self.bytes(at).ok_or(Error::MissingSection { kind: 0 })?;
+        let segment = crate::segment::Segment::open(bytes)?;
+        let reader = Reader::open(&segment)?;
+        match self.deleted(at)? {
+            Some(deleted) => Ok(reader.hiding(deleted)?),
+            None => Ok(reader),
+        }
+    }
+
+    /// Opens every segment, oldest first, each with its deletions applied.
+    ///
+    /// The order is the order the manifest lists them in, which is the order a
+    /// hit's identifier is worked out from, so it is the order a searcher has to
+    /// be given them in.
+    ///
+    /// # Errors
+    ///
+    /// As [`reader`](Self::reader), for the first segment that has one.
+    pub fn readers(&self) -> Result<Vec<Reader<'_>>> {
+        (0..self.len()).map(|at| self.reader(at)).collect()
     }
 }
 
@@ -1277,6 +1518,8 @@ mod tests {
                 .append_segment(&bytes, docs, 1_700_000_000 + n as u64)
                 .expect("appended");
             manifest.segments.push(described);
+            manifest.total += u64::from(described.docs);
+            manifest.live += u64::from(described.docs);
             from += count;
         }
         store.commit(manifest, 1_700_000_001).expect("committed");
@@ -1557,6 +1800,314 @@ mod tests {
             matches!(error, Trouble::Format(Error::SectionOutOfRange { .. })),
             "{error:?}"
         );
+    }
+
+    /// What a query gets out of a view, through the readers the view hands out,
+    /// which are the ones with the deletions already applied.
+    ///
+    /// Named by segment and by the document's place in it, the same as
+    /// [`page`], and without the scores because these tests are about which
+    /// documents come back rather than in what order.
+    fn answered(view: &View, query: &str, k: usize) -> Vec<(usize, u32)> {
+        let readers = view.readers().expect("readers");
+        let searcher = crate::search::Searcher::over(&readers).expect("a searcher");
+        searcher
+            .search(query, k)
+            .expect("searched")
+            .into_iter()
+            .map(|hit| searcher.locate(hit.doc).expect("a segment"))
+            .collect()
+    }
+
+    /// [`answered`], for a caller that has not taken a view yet.
+    fn hits(store: &Store, query: &str, k: usize) -> Vec<(usize, u32)> {
+        answered(&store.view().expect("a view"), query, k)
+    }
+
+    /// A query matching every document, because every one of them holds at
+    /// least the word its number picks.
+    const EVERYTHING: &str = "ledger invoice quarter audit";
+
+    /// How many documents a store answers with, counted rather than paged.
+    fn counted(store: &Store) -> u64 {
+        let view = store.view().expect("a view");
+        let readers = view.readers().expect("readers");
+        let searcher = crate::search::Searcher::over(&readers).expect("a searcher");
+        searcher.count(EVERYTHING).expect("counted")
+    }
+
+    #[test]
+    fn a_deleted_document_is_still_gone_when_the_store_is_opened_again() {
+        let path = path("deletecommit");
+        let mut store = stored(&path, &[40]);
+        let before = hits(&store, "audit", 8);
+        let (at, doc) = before[0];
+        store
+            .delete(at, &Bitmap::from_sorted(&[doc]), 2)
+            .expect("deleted");
+        assert_eq!(store.manifest().live, 39);
+        drop(store);
+
+        let store = Store::open(&path).expect("a store");
+        assert_eq!(store.manifest().live, 39);
+        let after = hits(&store, "audit", 8);
+        assert!(!after.contains(&(at, doc)), "{after:?}");
+        for hit in &before[1..] {
+            assert!(after.contains(hit), "{hit:?} went missing with {doc}");
+        }
+    }
+
+    #[test]
+    fn a_view_taken_before_a_delete_still_answers_with_the_document() {
+        let path = path("deletesnapshot");
+        let mut store = stored(&path, &[40]);
+        let older = store.view().expect("a view");
+        let (at, doc) = answered(&older, "audit", 1)[0];
+
+        store
+            .delete(at, &Bitmap::from_sorted(&[doc]), 2)
+            .expect("deleted");
+        let newer = store.view().expect("a view");
+
+        // Both alive at once, which is the whole point: the delete is a write
+        // somewhere else and a manifest pointed at it, so the older view is
+        // reading bytes nothing touched.
+        assert_eq!(
+            answered(&older, "audit", 1)[0],
+            (at, doc),
+            "a delete reached a view taken before it"
+        );
+        assert_ne!(answered(&newer, "audit", 1)[0], (at, doc));
+        assert!(older.tombstones(at).is_none());
+        assert!(newer.tombstones(at).is_some());
+    }
+
+    #[test]
+    fn a_newer_set_of_deletions_leaves_the_older_one_where_it_was() {
+        let path = path("copyonwrite");
+        let mut store = stored(&path, &[40]);
+        store
+            .delete(0, &Bitmap::from_sorted(&[1]), 2)
+            .expect("deleted");
+        let older = store.view().expect("a view");
+        let first = older.tombstones(0).expect("a bitmap").to_vec();
+
+        store
+            .delete(0, &Bitmap::from_sorted(&[1, 2, 3]), 3)
+            .expect("deleted");
+        let newer = store.view().expect("a view");
+
+        assert_eq!(older.tombstones(0).expect("a bitmap"), &first[..]);
+        assert_ne!(newer.tombstones(0).expect("a bitmap"), &first[..]);
+        assert_eq!(
+            older.deleted(0).expect("a set").expect("some"),
+            Bitmap::from_sorted(&[1])
+        );
+        assert_eq!(
+            newer.deleted(0).expect("a set").expect("some"),
+            Bitmap::from_sorted(&[1, 2, 3])
+        );
+        assert_eq!(store.manifest().live, 37);
+    }
+
+    #[test]
+    fn a_tombstone_bitmap_that_is_not_in_the_segment_region_is_refused_rather_than_read() {
+        let path = path("tombstoneslot");
+        let mut store = stored(&path, &[20]);
+        let mut manifest = store.manifest().clone();
+        // Pointing at a manifest slot, which is the dangerous one for a
+        // tombstone bitmap the same way it is for a segment: every byte of it
+        // is in the file, so it decodes into something and the something is a
+        // set of documents nobody deleted.
+        manifest.segments[0].tombstones_offset = SLOT_A_OFFSET;
+        manifest.segments[0].tombstones_len = 16;
+        manifest.segments[0].generation += 1;
+        store.commit(manifest, 2).expect("committed");
+
+        let error = store.view().expect_err("not in the region");
+        assert!(
+            matches!(error, Trouble::Format(Error::SectionOutOfRange { .. })),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_tombstone_bitmap_that_is_not_in_the_file_is_refused_rather_than_read() {
+        let path = path("tombstonepast");
+        let mut store = stored(&path, &[20]);
+        let mut manifest = store.manifest().clone();
+        manifest.segments[0].tombstones_offset = store.segments_end();
+        manifest.segments[0].tombstones_len = 1 << 20;
+        manifest.segments[0].generation += 1;
+        store.commit(manifest, 2).expect("committed");
+
+        let error = store.view().expect_err("not in the file");
+        assert!(
+            matches!(error, Trouble::Format(Error::Truncated { .. })),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_commit_that_puts_the_deletions_back_to_an_older_set_is_refused() {
+        let path = path("staleset");
+        let mut store = stored(&path, &[20]);
+        let (at, doc) = hits(&store, "audit", 1)[0];
+        store
+            .delete(at, &Bitmap::from_sorted(&[doc]), 2)
+            .expect("deleted");
+        let committed = store.manifest().clone();
+
+        // What a writer working from a manifest it read before the delete would
+        // commit, and what it would do is bring the document back.
+        let mut older = committed.clone();
+        older.segments[at].generation -= 1;
+        older.segments[at].tombstones_offset = 0;
+        older.segments[at].tombstones_len = 0;
+        let error = store.commit(older, 3).expect_err("a step backwards");
+        assert!(
+            matches!(error, Trouble::Format(Error::StaleGeneration { .. })),
+            "{error:?}"
+        );
+
+        assert_eq!(store.manifest().epoch, committed.epoch);
+        assert_eq!(store.manifest().segments, committed.segments);
+        assert!(!hits(&store, "audit", 8).contains(&(at, doc)));
+    }
+
+    #[test]
+    fn a_segment_that_starts_again_at_an_offset_another_one_used_is_not_a_step_backwards() {
+        // A compaction drops a segment and a later append reuses the space, so
+        // there is a new segment at an old offset with no deletions and a
+        // generation of zero. Matching on the footer as well as on the offset is
+        // what tells the two apart.
+        let path = path("reusedoffset");
+        let mut store = stored(&path, &[20]);
+        store
+            .delete(0, &Bitmap::from_sorted(&[0, 1]), 2)
+            .expect("deleted");
+
+        let mut manifest = store.manifest().clone();
+        manifest.segments[0].footer ^= 1;
+        manifest.segments[0].generation = 0;
+        manifest.segments[0].tombstones_offset = 0;
+        manifest.segments[0].tombstones_len = 0;
+        store.commit(manifest, 3).expect("committed");
+        assert_eq!(store.manifest().segments[0].generation, 0);
+    }
+
+    #[test]
+    fn a_delete_naming_a_document_the_segment_does_not_have_is_refused() {
+        let path = path("nosuchdocument");
+        let mut store = stored(&path, &[20]);
+        let error = store
+            .delete(0, &Bitmap::from_sorted(&[20]), 2)
+            .expect_err("no such document");
+        assert!(
+            matches!(
+                error,
+                Trouble::Format(Error::NoSuchDocument {
+                    doc: 20,
+                    documents: 20
+                })
+            ),
+            "{error:?}"
+        );
+        assert_eq!(store.manifest().live, 20);
+        assert!(store.view().expect("a view").tombstones(0).is_none());
+    }
+
+    #[test]
+    fn a_delete_of_a_segment_that_is_not_there_is_refused() {
+        let path = path("nosuchsegment");
+        let mut store = stored(&path, &[20]);
+        let error = store
+            .delete(3, &Bitmap::from_sorted(&[0]), 2)
+            .expect_err("no such segment");
+        assert!(
+            matches!(error, Trouble::Format(Error::MissingSection { .. })),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn deleting_nothing_clears_the_descriptor_rather_than_writing_an_empty_set() {
+        let path = path("undeleted");
+        let mut store = stored(&path, &[20]);
+        store
+            .delete(0, &Bitmap::from_sorted(&[0, 1, 2]), 2)
+            .expect("deleted");
+        assert_eq!(store.manifest().live, 17);
+
+        store.delete(0, &Bitmap::new(), 3).expect("deleted");
+        assert_eq!(store.manifest().live, 20);
+        let segment = store.manifest().segments[0];
+        assert_eq!(segment.tombstones_offset, 0);
+        assert_eq!(segment.tombstones_len, 0);
+        assert_eq!(segment.first_live, 0);
+        assert_eq!(segment.generation, 2);
+        assert!(store.view().expect("a view").tombstones(0).is_none());
+    }
+
+    #[test]
+    fn a_deleted_prefix_says_where_the_documents_worth_reading_begin() {
+        let path = path("firstlive");
+        let mut store = stored(&path, &[20]);
+        store
+            .delete(0, &Bitmap::from_sorted(&[0, 1, 2, 9]), 2)
+            .expect("deleted");
+        assert_eq!(store.manifest().segments[0].first_live, 3);
+        assert_eq!(store.manifest().segments[0].generation, 1);
+    }
+
+    #[test]
+    fn the_live_count_is_what_a_search_counts_after_several_rounds_of_deletion() {
+        let path = path("livecount");
+        let mut store = stored(&path, &[30, 30, 30]);
+        assert_eq!(store.manifest().live, 90);
+        assert_eq!(counted(&store), 90);
+
+        // A set is the whole answer for its segment rather than a change to it,
+        // so each round hands over what it had with one more in it.
+        let mut gone = [Bitmap::new(), Bitmap::new(), Bitmap::new()];
+        let mut written = 2;
+        for round in 0..4 {
+            for (at, set) in gone.iter_mut().enumerate() {
+                let doc = u32::try_from(round * 3 + at).expect("a small document number");
+                set.insert(doc);
+                store.delete(at, set, written).expect("deleted");
+                written += 1;
+                assert_eq!(
+                    counted(&store),
+                    store.manifest().live,
+                    "round {round} of segment {at}"
+                );
+            }
+        }
+        assert_eq!(store.manifest().live, 78);
+
+        // And the same store opened from nothing but the file agrees, which is
+        // the part that says the sets were written down rather than remembered.
+        drop(store);
+        let store = Store::open(&path).expect("a store");
+        assert_eq!(store.manifest().live, 78);
+        assert_eq!(counted(&store), 78);
+    }
+
+    #[test]
+    fn a_deletion_in_one_segment_does_not_touch_what_the_others_answer_with() {
+        let path = path("acrosssegments");
+        let mut store = stored(&path, &[30, 30, 30]);
+        let before = hits(&store, "audit", 12);
+        store
+            .delete(1, &Bitmap::from_sorted(&[0, 1, 2, 3, 4]), 2)
+            .expect("deleted");
+
+        let after = hits(&store, "audit", 12);
+        for hit in &before {
+            let deleted = hit.0 == 1 && hit.1 < 5;
+            assert_eq!(!deleted, after.contains(hit), "{hit:?}");
+        }
     }
 
     /// Changes one byte of a file in place, which is what a torn write leaves.
