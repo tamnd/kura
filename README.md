@@ -176,17 +176,17 @@ The Go source tree at go1.26.6, which is 10,888 text files and 106.4 MB, on an M
 
 | budget | segments | wall | peak RSS |
 | --- | --- | --- | --- |
-| none | 1 | 1.0 s | 120 to 122 MB |
-| 32m | 4 | 1.0 to 1.1 s | 77 to 101 MB |
-| 8m | 14 | 1.2 to 1.5 s | 58 to 66 MB |
-| 2m | 49 | 2.1 to 3.2 s | 46 to 48 MB |
+| none | 1 | 0.92 to 0.95 s | 91 to 110 MB |
+| 32m | 4 | 0.93 to 0.95 s | 69 to 102 MB |
+| 8m | 14 | 1.0 to 1.1 s | 47 to 59 MB |
+| 2m | 49 | 1.3 to 1.4 s | 45 to 49 MB |
 
 It is a trade and the table is the shape of it.
 A budget near the corpus size costs nothing measurable and takes off about a third of the memory.
 A budget far below it holds the memory near the budget and starts costing real time, because every flush pays for a term dictionary and the segments the query has to merge across get more numerous.
 
 The segments cost disk as well.
-The same corpus is 14.3 MB in one segment and 17.4 MB across fourteen, which is 22 percent more, and it is the term dictionary being written fourteen times.
+The same corpus is 14.4 MB in one segment and 17.6 MB across fourteen, which is 22 percent more, and it is the term dictionary being written fourteen times.
 
 Ranking does not change.
 Ten queries at depth 100 against the same corpus in one segment and in fourteen produced the same 1000 lines, the same documents in the same order with the same scores at every rank.
@@ -195,8 +195,8 @@ Querying is not slower either, and on this corpus the fourteen segment version w
 Every index run also says how much the writer held and what it was holding.
 
 ```
-indexed 10888 documents, 106.4 MB of text into /tmp/docs.kura, 14.3 MB in 1.0s
-held at most 60.5 MB at once, 43.0 MB postings, 17.0 MB vocabulary, 397.3 KB stored fields, 64.0 KB lengths
+indexed 10888 documents, 106.4 MB of text into /tmp/docs.kura, 14.4 MB in 0.9s
+held at most 60.7 MB at once, 43.0 MB postings, 17.0 MB vocabulary, 653.3 KB stored fields, 64.0 KB lengths
 ```
 
 That is the largest a single writer got, so on a run with `--flush-every` it is the peak of one segment rather than of the corpus.
@@ -204,40 +204,42 @@ The same tree at four budgets, three runs each, and the held numbers were identi
 
 | budget | segments | held | postings | vocabulary | stored fields | peak RSS |
 | --- | --- | --- | --- | --- | --- | --- |
-| none | 1 | 60.5 MB | 43.0 MB | 17.0 MB | 397.3 KB | 120 to 130 MB |
-| 32m | 4 | 27.1 MB | 19.4 MB | 7.5 MB | 159.1 KB | 60 to 82 MB |
-| 8m | 14 | 12.4 MB | 8.6 MB | 3.8 MB | 114.3 KB | 53 to 65 MB |
-| 2m | 49 | 8.7 MB | 5.6 MB | 3.0 MB | 97.1 KB | 47 to 52 MB |
+| none | 1 | 60.7 MB | 43.0 MB | 17.0 MB | 653.3 KB | 91 to 110 MB |
+| 32m | 4 | 27.4 MB | 19.4 MB | 7.5 MB | 415.1 KB | 69 to 102 MB |
+| 8m | 14 | 12.7 MB | 8.6 MB | 3.8 MB | 354.3 KB | 47 to 59 MB |
+| 2m | 49 | 8.9 MB | 5.6 MB | 3.0 MB | 353.1 KB | 45 to 49 MB |
 
 The postings are about three quarters of what a writer holds and the vocabulary is most of the rest, so a change that made the stored fields cheaper would be a change nobody could measure.
 
 What the writer holds is also well under what the process holds, and a third line says where the difference is.
 
 ```
-peak resident 122.0 MB, of which 86.1 MB by the last document, 15.2 MB more merging the postings, 20.6 MB more laying the segment out, 80.0 KB more writing it
+peak resident 109.5 MB, of which 83.9 MB by the last document, 19.3 MB more merging the postings, 6.3 MB more writing the segment
 ```
 
-That is the high water mark of the whole process, the same number `/usr/bin/time` reports, read at four points and reported as what each step added.
+That is the high water mark of the whole process, the same number `/usr/bin/time` reports, read at three points and reported as what each step added.
 A high water mark never falls, so the difference between two readings is how much further the work between them pushed the worst the process had been.
 Five runs of the tree above with no budget, so one segment:
 
-| | total | by the last document | merging the postings | laying the segment out | writing it |
-| --- | --- | --- | --- | --- | --- |
-| run 1 | 122.0 MB | 86.1 MB | 15.2 MB | 20.6 MB | 80.0 KB |
-| run 2 | 130.5 MB | 90.2 MB | 19.7 MB | 20.6 MB | 0 B |
-| run 3 | 111.3 MB | 69.3 MB | 21.3 MB | 20.6 MB | 96.0 KB |
-| run 4 | 121.6 MB | 90.2 MB | 10.7 MB | 20.6 MB | 64.0 KB |
-| run 5 | 126.6 MB | 84.0 MB | 21.9 MB | 20.6 MB | 0 B |
+| | total | by the last document | merging the postings | writing the segment |
+| --- | --- | --- | --- | --- |
+| run 1 | 109.5 MB | 83.9 MB | 19.3 MB | 6.3 MB |
+| run 2 | 108.1 MB | 78.7 MB | 23.1 MB | 6.3 MB |
+| run 3 | 103.6 MB | 95.1 MB | 2.2 MB | 6.3 MB |
+| run 4 | 107.9 MB | 77.2 MB | 24.4 MB | 6.3 MB |
+| run 5 | 92.1 MB | 66.9 MB | 18.9 MB | 6.3 MB |
 
-Writing the file costs nothing.
-Laying the segment out costs 20.6 MB on every run, to the tenth of a megabyte, because it is a copy of a thing whose size is decided by the corpus and not by the machine.
-The segment it produces is 14.3 MB, so laying it out costs about a copy and a half of it, and that is a copy that only exists because the finished bytes are handed back as a vector rather than written where they are going.
-Merging the postings costs 11 to 22 MB, which is the encoded lists and the term dictionary being built while the writer that fed them is still holding everything.
-The rest is already there by the last document, and it is most of it.
+Most of it is there by the last document, which is the writer plus the allocator plus the buffer each file is read into.
+Merging the postings costs 2 to 25 MB, which is the encoded lists and the term dictionary being built while the writer that fed them is still holding everything, and it varies that much because a run that had already been pushed high by the reading pays less for the merge.
+Writing the segment costs 6.3 MB and costs it on every run, because it is not the allocator being lucky, it is the pages of a file whose size the corpus decided.
+
+That last number used to be 20.6 MB higher.
+The segment was built into a vector and then handed to the store to copy in, so the largest thing this program makes existed twice for the length of one call.
+It is now written where it is going as it is made, which is what the three readings are for: the step that should have gone away is the step that went away.
 
 Unlike the held numbers the total moves from run to run, because it is the whole process and the whole process is at the mercy of what else the machine is doing.
 Read it as a shape and not as a measurement.
-The two middle steps are steadier, because they are the engine doing arithmetic on a corpus rather than the operating system handing out pages.
+On a run with `--flush-every` the last two steps read as nothing, because by then the segments before it have already pushed the mark past anything the last one does.
 
 ## Looking at the file itself
 

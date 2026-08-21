@@ -449,9 +449,50 @@ impl Store {
     /// committed either way, so a failure here leaves the store at the state it
     /// was at.
     pub fn append_segment(&mut self, bytes: &[u8], docs: u32, created: u64) -> Result<Segment> {
+        self.append_segment_with(docs, created, |into| {
+            use io::Write as _;
+            into.write_all(bytes)
+        })
+    }
+
+    /// Writes a segment into the segment region as it is produced.
+    ///
+    /// The same thing [`Store::append_segment`] does, for a caller that has the
+    /// parts of a segment rather than the segment. [`crate::segment::Writer`]
+    /// can write itself into anything that takes bytes, and this is the thing to
+    /// hand it when the bytes are going into a store, because the alternative is
+    /// building the whole segment in memory next to the sections it was built
+    /// out of and then copying it in. On a real corpus that copy is tens of
+    /// megabytes held for no reason other than the shape of the call.
+    ///
+    /// What the closure writes goes straight into the file at the offset the
+    /// segment starts at, in order, with no buffer in between. The descriptor
+    /// that comes back covers however much it wrote.
+    ///
+    /// Everything [`Store::append_segment`] promises holds here too: the bytes
+    /// are on the platter when this returns and nothing points at them until a
+    /// commit names them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Trouble::Io`] with whatever the closure failed with, or with
+    /// the failure of the sync afterwards. A closure that gave up halfway leaves
+    /// the store where it was, since the cursor only moves on success and a
+    /// stretch of bytes no manifest mentions is what the next append writes over.
+    pub fn append_segment_with(
+        &mut self,
+        docs: u32,
+        created: u64,
+        write: impl FnOnce(&mut Appending<'_>) -> io::Result<()>,
+    ) -> Result<Segment> {
         let offset = self.segments;
-        let len = bytes.len() as u64;
-        write_at(&self.file, bytes, offset)?;
+        let mut appending = Appending {
+            file: &self.file,
+            at: offset,
+            written: 0,
+        };
+        write(&mut appending)?;
+        let len = appending.written;
         // Everything and not just the data, because the file has grown and the
         // length is as much a part of what has to survive as the bytes are. A
         // sync that left the size behind would give back a store whose segment
@@ -658,6 +699,58 @@ impl View {
     /// Every segment's bytes, oldest first.
     pub fn all(&self) -> impl Iterator<Item = &[u8]> {
         (0..self.len()).filter_map(|at| self.bytes(at))
+    }
+}
+
+/// The segment region of a store, open at the end and taking bytes.
+///
+/// [`Store::append_segment_with`] hands one of these to whatever is producing a
+/// segment. Everything written goes where it is going as it arrives, positioned
+/// after what came before it, so nothing is ever held twice.
+///
+/// There is no buffer under this and there is deliberately not one. A segment is
+/// written as a header, a table and then one payload per section, which is a
+/// handful of writes of the size the sections already are, and putting a buffer
+/// in the way would put back exactly the copy this exists to avoid.
+#[derive(Debug)]
+pub struct Appending<'a> {
+    /// The store's descriptor, borrowed for as long as the write takes.
+    file: &'a File,
+    /// Where the segment starts.
+    at: u64,
+    /// How much of it has been written so far.
+    written: u64,
+}
+
+impl Appending<'_> {
+    /// How many bytes have gone in so far.
+    #[must_use]
+    pub const fn written(&self) -> u64 {
+        self.written
+    }
+}
+
+impl io::Write for Appending<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // All of it or none of it, because a positioned write of the whole
+        // slice is what both platforms give and reporting a short write here
+        // would only make the caller ask again for bytes already written.
+        self.write_all(buf)?;
+        Ok(buf.len())
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        write_at(self.file, buf, self.at.saturating_add(self.written))?;
+        self.written = self.written.saturating_add(buf.len() as u64);
+        Ok(())
+    }
+
+    /// Nothing to do, since there is nothing held back.
+    ///
+    /// Durability is the store's business and it is an fsync, which happens once
+    /// the whole segment is down rather than whenever a caller asks.
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -1332,6 +1425,83 @@ mod tests {
 
         assert_eq!(view.len(), 1, "a commit reached a view taken before it");
         assert_eq!(store.view().expect("a view").len(), 2);
+    }
+
+    #[test]
+    fn a_segment_written_as_it_is_made_is_the_segment_written_whole() {
+        let (bytes, docs) = built(0, 20);
+
+        let path = path("streamed");
+        let mut store = Store::create(&path, STORE, 1).expect("a store");
+        let mut writer = crate::index::Writer::new();
+        for n in 0..20 {
+            writer.add(&text(n)).expect("a document");
+        }
+        let segment = crate::index::Writer::build(vec![writer]).expect("a segment");
+        let described = store
+            .append_segment_with(docs, 2, |into| segment.write_to(into))
+            .expect("appended");
+        assert_eq!(described.len, bytes.len() as u64);
+
+        let mut manifest = store.manifest().clone();
+        manifest.segments.push(described);
+        store.commit(manifest, 3).expect("committed");
+
+        // Byte for byte, because the whole point of this is that it is the same
+        // segment and not a segment that reads the same.
+        let view = store.view().expect("a view");
+        assert_eq!(view.bytes(0).expect("the segment"), &bytes[..]);
+    }
+
+    #[test]
+    fn an_append_puts_the_pieces_it_is_given_one_after_another() {
+        use io::Write as _;
+
+        let path = path("pieces");
+        let mut store = Store::create(&path, STORE, 1).expect("a store");
+        let offset = store.segments_end();
+        let described = store
+            .append_segment_with(1, 2, |into| {
+                let mut so_far = 0;
+                for piece in [&b"one"[..], b"two", b"three"] {
+                    into.write_all(piece)?;
+                    so_far += piece.len() as u64;
+                    assert_eq!(into.written(), so_far);
+                }
+                Ok(())
+            })
+            .expect("appended");
+
+        assert_eq!(described.offset, offset);
+        assert_eq!(described.len, 11);
+        let mut back = [0u8; 11];
+        read_at(&store.file, &mut back, offset).expect("read back");
+        assert_eq!(&back, b"onetwothree");
+    }
+
+    #[test]
+    fn an_append_that_gave_up_halfway_leaves_the_store_where_it_was() {
+        let path = path("halfway");
+        let mut store = stored(&path, &[20]);
+        let end = store.segments_end();
+        let manifest = store.manifest().clone();
+
+        let refused = store.append_segment_with(1, 2, |into| {
+            use io::Write as _;
+            into.write_all(b"the start of a segment nobody finished")?;
+            Err(io::Error::other("the thing making the segment gave up"))
+        });
+        assert!(refused.is_err());
+
+        // The cursor did not move, so the bytes that did land are bytes the next
+        // append writes over, and the committed state has not heard about any of
+        // it.
+        assert_eq!(store.segments_end(), end);
+        assert_eq!(store.manifest().segments, manifest.segments);
+
+        let (bytes, docs) = built(20, 20);
+        let described = store.append_segment(&bytes, docs, 3).expect("appended");
+        assert_eq!(described.offset, end);
     }
 
     #[test]

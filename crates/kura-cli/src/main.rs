@@ -51,7 +51,7 @@ use kura_core::manifest;
 use kura_core::mapping::Map;
 use kura_core::residency;
 use kura_core::search::Searcher;
-use kura_core::segment::Segment;
+use kura_core::segment::{Segment, Writer as SegmentWriter};
 use kura_core::store::Scratch;
 
 /// How many results a command prints when nobody says otherwise.
@@ -72,9 +72,9 @@ const DEFAULT_TAG: &str = "kura";
 /// How long the log ring is in a store this tool makes.
 ///
 /// Well under the engine's default quarter of a gigabyte, because this tool
-/// builds a segment in memory and appends the finished thing, so it never writes
-/// a record and the ring is there for whatever opens the store next rather than
-/// for anything happening here. The size is fixed when the store is made and
+/// writes a segment straight into the store, so it never writes a record and the
+/// ring is there for whatever opens the store next rather than for anything
+/// happening here. The size is fixed when the store is made and
 /// cannot be changed afterwards without moving every segment in the file, so it
 /// is not nothing, but eight megabytes is thousands of records and a store that
 /// wants more than that is a store a program made rather than one made here.
@@ -550,15 +550,14 @@ fn label(
 struct Marks {
     documents: Option<Result<u64, &'static str>>,
     merged: Option<Result<u64, &'static str>>,
-    laid_out: Option<Result<u64, &'static str>>,
     written: Option<Result<u64, &'static str>>,
 }
 
 impl Marks {
-    /// The four readings, or nothing if this system does not keep them.
-    fn read(&self) -> Option<[u64; 4]> {
-        match (&self.documents, &self.merged, &self.laid_out, &self.written) {
-            (Some(Ok(a)), Some(Ok(b)), Some(Ok(c)), Some(Ok(d))) => Some([*a, *b, *c, *d]),
+    /// The three readings, or nothing if this system does not keep them.
+    fn read(&self) -> Option<[u64; 3]> {
+        match (&self.documents, &self.merged, &self.written) {
+            (Some(Ok(a)), Some(Ok(b)), Some(Ok(c))) => Some([*a, *b, *c]),
             _ => None,
         }
     }
@@ -570,16 +569,15 @@ impl Marks {
     /// the steps and a reader who wants to know whether this run fits on the
     /// machine wants the total.
     fn tell(&self) {
-        let Some([documents, merged, laid_out, written]) = self.read() else {
+        let Some([documents, merged, written]) = self.read() else {
             return;
         };
         println!(
-            "peak resident {}, of which {} by the last document, {} more merging the postings, {} more laying the segment out, {} more writing it",
+            "peak resident {}, of which {} by the last document, {} more merging the postings, {} more writing the segment",
             report::bytes(written),
             report::bytes(documents),
             report::bytes(merged - documents),
-            report::bytes(laid_out - merged),
-            report::bytes(written - laid_out)
+            report::bytes(written - merged)
         );
     }
 }
@@ -713,20 +711,20 @@ fn index(args: &[String]) -> Result<(), Failure> {
         // that refused documents larger than itself.
         if flush_every.is_some_and(|budget| pending >= budget) {
             let count = writer.len();
-            let segment = std::mem::replace(&mut writer, Writer::new()).finish()?;
-            written += segment.len() as u64;
+            let built = Writer::build(vec![std::mem::replace(&mut writer, Writer::new())])?;
+            written += built.size() as u64;
             documents += count;
-            segments = add_to_store(&out, &segment, count)?;
+            segments = add_to_store(&out, built, count)?;
             pending = 0;
         }
     }
 
-    // Four readings of the same high water mark, taken either side of the three
+    // Three readings of the same high water mark, taken either side of the two
     // things that happen after the last document has been read. Nothing lowers a
     // high water mark, so what each of these says is how much further the one
     // before it was pushed, and that is the only way to tell the memory that
-    // accumulates from the memory the merge needs from the memory the segment is
-    // laid out in from the pages of the file that was written.
+    // accumulates from the memory the merge needs from the pages of the file the
+    // segment goes into.
     let read_documents = Some(residency::peak_resident());
 
     // The last flush, and on a run without the option the only one. A writer
@@ -736,24 +734,21 @@ fn index(args: &[String]) -> Result<(), Failure> {
     if !writer.is_empty() || documents == 0 {
         let count = writer.len();
         // Split where the engine splits it, so the reading between the two says
-        // what the merge cost and what the copy cost rather than what the pair
-        // of them came to.
+        // what the merge cost and what putting the segment where it goes cost
+        // rather than what the pair of them came to.
         let built = Writer::build(vec![writer])?;
         let read_merged = Some(residency::peak_resident());
-        let segment = built.finish();
-        let read_laid_out = Some(residency::peak_resident());
-        written += segment.len() as u64;
+        written += built.size() as u64;
         documents += count;
         segments = if into_store {
-            add_to_store(&out, &segment, count)?
+            add_to_store(&out, built, count)?
         } else {
-            fs::write(&out, &segment).map_err(|error| Failure::Io(out.clone(), error))?;
+            write_bare(&out, built)?;
             1
         };
         marks = Marks {
             documents: read_documents,
             merged: read_merged,
-            laid_out: read_laid_out,
             written: Some(residency::peak_resident()),
         };
     }
@@ -812,7 +807,7 @@ fn size(value: &str) -> Result<u64, Failure> {
 /// the two, the segment is bytes nobody names and the next run puts its own over
 /// the top of them. What cannot happen is a store that names a segment which is
 /// not there.
-fn add_to_store(path: &Path, segment: &[u8], documents: usize) -> Result<usize, Failure> {
+fn add_to_store(path: &Path, segment: SegmentWriter, documents: usize) -> Result<usize, Failure> {
     let now = now();
     let mut store = if path.exists() {
         Store::open(path)
@@ -824,8 +819,13 @@ fn add_to_store(path: &Path, segment: &[u8], documents: usize) -> Result<usize, 
     let docs = u32::try_from(documents)
         .map_err(|_| Failure::usage("more documents than a single segment can number"))?;
     let mut manifest = store.manifest().clone();
+    // Through the segment writer rather than through a vector of the finished
+    // segment, so the bytes are laid out where they are going. Building the
+    // vector first cost 20.6 MB on a corpus whose segment came to 14.3 MB, which
+    // is a copy of the largest thing this program makes for the length of one
+    // call.
     let written = store
-        .append_segment(segment, docs, now)
+        .append_segment_with(docs, now, |into| segment.write_to(into))
         .map_err(|trouble| Failure::Store(path.to_path_buf(), trouble))?;
     manifest.live = manifest.live.saturating_add(u64::from(docs));
     manifest.total = manifest.total.saturating_add(u64::from(docs));
@@ -835,6 +835,24 @@ fn add_to_store(path: &Path, segment: &[u8], documents: usize) -> Result<usize, 
         .commit(manifest, now)
         .map_err(|trouble| Failure::Store(path.to_path_buf(), trouble))?;
     Ok(held)
+}
+
+/// Writes one segment to a path of its own, with no store around it.
+///
+/// The same streaming the store gets, for the same reason. A file is not a store
+/// and cannot be added to, so this replaces whatever was there rather than
+/// appending to it, which is what `-o` on a run without `--store` has always
+/// meant.
+///
+/// There is no buffer between the writer and the file. A segment goes out as a
+/// header, a table, one write per section and a footer, and the sections are the
+/// large part, so a buffer would only copy them again on the way past.
+fn write_bare(path: &Path, segment: SegmentWriter) -> Result<(), Failure> {
+    let mut file =
+        fs::File::create(path).map_err(|error| Failure::Io(path.to_path_buf(), error))?;
+    segment
+        .write_to(&mut file)
+        .map_err(|error| Failure::Io(path.to_path_buf(), error))
 }
 
 /// Now, in unix nanoseconds, or zero on a machine whose clock is before 1970.
