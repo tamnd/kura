@@ -34,6 +34,7 @@ pub mod segment;
 pub mod store;
 pub mod terms;
 pub mod vector;
+pub mod wal;
 pub mod xxh3;
 
 pub use error::{Error, Result};
