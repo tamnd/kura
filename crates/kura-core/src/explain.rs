@@ -66,7 +66,13 @@ pub struct Counters {
     pub postings_decoded: u64,
     /// How many documents had a score computed for them.
     pub documents_scored: u64,
-    /// How many times a cursor was moved forward to a document the walk named.
+    /// How many times a cursor was moved somewhere the walk named, rather than
+    /// to the next thing in front of it.
+    ///
+    /// A document, for the walks that go in document order, and a block, for the
+    /// one that takes them in order of what they could score. Both are the walk
+    /// deciding where to look next instead of reading on, which is what this
+    /// counts.
     pub seeks: u64,
     /// How many times a cursor was moved to its next document.
     pub advances: u64,
@@ -109,7 +115,7 @@ pub trait Tally {
     fn opened(&mut self, terms: u32, postings: u64, blocks: u64);
     /// A document was scored.
     fn scored(&mut self);
-    /// A cursor was moved to a named document.
+    /// A cursor was moved somewhere the walk named.
     fn sought(&mut self);
     /// A cursor was moved to its next document.
     fn advanced(&mut self);

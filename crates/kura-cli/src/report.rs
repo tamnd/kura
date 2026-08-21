@@ -128,6 +128,11 @@ pub enum Walk {
 
 /// Prints what the walk did.
 ///
+/// `took` is the search and nothing around it. The residency probe that
+/// `explain` wraps the search in has to scan the whole mapping before the query
+/// starts, which costs more than most queries do, so timing the probe as well
+/// would drown the number this line exists to show.
+///
 /// # Errors
 ///
 /// Returns an error if the output cannot be written, which is a closed pipe.
