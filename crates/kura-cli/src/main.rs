@@ -49,6 +49,7 @@ use std::time::{Duration, Instant};
 use kura_core::analysis::Analyzer;
 use kura_core::file::{Store, Trouble};
 use kura_core::index::{Held, Reader, Writer};
+use kura_core::ingest::Batch;
 use kura_core::manifest;
 use kura_core::mapping::Map;
 use kura_core::residency;
@@ -134,6 +135,13 @@ an <index> is either a single segment, which is what index writes by default,
 or a store holding any number of them, which is what --store writes into. Every
 command that reads one takes either, and a query over a store searches all of
 its segments together.
+
+a run with --store keys every file by its path, which is the same string the
+file is stored under, so a second run over a directory replaces what the first
+one wrote rather than putting a second copy of it in. The run says how many
+documents were new and how many replaced one. A run without --store writes a
+single segment and keys nothing, because a file is not a store and there is
+nothing in it to replace.
 
 --memory and --flush-every both take a plain number of bytes or a number with k,
 m or g after it, and each of them bounds how much of a corpus an index run holds
@@ -798,75 +806,178 @@ impl Plan {
     }
 }
 
+/// What an index run has done so far.
+///
+/// Carried through the run rather than handed back in pieces, because the report
+/// at the end is one paragraph about the whole of it and the two paths that fill
+/// it in have little else in common.
+#[derive(Default)]
+struct Run<'a> {
+    /// The text that went in, as it was on disk.
+    bytes: u64,
+    /// The segments that came out, as they are in the index.
+    written: u64,
+    documents: usize,
+    /// How many of those documents replaced one that was already in the store.
+    replaced: usize,
+    skipped: usize,
+    /// How many segments the index holds afterwards, which on a store counts
+    /// the ones that were there before this run.
+    segments: usize,
+    peak: Held,
+    steepest: Steepest<'a>,
+    marks: Marks,
+}
+
+impl<'a> Run<'a> {
+    /// Takes the readings that follow a document.
+    ///
+    /// Asked after every one, because the largest a writer gets is the document
+    /// before the flush that empties it, and a reading taken once at the end
+    /// would be a reading of whatever the last part happened to be.
+    fn saw(&mut self, file: &'a Path, held: Held) {
+        if held.total() > self.peak.total() {
+            self.peak = held;
+        }
+        self.steepest.saw(file, held.total());
+    }
+
+    /// Prints the paragraph a run ends with.
+    fn tell(&self, plan: &Plan, took: Duration) {
+        println!(
+            "indexed {} documents, {} of text into {}, {} in {took:.1?}",
+            self.documents,
+            report::bytes(self.bytes),
+            plan.out.display(),
+            report::bytes(self.written)
+        );
+        if plan.into_store {
+            // Apart, because the two are answers to different questions, and a
+            // run over a directory that was indexed yesterday is mostly the
+            // second one.
+            println!(
+                "{} of them were new and {} replaced a document already in the store",
+                self.documents - self.replaced,
+                self.replaced
+            );
+        }
+        tell_held(self.peak);
+        if let Some(budget) = plan.memory {
+            self.steepest.tell(budget, self.peak.total());
+        }
+        self.marks.tell();
+        if plan.into_store {
+            println!(
+                "{} now holds {} segments",
+                plan.out.display(),
+                self.segments
+            );
+        }
+        if self.skipped > 0 {
+            println!("skipped {} files that were not text", self.skipped);
+        }
+    }
+}
+
 /// Builds an index out of whatever the paths point at.
 fn index(args: &[String]) -> Result<(), Failure> {
-    let Plan {
-        inputs,
-        out,
-        into_store,
-        flush_every,
-        memory,
-    } = Plan::read(args)?;
+    let plan = Plan::read(args)?;
 
     let mut files = Vec::new();
-    for input in &inputs {
+    for input in &plan.inputs {
         collect(input, &mut files)?;
     }
     files.sort();
 
     let started = Instant::now();
-    let mut writer = fresh(memory);
-    let mut bytes = 0u64;
-    let mut written = 0u64;
+    let mut run = Run::default();
+    if plan.into_store {
+        into_store(&plan, &files, &mut run)?;
+    } else {
+        into_file(&plan, &files, &mut run)?;
+    }
+    run.tell(&plan, started.elapsed());
+    Ok(())
+}
+
+/// Indexes into a store, where a file replaces whatever is in there under its
+/// path.
+///
+/// The store is opened once and the run commits a batch at a time. Every batch
+/// takes its own view, so what a batch deletes is worked out against the store
+/// as the batch before it left it, and every batch is one commit that adds the
+/// new documents and hides the ones they replace together.
+fn into_store<'a>(plan: &Plan, files: &'a [PathBuf], run: &mut Run<'a>) -> Result<(), Failure> {
+    let mut store = open_store(&plan.out)?;
+    let mut at = 0;
+    while at < files.len() {
+        at += one_batch(&mut store, plan, &files[at..], run)?;
+    }
+    run.segments = store.manifest().segments.len();
+    Ok(())
+}
+
+/// Fills one batch, commits it, and says how many files it got through.
+///
+/// It stops on the budget the run was given, or when the files run out, and it
+/// always takes at least one file, so a run that has files left makes progress.
+fn one_batch<'a>(
+    store: &mut Store,
+    plan: &Plan,
+    files: &'a [PathBuf],
+    run: &mut Run<'a>,
+) -> Result<usize, Failure> {
+    let trouble = |trouble| Failure::Store(plan.out.clone(), trouble);
+    let view = store.view().map_err(trouble)?;
+    let mut batch = match plan.memory {
+        Some(budget) => Batch::with_budget(&view, budget),
+        None => Batch::over(&view),
+    }
+    .map_err(trouble)?;
+    // The batch this measures is a new one, so the next document is a step from
+    // what an empty one holds rather than from what the one before it did.
+    run.steepest.emptied(batch.held().total());
+
     let mut pending = 0u64;
-    let mut documents = 0usize;
-    let mut skipped = 0usize;
-    let mut segments = 0usize;
-    let mut peak = Held::default();
-    let mut steepest = Steepest::from(writer.held().total());
-    let mut marks = Marks::default();
-    for file in &files {
+    let mut taken = 0usize;
+    for file in files {
+        taken += 1;
         let Ok(content) = fs::read(file) else {
-            skipped += 1;
+            run.skipped += 1;
             continue;
         };
-        // A directory of anything real holds files that are not text, and a
-        // lossy decode indexes the words in a mixed file rather than dropping
-        // it. What it must not do is silently index a megabyte of replacement
-        // characters, which is what a binary would become.
         let text = String::from_utf8_lossy(&content);
         if looks_binary(&text) {
-            skipped += 1;
+            run.skipped += 1;
             continue;
         }
-        bytes += content.len() as u64;
+        run.bytes += content.len() as u64;
         pending += content.len() as u64;
+        // The path is the key as well as the field it is already stored under,
+        // which is what makes a second run over a directory a replacement
+        // rather than a second copy of everything.
         let path = file.to_string_lossy().into_owned();
-        writer.add_with_fields(&text, [(PATH_FIELD, path.as_bytes())])?;
-        // Asked after every document, because the largest a writer gets is the
-        // document before the flush that empties it, and a reading taken once at
-        // the end would be a reading of whatever the last part happened to be.
-        let now = writer.held();
-        if now.total() > peak.total() {
-            peak = now;
-        }
-        steepest.saw(file, now.total());
+        batch
+            .add_keyed_with_fields(path.as_bytes(), &text, [(PATH_FIELD, path.as_bytes())])
+            .map_err(trouble)?;
+        run.saw(file, batch.held());
 
         // The budget is checked after the document rather than before it,
         // because a budget that stopped short of a document would be a budget
         // that refused documents larger than itself.
-        if writer.is_full() || flush_every.is_some_and(|budget| pending >= budget) {
-            let (held, size, count) = flush(&out, &mut writer, memory)?;
-            segments = held;
-            written += size;
-            documents += count;
-            pending = 0;
-            // The writer this measures is a new one, so the next document is a
-            // step from what an empty writer holds rather than from what the one
-            // that was just written out did.
-            steepest.emptied(writer.held().total());
+        if batch.is_full() || plan.flush_every.is_some_and(|budget| pending >= budget) {
+            break;
         }
     }
+
+    // A batch holding nothing is not committed, because a segment of no
+    // documents is a segment every later reader has to skip over for the rest of
+    // the file's life.
+    if batch.is_empty() {
+        return Ok(taken);
+    }
+    let documents = batch.len();
+    let replaced = batch.replacements();
 
     // Three readings of the same high water mark, taken either side of the two
     // things that happen after the last document has been read. Nothing lowers a
@@ -875,52 +986,73 @@ fn index(args: &[String]) -> Result<(), Failure> {
     // accumulates from the memory the merge needs from the pages of the file the
     // segment goes into.
     let read_documents = Some(residency::peak_resident());
+    let prepared = batch.finish().map_err(trouble)?;
+    let read_merged = Some(residency::peak_resident());
+    let size = prepared
+        .segment
+        .as_ref()
+        .map_or(0, |(built, _)| built.size() as u64);
+    let now = now();
+    // Straight into the store rather than through a vector of the finished
+    // segment, so the bytes are laid out where they are going. Building the
+    // vector first cost 20.6 MB on a corpus whose segment came to 14.3 MB, which
+    // is a copy of the largest thing this program makes for the length of one
+    // call.
+    prepared.commit(store, now, now).map_err(trouble)?;
+    run.marks = Marks {
+        documents: read_documents,
+        merged: read_merged,
+        written: Some(residency::peak_resident()),
+    };
+    run.documents += documents;
+    run.replaced += replaced;
+    run.written += size;
+    Ok(taken)
+}
 
-    // The last flush, and on a run without the option the only one. A writer
-    // holding nothing is not written out, because a segment of no documents is a
-    // segment every later reader has to skip over for the rest of the file's
-    // life.
-    if !writer.is_empty() || documents == 0 {
-        let count = writer.len();
-        // Split where the engine splits it, so the reading between the two says
-        // what the merge cost and what putting the segment where it goes cost
-        // rather than what the pair of them came to.
-        let built = Writer::build(vec![writer])?;
-        let read_merged = Some(residency::peak_resident());
-        written += built.size() as u64;
-        documents += count;
-        segments = if into_store {
-            add_to_store(&out, built, count)?
-        } else {
-            write_bare(&out, built)?;
-            1
+/// Indexes into a file of its own, which is one segment and holds no keys.
+///
+/// There is nothing to replace here. A file is not a store, cannot be added to,
+/// and this writes over whatever was at the path, which is what `-o` on a run
+/// without `--store` has always meant.
+fn into_file<'a>(plan: &Plan, files: &'a [PathBuf], run: &mut Run<'a>) -> Result<(), Failure> {
+    let mut writer = fresh(plan.memory);
+    run.steepest = Steepest::from(writer.held().total());
+    for file in files {
+        let Ok(content) = fs::read(file) else {
+            run.skipped += 1;
+            continue;
         };
-        marks = Marks {
-            documents: read_documents,
-            merged: read_merged,
-            written: Some(residency::peak_resident()),
-        };
+        // A directory of anything real holds files that are not text, and a
+        // lossy decode indexes the words in a mixed file rather than dropping
+        // it. What it must not do is silently index a megabyte of replacement
+        // characters, which is what a binary would become.
+        let text = String::from_utf8_lossy(&content);
+        if looks_binary(&text) {
+            run.skipped += 1;
+            continue;
+        }
+        run.bytes += content.len() as u64;
+        let path = file.to_string_lossy().into_owned();
+        writer.add_with_fields(&text, [(PATH_FIELD, path.as_bytes())])?;
+        run.saw(file, writer.held());
     }
-    let took = started.elapsed();
 
-    println!(
-        "indexed {documents} documents, {} of text into {}, {} in {:.1?}",
-        report::bytes(bytes),
-        out.display(),
-        report::bytes(written),
-        took
-    );
-    tell_held(peak);
-    if let Some(budget) = memory {
-        steepest.tell(budget, peak.total());
-    }
-    marks.tell();
-    if into_store {
-        println!("{} now holds {segments} segments", out.display());
-    }
-    if skipped > 0 {
-        println!("skipped {skipped} files that were not text");
-    }
+    let read_documents = Some(residency::peak_resident());
+    run.documents = writer.len();
+    // Split where the engine splits it, so the reading between the two says what
+    // the merge cost and what putting the segment where it goes cost rather than
+    // what the pair of them came to.
+    let built = Writer::build(vec![writer])?;
+    let read_merged = Some(residency::peak_resident());
+    run.written = built.size() as u64;
+    write_bare(&plan.out, built)?;
+    run.marks = Marks {
+        documents: read_documents,
+        merged: read_merged,
+        written: Some(residency::peak_resident()),
+    };
+    run.segments = 1;
     Ok(())
 }
 
@@ -955,58 +1087,19 @@ fn fresh(memory: Option<u64>) -> Writer {
     memory.map_or_else(Writer::new, Writer::with_budget)
 }
 
-/// Puts what a writer holds into the store as a segment and empties the writer.
+/// Opens the store an index run is writing into, making it if it is not there.
 ///
-/// Hands back how many segments the store holds afterwards, how large the
-/// segment was, and how many documents were in it.
-fn flush(
-    out: &Path,
-    writer: &mut Writer,
-    memory: Option<u64>,
-) -> Result<(usize, u64, usize), Failure> {
-    let count = writer.len();
-    let built = Writer::build(vec![std::mem::replace(writer, fresh(memory))])?;
-    let size = built.size() as u64;
-    Ok((add_to_store(out, built, count)?, size, count))
-}
-
-/// Adds one segment to a store, making the store first if it is not there.
-///
-/// Returns how many segments the store holds afterwards.
-///
-/// Append then commit, which is the order the store insists on and the reason
-/// this is safe to run twice over the same file. If the machine stops between
-/// the two, the segment is bytes nobody names and the next run puts its own over
-/// the top of them. What cannot happen is a store that names a segment which is
-/// not there.
-fn add_to_store(path: &Path, segment: SegmentWriter, documents: usize) -> Result<usize, Failure> {
+/// Once for the run rather than once a batch. A store is a file and opening it
+/// reads and checks the manifest, which is work that says the same thing every
+/// time it is done.
+fn open_store(path: &Path) -> Result<Store, Failure> {
     let now = now();
-    let mut store = if path.exists() {
+    if path.exists() {
         Store::open(path)
     } else {
         Store::create_with_log(path, identity(path, now), now, LOG_LEN)
     }
-    .map_err(|trouble| Failure::Store(path.to_path_buf(), trouble))?;
-
-    let docs = u32::try_from(documents)
-        .map_err(|_| Failure::usage("more documents than a single segment can number"))?;
-    let mut manifest = store.manifest().clone();
-    // Through the segment writer rather than through a vector of the finished
-    // segment, so the bytes are laid out where they are going. Building the
-    // vector first cost 20.6 MB on a corpus whose segment came to 14.3 MB, which
-    // is a copy of the largest thing this program makes for the length of one
-    // call.
-    let written = store
-        .append_segment_with(docs, now, |into| segment.write_to(into))
-        .map_err(|trouble| Failure::Store(path.to_path_buf(), trouble))?;
-    manifest.live = manifest.live.saturating_add(u64::from(docs));
-    manifest.total = manifest.total.saturating_add(u64::from(docs));
-    manifest.segments.push(written);
-    let held = manifest.segments.len();
-    store
-        .commit(manifest, now)
-        .map_err(|trouble| Failure::Store(path.to_path_buf(), trouble))?;
-    Ok(held)
+    .map_err(|trouble| Failure::Store(path.to_path_buf(), trouble))
 }
 
 /// Writes one segment to a path of its own, with no store around it.
@@ -1491,6 +1584,108 @@ mod tests {
             .into_iter()
             .map(|hit| hit.score)
             .collect()
+    }
+
+    /// How many live documents a store answers `query` with.
+    ///
+    /// Through a view rather than through the segments, because what is being
+    /// asked about is what a replacement did and the documents it replaced are
+    /// still in the segments they were written into.
+    fn live(path: &Path, query: &str) -> u64 {
+        let store = Store::open(path).expect("the store opens");
+        let view = store.view().expect("a view");
+        let readers = view.readers().expect("readers");
+        let searcher = Searcher::over(&readers).expect("a searcher");
+        searcher.count(query).expect("counted")
+    }
+
+    /// Indexes a directory into a store, with whatever else the run needs.
+    fn into(corpus: &Path, store: &Path, extra: &[&str]) -> Result<(), Failure> {
+        let mut args = vec![
+            corpus.to_string_lossy().into_owned(),
+            "-o".to_string(),
+            store.to_string_lossy().into_owned(),
+            "--store".to_string(),
+        ];
+        args.extend(extra.iter().map(|part| (*part).to_string()));
+        index(&args)
+    }
+
+    #[test]
+    fn a_directory_indexed_twice_holds_one_live_copy_of_every_file() {
+        // The whole point of keying a file by its path. Before this the second
+        // run doubled the corpus and every query came back with each document
+        // twice.
+        let dir = scratch_dir("indexed-twice");
+        let corpus = documents(&dir.join("corpus"), 0, 40);
+        let store = dir.join("twice.kura");
+
+        into(&corpus, &store, &[]).expect("the first run");
+        let once = live(&store, "ledger");
+        into(&corpus, &store, &[]).expect("the second run");
+
+        let opened = Store::open(&store).expect("the store opens");
+        assert_eq!(opened.manifest().live, 40);
+        // Both copies of everything were written, and half of them are hidden,
+        // which is what a replacement is until a merge gets to it.
+        assert_eq!(opened.manifest().total, 80);
+        assert_eq!(live(&store, "ledger"), once);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_that_changed_is_indexed_again_and_the_old_text_is_gone() {
+        let dir = scratch_dir("changed");
+        let corpus = documents(&dir.join("corpus"), 0, 12);
+        let store = dir.join("changed.kura");
+        fs::write(corpus.join("3.txt"), "debenture ledger").expect("a document");
+        into(&corpus, &store, &[]).expect("the first run");
+        assert_eq!(live(&store, "debenture"), 1);
+
+        fs::write(corpus.join("3.txt"), "escrow ledger").expect("the same document");
+        into(&corpus, &store, &[]).expect("the second run");
+
+        assert_eq!(live(&store, "escrow"), 1);
+        assert_eq!(live(&store, "debenture"), 0);
+        assert_eq!(
+            Store::open(&store)
+                .expect("the store opens")
+                .manifest()
+                .live,
+            12
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_run_that_flushes_several_times_replaces_what_the_run_before_it_wrote() {
+        // Every batch has to take its own view, because the batch before it
+        // committed one and a batch working from a view older than the store is
+        // refused. It also has to find documents in the segments the run itself
+        // wrote a moment ago, which is the case a single batch never covers.
+        let dir = scratch_dir("flush-twice");
+        let corpus = documents(&dir.join("corpus"), 0, 137);
+        let store = dir.join("cut.kura");
+
+        into(&corpus, &store, &["--flush-every", "1k"]).expect("the first run");
+        let after_one = Store::open(&store)
+            .expect("the store opens")
+            .manifest()
+            .clone();
+        assert!(
+            after_one.segments.len() > 2,
+            "the corpus went into {} segments",
+            after_one.segments.len()
+        );
+
+        into(&corpus, &store, &["--flush-every", "1k"]).expect("the second run");
+        let opened = Store::open(&store).expect("the store opens");
+        assert_eq!(opened.manifest().live, 137);
+        assert_eq!(opened.manifest().total, 274);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

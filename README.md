@@ -163,6 +163,46 @@ The rank column in a run file is ignored and the score decides the order, ties b
 By default a query the run did not answer is not scored at all, which is `trec_eval` without its `-c` flag.
 Pass `--complete` to score it as a zero instead, which is the honest choice when comparing two engines, because an engine that returns nothing for its hard queries should not score as though nobody asked them.
 
+## Indexing the same directory again
+
+```sh
+./target/release/kura-cli index ./corpus -o /tmp/docs.kura --store
+./target/release/kura-cli index ./corpus -o /tmp/docs.kura --store
+```
+
+A run with `--store` keys every file by its path, and a document written under a key the store already holds replaces it.
+The second command above leaves one live copy of every file rather than two, and a file that changed between the two runs is in the index as it is now rather than as it was.
+The new documents and the deletions of the ones they replace land in one commit, so a query running at the same time sees one or the other and never a corpus with both copies of a file in it or neither.
+
+A run says which it did:
+
+```
+indexed 10888 documents, 106.4 MB of text into /tmp/docs.kura, 16.6 MB in 1.1s
+0 of them were new and 10888 replaced a document already in the store
+```
+
+The Go source tree at go1.26.6, which is 10,888 text files and 106.4 MB, on an M4 with the files already in page cache, `--memory 32m`, eight runs of the same command one after another:
+
+| run | new | replaced | segments after | wall |
+| --- | --- | --- | --- | --- |
+| 1 | 10,888 | 0 | 2 | 2.1 s |
+| 2 | 0 | 10,888 | 4 | 1.1 s |
+| 3 | 0 | 10,888 | 6 | 1.1 s |
+| 4 | 0 | 10,888 | 8 | 1.8 s |
+| 5 | 0 | 10,888 | 10 | 1.9 s |
+| 6 | 0 | 10,888 | 12 | 1.1 s |
+| 7 | 0 | 10,888 | 14 | 1.0 s |
+| 8 | 0 | 10,888 | 16 | 1.0 s |
+
+Every document in a run after the first is a lookup, an index and a deletion rather than an append, and it costs about half what the first run cost, because the first run is the one that reads the files off disk rather than out of the page cache.
+A lookup asks the key index of every segment in turn, so the cost of one grows with the segment count, and the run that ended with sixteen segments was not slower than the run that ended with four.
+
+What it does cost is the file.
+The documents that were replaced are still in the segments they were written into, so the store grows by a segment a run: 74.4 MB after four runs and 140.7 MB after eight, with 10,888 live documents and 87,104 written throughout.
+Reclaiming that is compaction, which is not here yet.
+
+A run without `--store` writes a single segment and keys nothing, because a file is not a store and there is nothing in it to replace.
+
 ## Bounding what an index run holds at once
 
 ```sh

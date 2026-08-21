@@ -23,8 +23,9 @@ use std::collections::HashMap;
 use crate::DocId;
 use crate::bitmap::Bitmap;
 use crate::error::Error;
-use crate::file::{Lookup, Result, Store, Trouble, View};
+use crate::file::{Appending, Lookup, Result, Store, Trouble, View};
 use crate::index::{self, Held};
+use crate::segment::Writer as SegmentWriter;
 
 /// Documents on their way into a store, with the ones they replace.
 ///
@@ -71,10 +72,27 @@ impl<'a> Batch<'a> {
     /// Returns a decoding error if a segment of the view, one of its key
     /// sections or one of its sets of deletions is not what it claims to be.
     pub fn over(view: &'a View) -> Result<Self> {
+        Self::with(view, index::Writer::new())
+    }
+
+    /// Starts a batch that says it is full once it holds `budget` bytes.
+    ///
+    /// A run loading a corpus commits a segment at a time rather than one
+    /// segment at the end, and this is what tells it when.
+    ///
+    /// # Errors
+    ///
+    /// As [`over`](Self::over).
+    pub fn with_budget(view: &'a View, budget: u64) -> Result<Self> {
+        Self::with(view, index::Writer::with_budget(budget))
+    }
+
+    /// Starts a batch around a writer that has already been set up.
+    fn with(view: &'a View, writer: index::Writer) -> Result<Self> {
         Ok(Self {
             view,
             lookup: view.lookup()?,
-            writer: index::Writer::new(),
+            writer,
             replaced: (0..view.len()).map(|_| None).collect(),
             superseded: Bitmap::new(),
             mine: HashMap::new(),
@@ -90,6 +108,22 @@ impl<'a> Batch<'a> {
     /// As [`index::Writer::add`].
     pub fn add(&mut self, text: &str) -> Result<DocId> {
         self.writer.add(text).map_err(Trouble::Format)
+    }
+
+    /// Adds a document that replaces nothing, with values to hand back with a
+    /// hit.
+    ///
+    /// # Errors
+    ///
+    /// As [`index::Writer::add_with_fields`].
+    pub fn add_with_fields<'f>(
+        &mut self,
+        text: &str,
+        fields: impl IntoIterator<Item = (&'f str, &'f [u8])>,
+    ) -> Result<DocId> {
+        self.writer
+            .add_with_fields(text, fields)
+            .map_err(Trouble::Format)
     }
 
     /// Adds a document under a key, replacing whatever the store holds under
@@ -109,24 +143,50 @@ impl<'a> Batch<'a> {
     /// deletions in the view does not decode.
     pub fn add_keyed(&mut self, key: &[u8], text: &str) -> Result<DocId> {
         let doc = self.writer.add_keyed(key, text).map_err(Trouble::Format)?;
-        // The store first, because the segment being built is the newer of the
-        // two and a key in both means the copy in the store is already on its
-        // way out either way.
+        self.replacing(key, doc)?;
+        Ok(doc)
+    }
+
+    /// [`add_keyed`](Self::add_keyed), with values to hand back with a hit.
+    ///
+    /// # Errors
+    ///
+    /// As [`add_keyed`](Self::add_keyed).
+    pub fn add_keyed_with_fields<'f>(
+        &mut self,
+        key: &[u8],
+        text: &str,
+        fields: impl IntoIterator<Item = (&'f str, &'f [u8])>,
+    ) -> Result<DocId> {
+        let doc = self
+            .writer
+            .add_keyed_with_fields(key, text, fields)
+            .map_err(Trouble::Format)?;
+        self.replacing(key, doc)?;
+        Ok(doc)
+    }
+
+    /// Works out what the document just written under `key` replaces.
+    fn replacing(&mut self, key: &[u8], doc: DocId) -> Result<()> {
+        // What this batch has already written first. A key it has seen before
+        // has already had whatever the store holds under it marked for
+        // deletion, so asking the store again would find the same document, mark
+        // it a second time and count a replacement that does not happen.
+        if let Some(old) = self.mine.insert(key.into(), doc) {
+            self.superseded.insert(old);
+            self.replacements += 1;
+            return Ok(());
+        }
+        self.key_bytes = self
+            .key_bytes
+            .saturating_add(u64::try_from(key.len()).unwrap_or(u64::MAX));
         if let Some((at, old)) = self.lookup.document(key)? {
             self.replaced[at]
                 .get_or_insert_with(Bitmap::new)
                 .insert(old);
             self.replacements += 1;
         }
-        if let Some(old) = self.mine.insert(key.into(), doc) {
-            self.superseded.insert(old);
-            self.replacements += 1;
-        } else {
-            self.key_bytes = self
-                .key_bytes
-                .saturating_add(u64::try_from(key.len()).unwrap_or(u64::MAX));
-        }
-        Ok(doc)
+        Ok(())
     }
 
     /// How many documents have been added.
@@ -139,6 +199,16 @@ impl<'a> Batch<'a> {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.writer.is_empty()
+    }
+
+    /// Whether it is holding as much as it was given a budget for.
+    ///
+    /// Always false without a budget. Asked after a document rather than before
+    /// one, because a document cannot be split across two segments and a budget
+    /// checked first would refuse documents larger than itself.
+    #[must_use]
+    pub fn is_full(&self) -> bool {
+        self.writer.is_full()
     }
 
     /// How many of them replaced a document, in the store or in this batch.
@@ -198,14 +268,14 @@ impl<'a> Batch<'a> {
             None
         } else {
             let docs = u32::try_from(self.writer.len()).unwrap_or(u32::MAX);
-            let bytes = self.writer.finish().map_err(Trouble::Format)?;
+            let built = index::Writer::build(vec![self.writer]).map_err(Trouble::Format)?;
             // The segment this commit adds answers to the position it is about
             // to take, which is where a key used twice in one batch puts the
             // copy that lost.
             if !self.superseded.is_empty() {
                 deletions.push((self.view.len(), self.superseded));
             }
-            Some((bytes, docs))
+            Some((built, docs))
         };
 
         Ok(Prepared {
@@ -233,11 +303,15 @@ impl<'a> Batch<'a> {
 /// Made by [`Batch::finish`]. It is a value with nothing borrowed in it, so the
 /// work of building a segment and the commit that publishes it do not have to
 /// happen in the same place.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Prepared {
     /// The segment to append, and how many documents it holds. A batch of
     /// nothing but deletions has none.
-    pub segment: Option<(Vec<u8>, u32)>,
+    ///
+    /// It is a writer rather than the bytes, so the segment is laid out straight
+    /// into the store rather than into a vector on the way there. The vector is
+    /// a copy of the largest thing an index run makes.
+    pub segment: Option<(SegmentWriter, u32)>,
     /// What to delete, per segment, each set being the whole answer for its
     /// segment. The last of them may name the segment above, which is a document
     /// the batch replaced with a later one of its own.
@@ -255,7 +329,7 @@ impl Prepared {
     /// been committed to since the batch read it, because the deletions are then
     /// about a store that no longer exists and committing them would undo
     /// whatever that commit did. Otherwise as [`Store::publish`].
-    pub fn commit(&self, store: &mut Store, created: u64, written: u64) -> Result<u64> {
+    pub fn commit(self, store: &mut Store, created: u64, written: u64) -> Result<u64> {
         let committed = store.manifest().epoch;
         if committed != self.epoch {
             return Err(Trouble::Format(Error::StaleView {
@@ -265,9 +339,8 @@ impl Prepared {
         }
         let segment = self
             .segment
-            .as_ref()
-            .map(|(bytes, docs)| (bytes.as_slice(), *docs));
-        store.publish(segment, created, &self.deletions, written)
+            .map(|(built, docs)| (docs, move |into: &mut Appending<'_>| built.write_to(into)));
+        store.publish_with(segment, created, &self.deletions, written)
     }
 }
 
@@ -357,6 +430,32 @@ mod tests {
         assert_eq!(count(&store, "first"), 0);
         assert_eq!(count(&store, "second"), 0);
         assert_eq!(store.manifest().live, 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_key_the_store_holds_and_the_batch_writes_twice_replaces_two_documents() {
+        // The copy in the store and the earlier copy in the batch, which is two
+        // documents and not three. Counting the store's copy once a document
+        // would say a commit deletes more than it deletes, and the count is what
+        // a run reports as replaced.
+        let path = path("twice-over");
+        let mut store = empty(&path);
+        write(&mut store, &[(b"a", "the first ledger")]);
+
+        let view = store.view().expect("a view");
+        let mut batch = Batch::over(&view).expect("a batch");
+        batch.add_keyed(b"a", "the second ledger").expect("added");
+        batch.add_keyed(b"a", "the third ledger").expect("added");
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch.replacements(), 2);
+        batch.commit(&mut store, 1, 1).expect("committed");
+        drop(view);
+
+        assert_eq!(count(&store, "ledger"), 1);
+        assert_eq!(count(&store, "third"), 1);
+        assert_eq!(store.manifest().live, 1);
+        assert_eq!(store.manifest().total, 3);
         let _ = std::fs::remove_file(&path);
     }
 
