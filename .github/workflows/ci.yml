@@ -106,16 +106,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - aarch64-pc-windows-msvc
-          - x86_64-unknown-freebsd
-          - wasm32-unknown-unknown
+        include:
+          - target: aarch64-pc-windows-msvc
+          - target: x86_64-unknown-freebsd
+          # No filesystem, so no store file. The rest of the engine is byte
+          # slices in and byte slices out and builds without one.
+          - target: wasm32-unknown-unknown
+            features: --no-default-features
     steps:
       - uses: actions/checkout@v7
       - name: add the target
         run: rustup target add ${{ matrix.target }}
       - name: check
-        run: cargo check -p kura-core --target ${{ matrix.target }}
+        run: cargo check -p kura-core --target ${{ matrix.target }} ${{ matrix.features }}
 
   # Licenses, advisories and sources. The engine is linked into other people's
   # binaries, so anything that arrives in the dependency tree has to be a

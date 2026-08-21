@@ -24,6 +24,8 @@ pub mod checksum;
 pub mod codec;
 pub mod error;
 pub mod explain;
+#[cfg(feature = "fs")]
+pub mod file;
 pub mod index;
 pub mod lz;
 pub mod manifest;
