@@ -36,16 +36,34 @@
 //! works out a key for each, and writes the dictionary back out with the keys in
 //! front. The blocks are copied across untouched.
 //!
+//! # Sections that are worked out from other sections
+//!
+//! Not every section is data. The block score ceilings are a function of the
+//! postings and the document lengths, which means a segment written before that
+//! section existed is not missing anything a migration has to invent, it is
+//! missing something a migration can compute. So after the version steps there
+//! is a second pass that rebuilds those, and it runs whether or not the old file
+//! had them.
+//!
+//! This is not a version step and it does not move the version. Adding a section
+//! is not a format change, because a reader that has never heard of a kind
+//! returns the same results without it, so a build that adds one does not get to
+//! call the files before it a different version. What it does get is a migration
+//! that still keeps its promise: a migrated file is what this build would have
+//! written, and this build would have written the ceilings.
+//!
 //! # What this does not do
 //!
 //! It does not write in place. A migration reads one file and writes another,
 //! and the caller keeps the original until it is satisfied with what came out.
 //! Anything else would be a tool that can leave a store as neither version.
 
-use crate::codec::{get_u32, get_uvarint, put_u32, put_uvarint, split_at};
+use crate::codec::{get_u32, get_u64, get_uvarint, put_u32, put_uvarint, split_at};
 use crate::error::{Error, Result};
+use crate::index::average;
+use crate::search::{B, K1};
 use crate::segment::{self, Segment};
-use crate::{FORMAT_VERSION, terms};
+use crate::{DocId, FORMAT_VERSION, bound, posting, terms};
 
 /// Brings one segment forward to [`FORMAT_VERSION`].
 ///
@@ -103,10 +121,104 @@ pub fn segment(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
         }
         version += 1;
     }
+    derive(&mut sections)?;
 
     let mut writer = segment::Writer::new();
     for (kind, payload) in sections {
         writer.add(kind, payload)?;
+    }
+    Ok(Some(writer.finish()))
+}
+
+/// Rebuilds the sections that are worked out from the others.
+///
+/// At present that is one section, the block score ceilings, which are a
+/// function of the postings and the document lengths. It is rebuilt rather than
+/// kept, because a file old enough to be migrated is old enough that whatever it
+/// holds was computed by rules this build has moved on from, and recomputing is
+/// cheaper to reason about than deciding which old ones are still good.
+///
+/// A segment missing the postings or the lengths gets nothing and is not an
+/// error. That is a segment holding something other than an index, which the
+/// container allows and this has no opinion about.
+fn derive(sections: &mut Vec<(u16, Vec<u8>)>) -> Result<()> {
+    let find = |want: u16| {
+        sections
+            .iter()
+            .find(|(kind, _)| *kind == want)
+            .map(|(_, payload)| payload.as_slice())
+    };
+    let (Some(dictionary), Some(postings), Some(norms)) = (
+        find(segment::kind::TERMS),
+        find(segment::kind::POSTINGS),
+        find(segment::kind::NORMS),
+    ) else {
+        return Ok(());
+    };
+    let built = ceilings(dictionary, postings, norms)?;
+
+    sections.retain(|(kind, _)| *kind != segment::kind::BOUNDS);
+    let Some(built) = built else {
+        return Ok(());
+    };
+    // Straight after the lengths it was computed from, which is where the
+    // indexer puts it. The order of the section table is part of what a byte for
+    // byte comparison against a freshly built segment is comparing.
+    let at = sections
+        .iter()
+        .position(|(kind, _)| *kind == segment::kind::NORMS)
+        .map_or(sections.len(), |at| at + 1);
+    sections.insert(at, (segment::kind::BOUNDS, built));
+    Ok(())
+}
+
+/// The block score ceilings of a segment, worked out from its own sections.
+///
+/// The indexer builds these as it writes the posting lists, where every
+/// frequency is already in hand. Here there is no such luck and the lists have
+/// to be decoded, which is why this is an offline tool's cost and not a
+/// reader's. The two have to agree byte for byte, and the fixture comparison in
+/// `tests/format.rs` is what says they do.
+fn ceilings(dictionary: &[u8], postings: &[u8], norms: &[u8]) -> Result<Option<Vec<u8>>> {
+    let (documents, rest) = get_u32(norms)?;
+    let (total, lengths) = get_u64(rest)?;
+    let needed = (documents as usize).checked_mul(4).ok_or(Error::Overflow)?;
+    if lengths.len() < needed {
+        return Err(Error::Truncated {
+            needed,
+            available: lengths.len(),
+        });
+    }
+    let length_of = |doc: DocId| -> u32 {
+        lengths
+            .get(doc as usize * 4..)
+            .and_then(<[u8]>::first_chunk::<4>)
+            .map_or(0, |bytes| u32::from_le_bytes(*bytes))
+    };
+
+    let mut writer = bound::Writer::new(K1, B, average(total, documents));
+    let mut entries = terms::Reader::new(dictionary)?.entries();
+    // Ascending by term, which for a dictionary written by this crate is also
+    // ascending by the offset of the list, and ascending offsets is what the
+    // ceiling directory is searched by.
+    while let Some((_, entry)) = entries.next_term()? {
+        let start = usize::try_from(entry.offset).map_err(|_| Error::Overflow)?;
+        let len = usize::try_from(entry.len).map_err(|_| Error::Overflow)?;
+        let end = start.checked_add(len).ok_or(Error::Overflow)?;
+        let list = postings.get(start..end).ok_or(Error::SectionOutOfRange {
+            kind: segment::kind::POSTINGS,
+            offset: entry.offset,
+            length: entry.len,
+        })?;
+        for (doc, frequency) in posting::Reader::new(list)?.to_postings()? {
+            writer.push(frequency, length_of(doc));
+        }
+        writer.finish_term(entry.offset);
+    }
+    // A segment whose every list is shorter than a block earns no section, which
+    // is the same judgement the indexer makes.
+    if writer.is_empty() {
+        return Ok(None);
     }
     Ok(Some(writer.finish()))
 }

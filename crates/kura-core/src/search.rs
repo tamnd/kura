@@ -47,6 +47,7 @@
 
 use crate::DocId;
 use crate::analysis::Analyzer;
+use crate::bound;
 use crate::error::{Error, Result};
 use crate::explain::{Counters, Off, Tally};
 use crate::index::Reader;
@@ -666,14 +667,21 @@ impl<'a, 'b> Searcher<'a, 'b> {
     /// that are already mapped, so holding one costs a pointer and a length,
     /// where finding it again costs a walk through a dictionary.
     fn open<T: Tally>(&self, terms: &[&[u8]], tally: &mut T) -> Result<Vec<Shard<'a, 'b>>> {
-        let mut found: Vec<Vec<Option<posting::Reader<'b>>>> =
+        // The offset of each list is kept beside it, because that is how the
+        // block score ceilings are keyed and looking it up again would mean a
+        // second walk through the dictionary.
+        let mut found: Vec<Vec<Option<(u64, posting::Reader<'b>)>>> =
             Vec::with_capacity(self.segments.len());
         let mut holding = vec![0u32; terms.len()];
         for index in self.segments {
             let mut row = Vec::with_capacity(terms.len());
             for (at, term) in terms.iter().enumerate() {
-                let list = index.postings(term)?.filter(|list| !list.is_empty());
-                if let Some(list) = &list {
+                let list = match index.entry(term)? {
+                    Some(entry) => Some((entry.offset, index.list(entry)?)),
+                    None => None,
+                }
+                .filter(|(_, list)| !list.is_empty());
+                if let Some((_, list)) = &list {
                     // A term cannot be in more documents than the store holds,
                     // and that count is a `u32`, so this cannot really
                     // saturate.
@@ -699,14 +707,29 @@ impl<'a, 'b> Searcher<'a, 'b> {
         let mut opened = 0u32;
         let mut postings = 0u64;
         let mut blocks = 0u64;
+        let average = self.average_length();
         for (index, row) in self.segments.iter().zip(found) {
+            // A segment scored with parameters other than the ones its ceilings
+            // were computed under has to ignore them. See `bound` for why that
+            // is a correctness matter: a bound that does not hold drops results
+            // rather than returning bad ones.
+            let ceilings = index.bounds().filter(|ceilings| {
+                let (k1, b) = ceilings.parameters();
+                // Bit equality rather than a tolerance, because these are the
+                // same two constants that went in, unchanged, or they are two
+                // numbers a caller chose and there is no tolerance that makes
+                // one of those safe.
+                k1.to_bits() == self.k1.to_bits() && b.to_bits() == self.b.to_bits()
+            });
             let mut lists = Lists {
                 heads: Vec::with_capacity(terms.len()),
                 cursors: Vec::with_capacity(terms.len()),
                 counts: Vec::with_capacity(terms.len()),
+                ceilings: Vec::with_capacity(terms.len()),
+                scale: ceilings.map_or(1.0, |ceilings| ceilings.scale(average)),
             };
             for (at, list) in row.into_iter().enumerate() {
-                let Some(list) = list else {
+                let Some((offset, list)) = list else {
                     continue;
                 };
                 let mut cursor = list.cursor();
@@ -724,6 +747,12 @@ impl<'a, 'b> Searcher<'a, 'b> {
                 lists.heads.push(Head { doc, idf, bound });
                 lists.cursors.push(cursor);
                 lists.counts.push(list.len());
+                // Empty for a list short enough that the writer did not think it
+                // worth an entry, and for every list in a segment written before
+                // the section existed. Both fall back on the looser bound.
+                lists
+                    .ceilings
+                    .push(ceilings.map_or(&[][..], |ceilings| ceilings.get(offset)));
             }
             if !lists.is_empty() {
                 shards.push(Shard { index, base, lists });
@@ -818,6 +847,13 @@ struct Lists<'a> {
     /// How many documents each list holds, which a total wants and the scorer
     /// has already spent to get the inverse document frequency.
     counts: Vec<u32>,
+    /// What each list's blocks can score at best, one byte a block, or empty for
+    /// a list the segment has none for.
+    ceilings: Vec<&'a [u8]>,
+    /// What a stored ceiling has to be multiplied by to hold at the average
+    /// length this query is scoring against, which is the store's and not this
+    /// segment's. One whenever the two agree.
+    scale: f32,
 }
 
 impl Lists<'_> {
@@ -896,9 +932,20 @@ impl Lists<'_> {
 
     /// The most one term can add to a document in the block its cursor is in.
     ///
-    /// The frequency comes from the byte the posting format stores per block,
-    /// and the length is taken to be zero, which is the shortest a document can
-    /// be and so the kindest the normalisation can be.
+    /// Two bounds, and the smaller of them. The first comes from the byte the
+    /// posting format stores per block, with the length taken to be zero, which
+    /// is the shortest a document can be and so the kindest the normalisation
+    /// can be. It is always available and it is loose by whatever the real
+    /// lengths came to, which on prose is a factor of about four.
+    ///
+    /// The second comes from the ceilings section, which stored what the block
+    /// really reaches, lengths and all. It is absent for a short list and for a
+    /// segment written before the section existed, which is why the first one is
+    /// still here.
+    ///
+    /// The smaller of the two rather than the second one, because a bound that is
+    /// the minimum of two bounds is a bound, and it costs a comparison in a place
+    /// that is already reading both.
     #[expect(
         clippy::cast_precision_loss,
         reason = "a frequency past the range of f32 would need a document of four \
@@ -906,7 +953,16 @@ impl Lists<'_> {
     )]
     fn block_bound(&self, at: usize, k1: f32, floor: f32) -> f32 {
         let frequency = self.cursors[at].block_max_frequency() as f32;
-        self.heads[at].idf * (frequency * (k1 + 1.0)) / (frequency + floor)
+        let loose = self.heads[at].idf * (frequency * (k1 + 1.0)) / (frequency + floor);
+        let Some(&quantum) = self.ceilings[at].get(self.cursors[at].block()) else {
+            return loose;
+        };
+        // `bound` is the term's `idf * (k1 + 1)`, which is what it contributes
+        // when the saturation is one, so a saturation ceiling scales it directly.
+        // Clamped at one because the correction for a different average length
+        // can push a ceiling past the most a term can ever contribute.
+        let tight = self.heads[at].bound * (bound::ceiling(quantum) * self.scale).min(1.0);
+        loose.min(tight)
     }
 
     /// What one term adds to the document its cursor is on.
@@ -1475,16 +1531,99 @@ mod tests {
         );
     }
 
+    /// A corpus the frequency bound cannot tell apart and the score bound can.
+    ///
+    /// Every document holds the term exactly five times, so the largest
+    /// frequency in every block is five and a bound taken from frequency alone
+    /// is the same number for all of them. What differs is length: the first
+    /// block of documents is a few words long and everything after it is long
+    /// prose. The short ones score far higher, so once the top `k` is full every
+    /// later block is beneath it, and only a bound that knows about length can
+    /// see that.
+    fn same_frequency_different_lengths(documents: usize, short: usize) -> Vec<String> {
+        (0..documents)
+            .map(|i| {
+                let mut text = String::from("common common common common common");
+                if i >= short {
+                    for word in 0..400 {
+                        use core::fmt::Write as _;
+                        let _ = write!(text, " word{}", (i + word) % 4_000);
+                    }
+                }
+                text
+            })
+            .collect()
+    }
+
     #[test]
-    fn a_common_term_on_its_own_skips_nothing_at_all() {
-        // Not an assertion that this is right. It is an assertion of what the
-        // engine does today, which is decode every posting of a term that is in
-        // every document, because the block bound is computed from the largest
-        // frequency in the block with the length normalisation pinned to zero
-        // and is therefore too loose to ever fall under the threshold.
+    fn a_common_term_alone_skips_the_blocks_that_only_hold_long_documents() {
+        // The whole of what the ceilings section buys, on the shape it was
+        // written for. Without it every block reports the same bound, because
+        // the only thing the posting format stores per block is the largest
+        // frequency and here that is five everywhere.
+        let docs = same_frequency_different_lengths(1_280, BLOCK_SIZE);
+        let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+        let bytes = build(&refs);
+        let segment = Segment::open(&bytes).expect("opens");
+        let index = Reader::open(&segment).expect("opens");
+        let searcher = Searcher::new(&index);
+
+        let (hits, counters) = searcher.search_explained("common", 10).expect("searches");
+        assert_eq!(counters.blocks, 1_280 / BLOCK_SIZE as u64);
+        // One block scored and nine stepped over. Without the ceilings this is
+        // all 1280, which is the test below.
+        assert_eq!(counters.documents_scored, BLOCK_SIZE as u64);
+        // The blocks are still unpacked, though nothing in them is scored,
+        // because the walk steps over a block by seeking past its last document
+        // and the seek lands in the next block and decodes it. Getting that back
+        // is the next item on this milestone and not this one, and the number is
+        // asserted here so that it is a measurement rather than an oversight.
+        assert_eq!(counters.blocks_skipped, 0);
+        // And the answer is still the answer, which is the half of this that
+        // matters. A bound that skipped one block too many would look like a
+        // faster query and be a wrong one.
+        same(&hits, &by_hand(&index, &[b"common"], K1, B)[..10]);
+    }
+
+    #[test]
+    fn the_frequency_bound_on_its_own_would_have_skipped_none_of_them() {
+        // The control for the test above, and the reason the ceilings are worth
+        // a byte a block. Everything here is the old bound, worked out by hand:
+        // the largest frequency in any block against the threshold the top ten
+        // settles at. It never falls under, so a build without the section
+        // decodes all ten blocks.
+        let docs = same_frequency_different_lengths(1_280, BLOCK_SIZE);
+        let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+        let bytes = build(&refs);
+        let segment = Segment::open(&bytes).expect("opens");
+        let index = Reader::open(&segment).expect("opens");
+
+        let list = index
+            .postings(b"common")
+            .expect("decodes")
+            .expect("is there");
+        let idf = idf(index.documents(), list.len());
+        let frequency = 5.0f32;
+        let old = idf * (frequency * (K1 + 1.0)) / (frequency + K1 * (1.0 - B));
+
+        let threshold = by_hand(&index, &[b"common"], K1, B)[9].score;
+        assert!(
+            old > threshold,
+            "the old bound {old} was meant to stay above the threshold {threshold}"
+        );
+    }
+
+    #[test]
+    fn a_common_term_on_its_own_skips_nothing_when_every_block_holds_a_winner() {
+        // Not the bound being loose. This corpus repeats the term one to forty
+        // times cycling with the document number, so every block of a hundred
+        // and twenty eight holds a document at the top of the ranking, and no
+        // bound however tight can skip a block that holds one.
         //
-        // The fix changes this test, and the test is here so that the fix has to
-        // change it rather than being believed.
+        // Worth keeping because it is the case that says the pruning is not
+        // cheating: a query whose candidates really are spread everywhere reads
+        // everything, and the tests above are measuring a corpus and not a
+        // shortcut.
         let docs = skewed(6_000);
         let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
         let bytes = build(&refs);
@@ -1757,6 +1896,81 @@ mod tests {
                 same(&hits, &one.search(query, k).expect("searches"));
                 assert_eq!(total, one.count(query).expect("counts"), "{query} at k {k}");
             }
+        }
+    }
+
+    /// A store whose last segment is nothing like the rest of it.
+    ///
+    /// The long documents come first and hold the term a hundred and seven
+    /// times in four hundred and fifty words. The short ones come last and hold
+    /// it fifty times in fifty, so every one of them outranks every long one.
+    /// The point is the last segment's own mean length, fifty against the
+    /// store's three hundred and thirty two, which is what makes a ceiling
+    /// computed against the segment beneath what the store scores.
+    fn a_short_segment_after_long_ones(long: usize, short: usize) -> Vec<String> {
+        let mut docs = Vec::with_capacity(long + short);
+        for i in 0..long {
+            let mut text = "common ".repeat(107);
+            for word in 0..343 {
+                use core::fmt::Write as _;
+                let _ = write!(text, " word{}", (i + word) % 4_000);
+            }
+            docs.push(text);
+        }
+        for _ in 0..short {
+            docs.push("common ".repeat(50));
+        }
+        docs
+    }
+
+    #[test]
+    fn a_short_segment_in_a_store_of_long_ones_still_wins_the_page_it_should() {
+        // What the correction in `bound::Reader::scale` is for. A ceiling is
+        // written against the segment's own mean length, and a store of several
+        // segments scores every one of them against the store's, which for this
+        // corpus is six times larger. Uncorrected, the last segment's ceilings
+        // sit under what its documents really score, the walk steps over the
+        // block holding them, and the page comes back full of documents that
+        // should have lost with nothing anywhere to say a hit was dropped.
+        let docs = a_short_segment_after_long_ones(384, 160);
+        let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+
+        let whole = build(&refs);
+        let one = Segment::open(&whole).expect("opens");
+        let one = Reader::open(&one).expect("opens");
+        let one = Searcher::new(&one);
+
+        let parts = [build(&refs[..384]), build(&refs[384..])];
+        let segments: Vec<Segment<'_>> = parts
+            .iter()
+            .map(|bytes| Segment::open(bytes).expect("opens"))
+            .collect();
+        let readers: Vec<Reader<'_>> = segments
+            .iter()
+            .map(|segment| Reader::open(segment).expect("opens"))
+            .collect();
+        let many = Searcher::over(&readers).expect("this many documents are numberable");
+
+        // The premise, checked rather than assumed, because a corpus that
+        // drifted into having two similar segments would leave this test
+        // passing and measuring nothing.
+        assert!(
+            readers[1].average_length() * 6.0 < one.average_length(),
+            "the short segment's mean is {} against the store's {}",
+            readers[1].average_length(),
+            one.average_length()
+        );
+
+        let hits = many.search("common", 10).expect("searches");
+        same(&hits, &one.search("common", 10).expect("searches"));
+        // And the page is the short segment's, which is the thing that would be
+        // lost. Stated on its own so that a failure says which way it went.
+        for hit in &hits {
+            assert!(
+                hit.doc >= 384,
+                "document {} is from the long segment",
+                hit.doc
+            );
         }
     }
 

@@ -31,13 +31,22 @@
 //!
 //! # The parameters are part of the data
 //!
-//! `norm` depends on `k1`, on `b` and on the average document length, and the
-//! first two are the caller's to choose at query time. A bound computed under
-//! one pair of parameters is not a bound under another, so the pair is written
-//! into the section and a searcher that was given different ones ignores what is
-//! here and falls back. Silently using it would not be slower, it would be
-//! wrong, and it would be wrong by dropping results rather than by returning
-//! bad ones, which is the kind of wrong nobody notices.
+//! `norm` depends on `k1`, on `b` and on the average document length, and all
+//! three are the caller's at query time. A bound computed under one set is not a
+//! bound under another, so the set is written into the section.
+//!
+//! `k1` and `b` are compared and nothing else happens: a searcher given
+//! different ones ignores what is here and falls back to the old bound. Silently
+//! using it would not be slower, it would be wrong, and it would be wrong by
+//! dropping results rather than by returning bad ones, which is the kind of
+//! wrong nobody notices.
+//!
+//! The average is different, because a store of several segments scores every
+//! one of them against the average of the whole store and no segment's own
+//! average is that number. Falling back whenever they differ would mean falling
+//! back on every multi segment store, which is most of them. Instead the
+//! difference is corrected for. See [`Reader::scale`] for the factor and why it
+//! holds.
 //!
 //! # Layout
 //!
@@ -45,7 +54,8 @@
 //! 0..4    terms, u32          how many terms have an entry
 //! 4..8    k1, f32
 //! 8..12   b, f32
-//! 12..    the directory, `terms` entries of twelve bytes, ascending by offset
+//! 12..16  average, f32        the mean document length the ceilings assume
+//! 16..    the directory, `terms` entries of twelve bytes, ascending by offset
 //!           0..8    the term's byte offset into the postings section, u64
 //!           8..12   where its ceilings start in the payload, u32
 //! then    the payload, one byte per block
@@ -78,7 +88,7 @@ pub const SCALE: u8 = u8::MAX;
 const ENTRY: usize = 12;
 
 /// The bytes before the directory starts.
-const HEADER: usize = 12;
+const HEADER: usize = 16;
 
 /// Builds the ceilings for a segment, one term at a time.
 ///
@@ -102,6 +112,9 @@ pub struct Writer {
     filled: usize,
     k1: f32,
     b: f32,
+    /// The mean document length the ceilings were computed against, written into
+    /// the section so a searcher working from a different one can correct for it.
+    average: f32,
     /// The part of the normalisation that does not vary with the document.
     base: f32,
     /// The part that does, per word of document length.
@@ -128,6 +141,7 @@ impl Writer {
             filled: 0,
             k1,
             b,
+            average: average.max(1.0),
             base: k1 * (1.0 - b),
             per_word: k1 * b / average.max(1.0),
         }
@@ -187,6 +201,7 @@ impl Writer {
         put_u32(&mut out, self.terms);
         put_u32(&mut out, self.k1.to_bits());
         put_u32(&mut out, self.b.to_bits());
+        put_u32(&mut out, self.average.to_bits());
         out.extend_from_slice(&self.directory);
         out.extend_from_slice(&self.payload);
         out
@@ -207,6 +222,7 @@ pub struct Reader<'a> {
     terms: usize,
     k1: f32,
     b: f32,
+    average: f32,
 }
 
 impl<'a> Reader<'a> {
@@ -221,6 +237,7 @@ impl<'a> Reader<'a> {
         let (terms, rest) = get_u32(input)?;
         let (k1, rest) = get_u32(rest)?;
         let (b, rest) = get_u32(rest)?;
+        let (average, rest) = get_u32(rest)?;
         let terms = terms as usize;
         let needed = terms.checked_mul(ENTRY).ok_or(Error::Overflow)?;
         if rest.len() < needed {
@@ -236,6 +253,7 @@ impl<'a> Reader<'a> {
             terms,
             k1: f32::from_bits(k1),
             b: f32::from_bits(b),
+            average: f32::from_bits(average),
         };
         // The search below is a binary search, so an out of order directory
         // would not be a wrong answer, it would be a missing one. Refusing it
@@ -261,6 +279,38 @@ impl<'a> Reader<'a> {
     #[must_use]
     pub const fn parameters(&self) -> (f32, f32) {
         (self.k1, self.b)
+    }
+
+    /// The mean document length the ceilings were computed against.
+    #[must_use]
+    pub const fn average_length(&self) -> f32 {
+        self.average
+    }
+
+    /// What a ceiling has to be multiplied by to hold at a different average
+    /// document length.
+    ///
+    /// A term contributes `f / (f + c0 + c1 * len / a)` with `c0` and `c1` fixed
+    /// by `k1` and `b`. Raising `a` shrinks the denominator, so a ceiling
+    /// computed at the segment's own average is not a ceiling at the larger
+    /// average a store of several segments scores by. Writing `s` for the stored
+    /// average and `q` for the one being scored with, the ratio between the two
+    /// contributions is
+    ///
+    /// ```text
+    /// (f + c0 + c1 * len / s) / (f + c0 + c1 * len / q)
+    /// ```
+    ///
+    /// which is at most one when `q <= s`, and at most `q / s` otherwise, since
+    /// `s / q * (u + p) <= u + s / q * p` for any non negative `u` and `p` once
+    /// `s <= q`. So `max(1, q / s)` scales a ceiling into one that holds, it is
+    /// exactly one whenever the averages agree, and it approaches the truth as
+    /// documents get long. That is what lets a multi segment store keep the
+    /// tight bound instead of falling back on every query.
+    #[must_use]
+    pub fn scale(&self, average: f32) -> f32 {
+        let stored = self.average.max(1.0);
+        (average.max(1.0) / stored).max(1.0)
     }
 
     /// How many terms have ceilings.
@@ -507,6 +557,60 @@ mod tests {
         let (k1, b) = reader.parameters();
         assert!((k1 - 1.7).abs() < 1e-9, "{k1}");
         assert!((b - 0.3).abs() < 1e-9, "{b}");
+        assert!((reader.average_length() - 400.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn an_average_that_agrees_costs_nothing() {
+        let bytes = Writer::new(1.2, 0.75, 400.0).finish();
+        let reader = Reader::new(&bytes).expect("reads");
+        assert!((reader.scale(400.0) - 1.0).abs() < 1e-9);
+        // A shorter average makes every normalisation larger and every
+        // contribution smaller, so the stored ceiling already holds.
+        assert!((reader.scale(200.0) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_scaled_ceiling_still_bounds_the_block_at_a_longer_average() {
+        // The property the correction exists for. A segment of short documents
+        // inside a store of long ones is scored against an average larger than
+        // its own, which makes every contribution larger than what was stored.
+        let (k1, b) = (1.2f32, 0.75f32);
+        let mine = 200.0f32;
+        let postings: Vec<(u32, u32)> = (0..BLOCK_SIZE)
+            .map(|at| (at as u32 % 9 + 1, (at as u32 % 40) * 25 + 1))
+            .collect();
+        let bytes = one_term(&postings, k1, b, mine);
+        let reader = Reader::new(&bytes).expect("reads");
+        let stored = ceiling(reader.get(0)[0]);
+        for theirs in [200.0f32, 400.0, 1000.0, 50_000.0] {
+            let held = stored * reader.scale(theirs);
+            let truth = best(&postings, k1, b, theirs);
+            assert!(
+                held >= truth,
+                "at average {theirs} the scaled ceiling {held} is under the truth {truth}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_scaled_ceiling_is_still_far_tighter_than_the_bound_it_replaces() {
+        // The correction is only worth having if what comes out of it is still
+        // better than pinning the normalisation at its floor, which is what a
+        // segment with no ceilings falls back to.
+        let (k1, b) = (1.2f32, 0.75f32);
+        let postings: Vec<(u32, u32)> = (0..BLOCK_SIZE)
+            .map(|at| (at as u32 % 3 + 1, 3000))
+            .collect();
+        let bytes = one_term(&postings, k1, b, 300.0);
+        let reader = Reader::new(&bytes).expect("reads");
+        let held = ceiling(reader.get(0)[0]) * reader.scale(400.0);
+
+        let frequency = postings.iter().map(|p| p.0).max().expect("some") as f32;
+        let floor = k1 * (1.0 - b);
+        let before = frequency / (frequency + floor);
+
+        assert!(held < before / 2.0, "{held} against {before}");
     }
 
     #[test]
@@ -545,6 +649,7 @@ mod tests {
         put_u32(&mut bytes, 2);
         put_u32(&mut bytes, 1.2f32.to_bits());
         put_u32(&mut bytes, 0.75f32.to_bits());
+        put_u32(&mut bytes, 400.0f32.to_bits());
         put_u64(&mut bytes, 900);
         put_u32(&mut bytes, 0);
         put_u64(&mut bytes, 10);

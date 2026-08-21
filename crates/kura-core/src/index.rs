@@ -20,8 +20,9 @@
 use crate::analysis::Analyzer;
 use crate::codec::{get_u32, get_u64, get_uvarint, put_u32, put_u64, put_uvarint};
 use crate::error::{Error, Result};
+use crate::search::{B, K1};
 use crate::segment::{Segment, Writer as SegmentWriter, kind};
-use crate::{DocId, posting, store, terms};
+use crate::{DocId, bound, posting, store, terms};
 
 /// The size of one link in a term's posting chain, in bytes.
 ///
@@ -561,6 +562,12 @@ impl Writer {
                 .ok_or(Error::Overflow)?;
         }
 
+        // The ceilings need the mean length before the first posting is pushed,
+        // which is why the total is summed here rather than where the norms are
+        // laid out below.
+        let total: u64 = parts.iter().map(|part| part.total).sum();
+        let mut ceilings = bound::Writer::new(K1, B, average(total, documents));
+
         let order: Vec<Vec<u32>> = parts.iter().map(|part| part.postings.sorted()).collect();
         let mut front = vec![0usize; parts.len()];
         let mut dictionary = terms::Writer::new();
@@ -594,12 +601,14 @@ impl Writer {
                 if part.postings.vocabulary.term(id) != term {
                     continue;
                 }
-                part.postings.walk(id, base[index], &mut list)?;
+                part.postings
+                    .walk(id, base[index], &part.lengths, &mut list, &mut ceilings)?;
                 docs += part.postings.chains[id as usize].documents;
                 front[index] += 1;
             }
             let offset = blob.len() as u64;
             list.finish_into(&mut blob);
+            ceilings.finish_term(offset);
             dictionary.push(
                 term,
                 terms::Entry {
@@ -612,7 +621,6 @@ impl Writer {
 
         let mut norms = Vec::with_capacity(16 + documents as usize * 4);
         put_u32(&mut norms, documents);
-        let total: u64 = parts.iter().map(|part| part.total).sum();
         put_u64(&mut norms, total);
         for part in &parts {
             for length in &part.lengths {
@@ -637,6 +645,11 @@ impl Writer {
         segment.add(kind::TERMS, dictionary.finish())?;
         segment.add(kind::POSTINGS, blob)?;
         segment.add(kind::NORMS, norms)?;
+        // A segment whose every list is shorter than a block has nothing to skip,
+        // and an empty section would cost a row in the table to say so.
+        if !ceilings.is_empty() {
+            segment.add(kind::BOUNDS, ceilings.finish())?;
+        }
         if let (true, Some(store)) = (stored, store) {
             segment.add(kind::FIELDS, store.finish()?)?;
         }
@@ -768,7 +781,14 @@ impl Accumulator {
     ///
     /// The shift is what lets a part that numbered its documents from zero sit
     /// after another part in one segment.
-    fn walk(&self, id: u32, base: DocId, writer: &mut posting::Writer) -> Result<()> {
+    fn walk(
+        &self,
+        id: u32,
+        base: DocId,
+        lengths: &[u32],
+        writer: &mut posting::Writer,
+        ceilings: &mut bound::Writer,
+    ) -> Result<()> {
         let at = id as usize;
         let chain = self.chains[at];
         let mut chunk = chain.head as usize;
@@ -788,7 +808,11 @@ impl Accumulator {
             let gap = u32::try_from(gap).map_err(|_| Error::NotSorted { at: doc })?;
             doc = if index == 0 { gap } else { doc + gap };
             let shifted = doc.checked_add(base).ok_or(Error::Overflow)?;
-            writer.push(shifted, u32::try_from(frequency).unwrap_or(u32::MAX))?;
+            let frequency = u32::try_from(frequency).unwrap_or(u32::MAX);
+            writer.push(shifted, frequency)?;
+            // The lengths are the part's own, indexed the way the part numbers
+            // its documents, which is before the shift and not after it.
+            ceilings.push(frequency, lengths.get(doc as usize).copied().unwrap_or(0));
         }
         Ok(())
     }
@@ -912,12 +936,32 @@ fn hash(bytes: &[u8]) -> u32 {
     (state ^ (state >> 32)) as u32
 }
 
+/// The mean document length, in the one place both the writer and the reader can
+/// call so that the two cannot drift apart.
+///
+/// A bound written against one denominator and read against another is not a
+/// bound, so this being one function rather than two copies of a division is the
+/// whole of what keeps them honest.
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    reason = "an average over a corpus is wanted to a few significant figures, \
+              and the division runs in f64 so that only the result is narrowed"
+)]
+pub(crate) fn average(total: u64, documents: u32) -> f32 {
+    if documents == 0 {
+        return 0.0;
+    }
+    (total as f64 / f64::from(documents)) as f32
+}
+
 /// Reads an index out of a segment.
 #[derive(Debug)]
 pub struct Reader<'a> {
     terms: terms::Reader<'a>,
     postings: &'a [u8],
     lengths: &'a [u8],
+    bounds: Option<bound::Reader<'a>>,
     store: Option<store::Reader<'a>>,
     documents: u32,
     total: u64,
@@ -948,10 +992,18 @@ impl<'a> Reader<'a> {
             Some(bytes) => Some(store::Reader::new(bytes)?),
             None => None,
         };
+        // Not every segment has one. A build that predates the section leaves it
+        // out, and so does a segment whose lists are all shorter than a block, so
+        // its absence is an ordinary case rather than a damaged file.
+        let bounds = match segment.section(kind::BOUNDS) {
+            Some(bytes) => Some(bound::Reader::new(bytes)?),
+            None => None,
+        };
         Ok(Self {
             terms: terms::Reader::new(dictionary)?,
             postings,
             lengths,
+            bounds,
             store,
             documents,
             total,
@@ -1001,17 +1053,19 @@ impl<'a> Reader<'a> {
 
     /// The mean document length, which is the denominator BM25 normalises by.
     #[must_use]
-    #[expect(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        reason = "an average over a corpus is wanted to a few significant figures, \
-                  and the division runs in f64 so that only the result is narrowed"
-    )]
     pub fn average_length(&self) -> f32 {
-        if self.documents == 0 {
-            return 0.0;
-        }
-        (self.total as f64 / f64::from(self.documents)) as f32
+        average(self.total, self.documents)
+    }
+
+    /// What each block of postings can score at best, if the segment says.
+    ///
+    /// Nothing that reads this is allowed to need it. A segment written before
+    /// the section existed does not have one, and neither does a segment of
+    /// short lists, so a caller that cannot fall back on a looser bound has a
+    /// bug rather than a missing section.
+    #[must_use]
+    pub const fn bounds(&self) -> Option<&bound::Reader<'a>> {
+        self.bounds.as_ref()
     }
 
     /// The stored fields, or nothing if the index was built without any.
@@ -1026,10 +1080,23 @@ impl<'a> Reader<'a> {
     ///
     /// Returns an error if the dictionary or the posting list does not decode.
     pub fn postings(&self, term: &[u8]) -> Result<Option<posting::Reader<'a>>> {
-        match self.terms.get(term)? {
+        match self.entry(term)? {
             Some(entry) => self.list(entry).map(Some),
             None => Ok(None),
         }
+    }
+
+    /// What the dictionary holds for a term, or nothing if it does not hold it.
+    ///
+    /// [`postings`](Self::postings) is this and [`list`](Self::list) together,
+    /// and is what most callers want. This is for the one that also needs where
+    /// the list sits, because that offset is how the ceilings are keyed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the dictionary does not decode.
+    pub fn entry(&self, term: &[u8]) -> Result<Option<terms::Entry>> {
+        self.terms.get(term)
     }
 
     /// Walks every term in the index, in order.
