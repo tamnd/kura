@@ -11,6 +11,15 @@ homepage.workspace = true
 categories.workspace = true
 keywords.workspace = true
 
+[features]
+default = ["fs"]
+
+# Opening, creating and committing to a store file. On by default, because
+# almost everything that links the engine wants it, and separable because the
+# rest of the crate is byte slices in and byte slices out and builds for targets
+# that have no filesystem.
+fs = []
+
 [lints]
 workspace = true
 
