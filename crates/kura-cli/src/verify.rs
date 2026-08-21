@@ -14,6 +14,15 @@
 //! each stage depends on the one before it: there is no point decoding a posting
 //! list out of a section table that points outside the file.
 //!
+//! A store is that list with three stages in front of it. The superblock, the
+//! two manifest slots, and the segment descriptors that say where in the file
+//! each segment sits, and then the whole list again for every segment the
+//! manifest names. Those three are checked separately because they are the only
+//! parts of a store that a segment cannot see, and because they are where an
+//! interrupted commit lands. A store also gets one check that a bare segment
+//! cannot have at all: the manifest writes down how many documents a segment
+//! holds, the segment holds them, and the two are compared.
+//!
 //! # Why it keeps going after the first failure
 //!
 //! Anything that stops at the first bad byte answers only whether a file is
@@ -48,6 +57,7 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use kura_core::index;
+use kura_core::manifest::{self, Manifest, Superblock};
 use kura_core::mapping::Map;
 use kura_core::segment::{self, Segment};
 use kura_core::store::Scratch;
@@ -73,6 +83,9 @@ impl Outcome {
 
 /// Reads an index all the way through and prints what it found.
 ///
+/// Takes either shape a path can hold, a store or a bare segment, because both
+/// are things the indexer writes and both are things a person ends up holding.
+///
 /// # Errors
 ///
 /// Returns an error only when the file itself cannot be read or the report
@@ -85,21 +98,214 @@ pub fn check(path: &Path, out: &mut impl Write) -> io::Result<Outcome> {
     writeln!(out, "  size {:>26}", self::bytes(as_u64(bytes.len())))?;
     writeln!(out)?;
 
+    // Which decoder gets the bytes, decided by the magic at the front rather
+    // than by handing them to one and then the other and keeping whichever did
+    // not complain. Guessing that way answers a question about a damaged store
+    // with a complaint about a segment header, which sends the person reading it
+    // to the wrong place.
+    let outcome = if manifest::looks_like_a_store(&bytes) {
+        store(&bytes, out)?
+    } else {
+        one_segment(&bytes, None, out)?
+    };
+
+    writeln!(out)?;
+    if outcome.clean() {
+        writeln!(out, "  everything checked passed")?;
+    } else {
+        writeln!(
+            out,
+            "  {} failed, {} not checked",
+            outcome.failures, outcome.skipped
+        )?;
+    }
+    Ok(outcome)
+}
+
+/// Checks the parts of a store that no segment can see, then every segment.
+///
+/// A commit writes one manifest slot and leaves the other alone, exactly so
+/// that a machine which loses power in the middle of it comes back to an older
+/// manifest rather than to nothing. So a store where only one slot decodes is a
+/// store doing what it was designed to do, and this reports which slot is
+/// committed rather than calling the other one damage.
+fn store(file: &[u8], out: &mut impl Write) -> io::Result<Outcome> {
+    let mut outcome = Outcome::default();
+
+    let superblock = match Superblock::decode(file) {
+        Ok(superblock) => superblock,
+        Err(error) => return fatal(out, "superblock", &error),
+    };
+    passed(out, "superblock")?;
+    writeln!(
+        out,
+        "      format {}.{}, {} byte pages",
+        superblock.major, superblock.minor, superblock.page
+    )?;
+
+    // Every slice below is inside the region this proves is present, and they
+    // are the only reason it is proved here rather than left to each decode.
+    let front = usize::try_from(manifest::WAL_OFFSET).unwrap_or(usize::MAX);
+    if file.len() < front {
+        return fatal(
+            out,
+            "manifest",
+            &format!(
+                "a store keeps its manifest in the first {front} bytes and this file has {}",
+                file.len()
+            ),
+        );
+    }
+
+    let a = slot(file, manifest::SLOT_A_OFFSET);
+    let b = slot(file, manifest::SLOT_B_OFFSET);
+    let committed = match manifest::recover(a, b) {
+        Ok(committed) => committed,
+        Err(error) => return fatal(out, "manifest", &error),
+    };
+    let manifest = &committed.manifest;
+    passed(out, "manifest")?;
+    writeln!(
+        out,
+        "      committed in slot {:?} at epoch {}",
+        committed.slot, manifest.epoch
+    )?;
+    match Manifest::decode(slot(file, committed.slot.other().offset())) {
+        Ok(other) => writeln!(out, "      the other slot holds epoch {}", other.epoch)?,
+        // A store starts with one slot written and fills the second on its
+        // second commit, so a slot that does not decode is as much what a new
+        // store looks like as what an interrupted one does. Neither is damage,
+        // and in both cases the slot that did decode is the committed state.
+        Err(_) => writeln!(
+            out,
+            "      the other slot does not decode, which is also what a store looks like before its second commit"
+        )?,
+    }
+
+    writeln!(out)?;
+    writeln!(out, "  documents    {:>12}", manifest.live)?;
+    writeln!(out, "  with deleted {:>12}", manifest.total)?;
+    writeln!(out, "  log          {:>12}", bytes(superblock.wal_len))?;
+    writeln!(out, "  segments     {:>12}", manifest.segments.len())?;
+    // No share of the file here, unlike the sections inside a segment. Most of a
+    // store's length is a log region that is reserved up front and sparse until
+    // something writes into it, so a percentage of the file would say that every
+    // segment is a rounding error and mean nothing.
+    for (n, described) in manifest.segments.iter().enumerate() {
+        writeln!(
+            out,
+            "    {:<4} {:>12}  {:>9} documents  at {}",
+            n + 1,
+            bytes(described.len),
+            described.docs,
+            described.offset,
+        )?;
+    }
+    writeln!(out)?;
+
+    outcome.failures += counts(manifest, out)?;
+
+    let ranges = match manifest::locate(&superblock, manifest, file.len()) {
+        Ok(ranges) => {
+            passed(out, "segment table")?;
+            ranges
+        }
+        Err(error) => {
+            failed(out, "segment table", &error)?;
+            writeln!(
+                out,
+                "      the segments are wherever this table says they are, so none of them were read"
+            )?;
+            outcome.failures += 1;
+            outcome.skipped += manifest.segments.len();
+            return Ok(outcome);
+        }
+    };
+
+    if ranges.is_empty() {
+        writeln!(out)?;
+        writeln!(
+            out,
+            "  this store holds no segments, which is what one looks like before anything is written into it"
+        )?;
+        return Ok(outcome);
+    }
+
+    let held = ranges.len();
+    for (n, range) in ranges.into_iter().enumerate() {
+        writeln!(out)?;
+        writeln!(out, "  segment {} of {held}", n + 1)?;
+        writeln!(out)?;
+        let found = one_segment(&file[range], Some(manifest.segments[n].docs), out)?;
+        outcome.failures += found.failures;
+        outcome.skipped += found.skipped;
+    }
+
+    Ok(outcome)
+}
+
+/// One manifest slot's bytes.
+///
+/// The caller has already proved that the file reaches past both slots, which
+/// is what makes this a slice rather than an option.
+fn slot(file: &[u8], offset: u64) -> &[u8] {
+    let at = usize::try_from(offset).unwrap_or(usize::MAX);
+    &file[at..][..manifest::SLOT_LEN]
+}
+
+/// Checks the totals a manifest carries against the segments it names.
+///
+/// These counts are written down so that opening a store does not have to read
+/// every segment to know how big it is, and anything written down twice can
+/// disagree with itself. A manifest that undercounts is the dangerous direction,
+/// because a query that trusts it ranks against the wrong collection size and
+/// returns plausible answers in the wrong order.
+fn counts(manifest: &Manifest, out: &mut impl Write) -> io::Result<usize> {
+    let held: u64 = manifest
+        .segments
+        .iter()
+        .map(|described| u64::from(described.docs))
+        .sum();
+
+    if manifest.total != held {
+        failed(
+            out,
+            "document counts",
+            &format!(
+                "the manifest totals {} documents and the segments it names hold {held}",
+                manifest.total
+            ),
+        )?;
+        return Ok(1);
+    }
+    if manifest.live > manifest.total {
+        failed(
+            out,
+            "document counts",
+            &format!(
+                "the manifest says {} of {} documents are live",
+                manifest.live, manifest.total
+            ),
+        )?;
+        return Ok(1);
+    }
+
+    passed(out, "document counts")?;
+    Ok(0)
+}
+
+/// Everything that can be checked from inside one segment.
+///
+/// `expected` is what a manifest said this segment holds, for a segment that
+/// came out of a store, and nothing for a bare one.
+fn one_segment(bytes: &[u8], expected: Option<u32>, out: &mut impl Write) -> io::Result<Outcome> {
     let mut outcome = Outcome::default();
 
     // Structure first, and fatally. Everything below reads through the section
     // table, so a table that does not decode leaves nothing else to try.
-    let segment = match Segment::open_without_checksum(&bytes) {
+    let segment = match Segment::open_without_checksum(bytes) {
         Ok(segment) => segment,
-        Err(error) => {
-            failed(out, "structure", &error)?;
-            writeln!(out)?;
-            writeln!(out, "  nothing else can be read out of this file")?;
-            return Ok(Outcome {
-                failures: 1,
-                skipped: 0,
-            });
-        }
+        Err(error) => return fatal(out, "structure", &error),
     };
     passed(out, "structure")?;
 
@@ -115,6 +321,7 @@ pub fn check(path: &Path, out: &mut impl Write) -> io::Result<Outcome> {
         Ok(reader) => {
             passed(out, "sections")?;
             contents(&reader, out)?;
+            outcome.failures += promised(&reader, expected, out)?;
             outcome.failures += postings(&reader, out)?;
             outcome.failures += documents(&reader, out)?;
         }
@@ -128,17 +335,46 @@ pub fn check(path: &Path, out: &mut impl Write) -> io::Result<Outcome> {
         }
     }
 
-    writeln!(out)?;
-    if outcome.clean() {
-        writeln!(out, "  everything checked passed")?;
-    } else {
-        writeln!(
-            out,
-            "  {} failed, {} not checked",
-            outcome.failures, outcome.skipped
-        )?;
-    }
     Ok(outcome)
+}
+
+/// Checks a segment against the number of documents the manifest promised.
+///
+/// Only a store can ask this, because only a store writes the number down in a
+/// second place. It is worth asking because the two drifting apart comes back as
+/// wrong answers rather than as an error: every document past the count the
+/// manifest carries is a document no query will rank, and nothing else in this
+/// file would notice them missing.
+fn promised(
+    reader: &index::Reader<'_>,
+    expected: Option<u32>,
+    out: &mut impl Write,
+) -> io::Result<usize> {
+    let Some(expected) = expected else {
+        return Ok(0);
+    };
+    let found = reader.documents();
+    if found == expected {
+        passed(out, "manifest count")?;
+        return Ok(0);
+    }
+    failed(
+        out,
+        "manifest count",
+        &format!("the manifest says {expected} documents and the segment holds {found}"),
+    )?;
+    Ok(1)
+}
+
+/// A failure that leaves nothing underneath it worth trying.
+fn fatal(out: &mut impl Write, what: &str, error: &dyn fmt::Display) -> io::Result<Outcome> {
+    failed(out, what, error)?;
+    writeln!(out)?;
+    writeln!(out, "  nothing else can be read out of this file")?;
+    Ok(Outcome {
+        failures: 1,
+        skipped: 0,
+    })
 }
 
 /// Prints the section table, which is the map of everything below it.
@@ -432,6 +668,7 @@ fn as_u64(value: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kura_core::file::Store;
     use kura_core::index::Writer;
 
     /// An index with enough in it that the checks have something to walk.
@@ -594,5 +831,239 @@ mod tests {
     fn a_share_of_nothing_is_not_a_division_by_zero() {
         assert_eq!(share(0, 0), "-");
         assert_eq!(share(50, 100), "50.0%");
+    }
+
+    /// How many documents each segment a store test builds holds.
+    const PER_SEGMENT: u32 = 20;
+
+    /// A path of this test's own, under a directory this process shares.
+    fn a_path(name: &str) -> std::path::PathBuf {
+        let directory = std::env::temp_dir().join(format!("kura-verify-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("a temporary directory");
+        let path = directory.join(format!("{name}.kura"));
+        std::fs::remove_file(&path).ok();
+        path
+    }
+
+    /// A store on disk holding `count` segments, each of [`PER_SEGMENT`] docs.
+    ///
+    /// Committed once per segment rather than once at the end, so that a store
+    /// built here has been through the slot alternation the same number of times
+    /// a real one would have.
+    fn a_store(name: &str, count: usize) -> std::path::PathBuf {
+        let path = a_path(name);
+        let mut store =
+            Store::create_with_log(&path, 1, 1_700_000_000, 1 << 20).expect("a new store");
+        for round in 0..count {
+            let mut writer = Writer::new();
+            for id in 0..PER_SEGMENT {
+                writer
+                    .add_with_fields(
+                        &format!("segment {round} document {id} about storage and retrieval"),
+                        [("path", format!("doc{round}-{id}.txt").as_bytes())],
+                    )
+                    .expect("a small document fits");
+            }
+            let segment = writer.finish().expect("what was written decodes");
+            let described = store
+                .append_segment(&segment, PER_SEGMENT, 1_700_000_000)
+                .expect("the segment is written");
+            let mut manifest = store.manifest().clone();
+            manifest.live += u64::from(PER_SEGMENT);
+            manifest.total += u64::from(PER_SEGMENT);
+            manifest.segments.push(described);
+            store.commit(manifest, 1_700_000_001).expect("committed");
+        }
+        path
+    }
+
+    /// Runs the checks over a file already on disk.
+    fn check_file(path: &std::path::Path) -> (String, Outcome) {
+        let mut out = Vec::new();
+        let outcome = check(path, &mut out).expect("the file is readable");
+        (String::from_utf8(out).expect("the report is text"), outcome)
+    }
+
+    /// Rewrites the committed manifest of a store, after changing it.
+    ///
+    /// This is how the tests below build a store that is internally
+    /// inconsistent, which is a thing no amount of correct code will produce and
+    /// a thing a disk will produce eventually.
+    fn recommit(path: &std::path::Path, change: impl FnOnce(&mut kura_core::manifest::Manifest)) {
+        let mut store = Store::open(path).expect("the store opens");
+        let mut manifest = store.manifest().clone();
+        change(&mut manifest);
+        store.commit(manifest, 1_700_000_002).expect("committed");
+    }
+
+    #[test]
+    fn a_store_passes_every_check_and_names_each_segment_it_walked() {
+        // The bug this whole path exists for. A store used to come back as not a
+        // kura file, which reads as total loss on a file that is completely
+        // intact.
+        let path = a_store("store-intact", 3);
+        let (report, outcome) = check_file(&path);
+        assert_eq!(outcome.failures, 0, "{report}");
+        assert_eq!(outcome.skipped, 0, "{report}");
+        assert!(report.contains("everything checked passed"), "{report}");
+        for n in 1..=3 {
+            assert!(report.contains(&format!("segment {n} of 3")), "{report}");
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_store_says_which_slot_it_committed_into() {
+        // Two commits, so both slots hold something and the report can say which
+        // one is current and what the other one is. One commit is the other case
+        // and it is covered by the empty store below.
+        let path = a_store("store-slots", 2);
+        let (report, _) = check_file(&path);
+        assert!(report.contains("committed in slot"), "{report}");
+        assert!(report.contains("the other slot holds epoch"), "{report}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_store_with_nothing_in_it_is_not_a_failure() {
+        // An empty store is a legal state, not a broken one. It is also the only
+        // state where the second manifest slot has never been written, so this
+        // covers the report line that says so.
+        let path = a_store("store-empty", 0);
+        let (report, outcome) = check_file(&path);
+        assert_eq!(outcome.failures, 0, "{report}");
+        assert!(report.contains("holds no segments"), "{report}");
+        assert!(report.contains("before its second commit"), "{report}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_manifest_that_miscounts_a_segment_is_caught() {
+        // The check a bare segment cannot have. Both numbers decode, both are
+        // internally consistent, and they disagree, which on the query path would
+        // be silently missing documents rather than an error.
+        let path = a_store("store-miscount", 1);
+        recommit(&path, |manifest| {
+            manifest.segments[0].docs = PER_SEGMENT - 5;
+            manifest.live = u64::from(PER_SEGMENT - 5);
+            manifest.total = u64::from(PER_SEGMENT - 5);
+        });
+
+        let (report, outcome) = check_file(&path);
+        assert_eq!(outcome.failures, 1, "{report}");
+        assert!(report.contains("FAILED   manifest count"), "{report}");
+        assert!(report.contains("the segment holds 20"), "{report}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_manifest_whose_totals_do_not_add_up_is_caught() {
+        let path = a_store("store-totals", 2);
+        recommit(&path, |manifest| manifest.total += 7);
+
+        let (report, outcome) = check_file(&path);
+        assert!(outcome.failures >= 1, "{report}");
+        assert!(report.contains("FAILED   document counts"), "{report}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_descriptor_that_points_past_the_end_of_the_file_reads_no_segments() {
+        // The dangerous shape, and the reason the report counts what it did not
+        // look at. Two segments are named and neither is reachable, so the answer
+        // is two unchecked and not a clean walk.
+        let path = a_store("store-outside", 2);
+        recommit(&path, |manifest| {
+            manifest.segments[1].offset = 1 << 40;
+        });
+
+        let (report, outcome) = check_file(&path);
+        assert_eq!(outcome.failures, 1, "{report}");
+        assert_eq!(outcome.skipped, 2, "{report}");
+        assert!(report.contains("FAILED   segment table"), "{report}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn damage_inside_a_store_is_reported_against_the_segment_it_is_in() {
+        // What walking the segments separately buys over one verdict for the
+        // file. One of three is damaged, the report says which, and the other two
+        // are reported good, which is the difference between rebuilding one
+        // segment and restoring the store.
+        let path = a_store("store-damaged", 3);
+        let mut bytes = std::fs::read(&path).expect("the store reads");
+        let at = {
+            let (superblock, committed) = manifest::front(&bytes).expect("the front decodes");
+            let ranges =
+                manifest::locate(&superblock, &committed, bytes.len()).expect("they are located");
+            // Into the middle of the second segment, which is past its header and
+            // into a section body.
+            let second = ranges[1].clone();
+            second.start + second.len() / 2
+        };
+        bytes[at] ^= 0x01;
+        std::fs::write(&path, &bytes).expect("the store is rewritten");
+
+        let (report, outcome) = check_file(&path);
+        assert!(outcome.failures >= 1, "{report}");
+        assert!(report.contains("segment 2 of 3"), "{report}");
+        assert!(report.contains("FAILED   checksum"), "{report}");
+        let (before, after) = report
+            .split_once("segment 2 of 3")
+            .expect("the report reached the second segment");
+        assert!(!before.contains("FAILED"), "{before}");
+        let (_, third) = after
+            .split_once("segment 3 of 3")
+            .expect("the report reached the third segment");
+        assert!(!third.contains("FAILED"), "{third}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_store_whose_superblock_is_gone_stops_at_the_superblock() {
+        let path = a_store("store-superblock", 1);
+        let mut bytes = std::fs::read(&path).expect("the store reads");
+        // Past the magic, so it still looks like a store and gets as far as the
+        // decode. Damaging the magic instead would send it down the segment path,
+        // which is a different question and the one the format cannot answer.
+        bytes[16] ^= 0xff;
+        std::fs::write(&path, &bytes).expect("the store is rewritten");
+
+        let (report, outcome) = check_file(&path);
+        assert_eq!(outcome.failures, 1, "{report}");
+        assert!(report.contains("FAILED   superblock"), "{report}");
+        assert!(report.contains("nothing else"), "{report}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_store_with_neither_manifest_slot_readable_stops_at_the_manifest() {
+        let path = a_store("store-noslots", 1);
+        let mut bytes = std::fs::read(&path).expect("the store reads");
+        for slot in [manifest::SLOT_A_OFFSET, manifest::SLOT_B_OFFSET] {
+            let at = usize::try_from(slot).expect("an offset fits");
+            bytes[at..at + manifest::SLOT_LEN].fill(0xff);
+        }
+        std::fs::write(&path, &bytes).expect("the store is rewritten");
+
+        let (report, outcome) = check_file(&path);
+        assert_eq!(outcome.failures, 1, "{report}");
+        assert!(report.contains("FAILED   manifest"), "{report}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_store_truncated_to_its_superblock_says_so_rather_than_slicing() {
+        let path = a_path("store-short");
+        // A superblock and then the end of the file, which is what a store that
+        // was cut off during creation looks like. Every offset in it names a
+        // region that is not there.
+        let superblock = Superblock::new(1, 1_700_000_000).encode();
+        std::fs::write(&path, &superblock).expect("a short store is written");
+
+        let (report, outcome) = check_file(&path);
+        assert_eq!(outcome.failures, 1, "{report}");
+        assert!(report.contains("FAILED   manifest"), "{report}");
+        std::fs::remove_file(&path).ok();
     }
 }
