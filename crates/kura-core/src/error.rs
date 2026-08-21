@@ -112,6 +112,18 @@ pub enum Error {
         tail: u64,
     },
 
+    /// The segments of one search hold more documents between them than a
+    /// single numbering can address.
+    ///
+    /// A segment counts its own documents in 32 bits, and a search across
+    /// segments numbers them one after another so that a page of results is one
+    /// ordered list. The store that runs out of numbers has upwards of four
+    /// billion documents in it and wants splitting rather than a wider integer.
+    TooManyDocuments {
+        /// How many documents the segments hold between them.
+        count: u64,
+    },
+
     /// Two vectors of different lengths were compared, which is a caller bug
     /// rather than a data problem.
     DimensionMismatch {
@@ -223,6 +235,13 @@ impl fmt::Display for Error {
             }
             Self::BadPositions { head, tail } => {
                 write!(f, "log head {head} and tail {tail} do not describe a ring")
+            }
+            Self::TooManyDocuments { count } => {
+                write!(
+                    f,
+                    "these segments hold {count} documents between them, which is more than one \
+                     search can number"
+                )
             }
             Self::DimensionMismatch { left, right } => {
                 write!(f, "vectors of different lengths: {left} and {right}")

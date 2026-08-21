@@ -599,6 +599,17 @@ impl<'a> Reader<'a> {
             .map_or(0, |bytes| u32::from_le_bytes(*bytes))
     }
 
+    /// How many terms the index holds across all of its documents.
+    ///
+    /// The numerator of the mean length, and what a search across several
+    /// segments needs. Such a search cannot average the segments' averages,
+    /// because a mean of means is only the mean when the parts are the same
+    /// size, and segments are not the same size.
+    #[must_use]
+    pub const fn total_length(&self) -> u64 {
+        self.total
+    }
+
     /// The mean document length, which is the denominator BM25 normalises by.
     #[must_use]
     #[expect(
