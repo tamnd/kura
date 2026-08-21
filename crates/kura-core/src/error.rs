@@ -133,6 +133,24 @@ pub enum Error {
         right: usize,
     },
 
+    /// A container said it holds a number of members and holds another, so the
+    /// bytes and the header that describes them disagree.
+    BadCardinality {
+        /// What the header said.
+        stated: usize,
+        /// What the container actually holds.
+        found: usize,
+    },
+
+    /// A container's offset in the header is not where that container is, so
+    /// one of the two is wrong and there is no way to tell which.
+    BadOffset {
+        /// Where the header said the container starts.
+        stated: usize,
+        /// Where reading the containers in order arrived.
+        found: usize,
+    },
+
     /// Input that has to be ascending was not, which every decoder, every
     /// intersection and every binary search in this crate relies on.
     NotSorted {
@@ -285,6 +303,15 @@ impl fmt::Display for Error {
                 write!(f, "vectors of different lengths: {left} and {right}")
             }
             Self::NotSorted { at } => write!(f, "input is not ascending at {at}"),
+            Self::BadCardinality { stated, found } => {
+                write!(f, "a container of {stated} members holds {found}")
+            }
+            Self::BadOffset { stated, found } => {
+                write!(
+                    f,
+                    "a container said it starts at {stated} and starts at {found}"
+                )
+            }
             Self::BadPrefix { shared, available } => {
                 write!(
                     f,
