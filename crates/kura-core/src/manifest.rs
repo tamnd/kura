@@ -584,6 +584,117 @@ pub fn recover(a: &[u8], b: &[u8]) -> Result<Committed> {
     }
 }
 
+/// An offset in a file of `len` bytes, as something a slice can be indexed by.
+///
+/// The offsets in a store are all `u64` because that is what gets written down,
+/// and a slice wants a `usize`. On a target where the two are the same width
+/// this compiles away. On a smaller one it is the honest answer: a file that
+/// reaches past what this machine can address is a file this machine cannot
+/// read, and saying so as a truncation is closer to true than wrapping.
+fn index_of(offset: u64, len: usize) -> Result<usize> {
+    usize::try_from(offset).map_err(|_| Error::Truncated {
+        needed: usize::MAX,
+        available: len,
+    })
+}
+
+/// Reads the committed state off the front of a store.
+///
+/// The superblock and whichever manifest slot won, from the first 132 KiB of a
+/// store's bytes and nothing past them. This is what a reader that already has
+/// the file in front of it needs, and it is deliberately separate from the store
+/// itself, which does the same three decodes and then goes on to want a
+/// descriptor it can write through and a log ring behind it.
+///
+/// # Errors
+///
+/// Returns [`Error::Truncated`] if the bytes are shorter than the superblock
+/// and the two slots, and whatever the superblock or the manifests failed to
+/// decode with otherwise, including [`Error::NoManifest`] when neither slot
+/// reads.
+pub fn front(bytes: &[u8]) -> Result<(Superblock, Manifest)> {
+    let needed = index_of(WAL_OFFSET, bytes.len())?;
+    if bytes.len() < needed {
+        return Err(Error::Truncated {
+            needed,
+            available: bytes.len(),
+        });
+    }
+    let superblock = Superblock::decode(bytes)?;
+    let a = index_of(SLOT_A_OFFSET, bytes.len())?;
+    let b = index_of(SLOT_B_OFFSET, bytes.len())?;
+    let Committed { manifest, .. } = recover(&bytes[a..][..SLOT_LEN], &bytes[b..][..SLOT_LEN])?;
+    Ok((superblock, manifest))
+}
+
+/// Where each of a store's segments sits in a file of `len` bytes.
+///
+/// The check that turns a manifest into something safe to slice with, and the
+/// only place that check lives. A descriptor is a pair of numbers written by a
+/// previous run of a program, and two things can be wrong with it that a decode
+/// will not notice: it can reach past the end of the file, and it can point at
+/// part of the file that is not the segment region. The second one is the
+/// dangerous one, because every byte of it is present and a reader would happily
+/// take a manifest slot for a set of postings.
+///
+/// # Errors
+///
+/// Returns [`Error::Truncated`] for a segment that is not entirely inside `len`,
+/// and [`Error::SectionOutOfRange`] for one that starts before the segment
+/// region does.
+pub fn locate(
+    superblock: &Superblock,
+    manifest: &Manifest,
+    len: usize,
+) -> Result<Vec<core::ops::Range<usize>>> {
+    let mut ranges = Vec::with_capacity(manifest.segments.len());
+    for segment in &manifest.segments {
+        if segment.offset < superblock.segments_offset {
+            return Err(Error::SectionOutOfRange {
+                kind: 0,
+                offset: segment.offset,
+                length: segment.len,
+            });
+        }
+        let start = index_of(segment.offset, len)?;
+        let end = index_of(segment.offset.saturating_add(segment.len), len)?;
+        if end > len {
+            return Err(Error::Truncated {
+                needed: end,
+                available: len,
+            });
+        }
+        ranges.push(start..end);
+    }
+    Ok(ranges)
+}
+
+/// The bytes of every segment in a store, oldest first.
+///
+/// [`front`] and [`locate`] together, for a caller that has the whole store
+/// mapped and wants the segments out of it without opening the file again.
+///
+/// # Errors
+///
+/// As [`front`] and [`locate`].
+pub fn segments_of(bytes: &[u8]) -> Result<Vec<&[u8]>> {
+    let (superblock, manifest) = front(bytes)?;
+    let ranges = locate(&superblock, &manifest, bytes.len())?;
+    Ok(ranges.into_iter().map(|range| &bytes[range]).collect())
+}
+
+/// Whether these bytes begin like a store.
+///
+/// Cheap and not conclusive, which is what it is for: a tool handed a path has
+/// to decide whether it is looking at a store or at a bare segment before it can
+/// decide which decoder to hand the bytes to, and asking both in turn and
+/// keeping whichever did not fail turns a corrupt file into a confusing error
+/// about the wrong format.
+#[must_use]
+pub fn looks_like_a_store(bytes: &[u8]) -> bool {
+    bytes.starts_with(&MAGIC)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -854,5 +965,109 @@ mod tests {
         // a change to the entry layout that quietly halves the capacity has to
         // be a deliberate edit to a written down number.
         assert_eq!(MAX_SEGMENTS, 1022);
+    }
+
+    /// A superblock with a one page log, so that a store laid out in memory for
+    /// a test is a hundred and fifty kilobytes rather than a quarter of a
+    /// gigabyte.
+    fn small() -> Superblock {
+        Superblock::with_log(0x0123_4567_89ab_cdef_fedc_ba98_7654_3210, 1_700_000_000, 1)
+    }
+
+    /// The bytes of a store holding `parts` as its segments, one after another
+    /// in the segment region, with slot A committed and slot B never written.
+    fn store_of(parts: &[&[u8]]) -> Vec<u8> {
+        let block = small();
+        let mut bytes = block.encode();
+        bytes.resize(as_index(block.segments_offset), 0);
+        let mut segments = Vec::with_capacity(parts.len());
+        for part in parts {
+            let offset = bytes.len() as u64;
+            bytes.extend_from_slice(part);
+            bytes.resize(bytes.len().next_multiple_of(PAGE as usize), 0);
+            segments.push(Segment {
+                offset,
+                len: part.len() as u64,
+                docs: 1,
+                ..Segment::default()
+            });
+        }
+        let mut state = manifest(1, 0);
+        state.segments = segments;
+        let slot = state.encode().expect("a manifest");
+        let at = as_index(SLOT_A_OFFSET);
+        bytes[at..at + slot.len()].copy_from_slice(&slot);
+        bytes
+    }
+
+    /// An offset as an index, for a test that knows the numbers are small.
+    fn as_index(offset: u64) -> usize {
+        usize::try_from(offset).expect("a test store fits in memory")
+    }
+
+    #[test]
+    fn the_front_of_a_store_reads_back_what_was_committed() {
+        let bytes = store_of(&[b"first", b"second"]);
+        let (block, state) = front(&bytes).expect("a front");
+        assert_eq!(block, small());
+        assert_eq!(state.epoch, 1);
+        assert_eq!(state.segments.len(), 2);
+    }
+
+    #[test]
+    fn a_store_hands_back_the_bytes_of_every_segment_in_it() {
+        let bytes = store_of(&[b"first", b"second", b"third"]);
+        let found = segments_of(&bytes).expect("segments");
+        assert_eq!(found, vec![&b"first"[..], &b"second"[..], &b"third"[..]]);
+    }
+
+    #[test]
+    fn a_store_with_no_segments_hands_back_nothing_rather_than_failing() {
+        // Which is a different fact from a file that is not a store, and the two
+        // have to stay different: an empty store is what every store is on the
+        // day it is made.
+        let bytes = store_of(&[]);
+        assert_eq!(segments_of(&bytes).expect("segments").len(), 0);
+    }
+
+    #[test]
+    fn a_file_that_stops_before_the_manifest_is_truncated_rather_than_unreadable() {
+        let bytes = store_of(&[b"first"]);
+        let short = &bytes[..as_index(SLOT_B_OFFSET)];
+        assert!(matches!(front(short), Err(Error::Truncated { .. })));
+    }
+
+    #[test]
+    fn a_segment_reaching_past_the_end_of_the_file_is_refused() {
+        let bytes = store_of(&[b"first"]);
+        let (block, state) = front(&bytes).expect("a front");
+        // A file that stops one byte into the segment, which is what a copy
+        // interrupted halfway leaves behind.
+        let cut = as_index(state.segments[0].offset) + 1;
+        assert!(matches!(
+            locate(&block, &state, cut),
+            Err(Error::Truncated { .. })
+        ));
+    }
+
+    #[test]
+    fn a_segment_pointing_at_the_manifest_is_refused() {
+        // The dangerous one. Every byte of it is there, so a length check passes
+        // and a reader goes on to parse a manifest slot as though it were a set
+        // of posting lists.
+        let bytes = store_of(&[b"first"]);
+        let (block, mut state) = front(&bytes).expect("a front");
+        state.segments[0].offset = SLOT_A_OFFSET;
+        assert!(matches!(
+            locate(&block, &state, bytes.len()),
+            Err(Error::SectionOutOfRange { .. })
+        ));
+    }
+
+    #[test]
+    fn a_bare_segment_does_not_look_like_a_store() {
+        assert!(looks_like_a_store(&store_of(&[])));
+        assert!(!looks_like_a_store(&crate::MAGIC));
+        assert!(!looks_like_a_store(b""));
     }
 }

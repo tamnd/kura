@@ -29,12 +29,15 @@ mod verify;
 use std::fmt;
 use std::fs;
 use std::io::{BufWriter, Write as _};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
 use kura_core::analysis::Analyzer;
+use kura_core::file::{Store, Trouble};
 use kura_core::index::{Reader, Writer};
+use kura_core::manifest;
 use kura_core::mapping::Map;
 use kura_core::residency;
 use kura_core::search::Searcher;
@@ -55,6 +58,20 @@ const PATH_FIELD: &str = "path";
 
 /// What a run file calls a run that nobody named.
 const DEFAULT_TAG: &str = "kura";
+
+/// How long the log ring is in a store this tool makes.
+///
+/// Well under the engine's default quarter of a gigabyte, because this tool
+/// builds a segment in memory and appends the finished thing, so it never writes
+/// a record and the ring is there for whatever opens the store next rather than
+/// for anything happening here. The size is fixed when the store is made and
+/// cannot be changed afterwards without moving every segment in the file, so it
+/// is not nothing, but eight megabytes is thousands of records and a store that
+/// wants more than that is a store a program made rather than one made here.
+///
+/// It also keeps the file small on a filesystem that reserves the space a file
+/// says it is long rather than handing it out as it is written to.
+const LOG_LEN: u64 = 8 << 20;
 
 fn main() -> ExitCode {
     match run() {
@@ -82,6 +99,7 @@ usage:
 options:
   -k <n>        how many results, for search and explain (default 10)
   -o <file>     where to write, for index and topics
+  --store       for index, add a segment to a store rather than write a bare one
   --total       for explain, walk for the total as well as the page
   --depth <n>   how deep a run file goes, for topics (default 1000)
   --tag <name>  what the run file calls this run (default kura)
@@ -89,6 +107,11 @@ options:
   --verify      check the index checksum before querying, which reads all of it
   --complete    for eval, score every judged query and not only the answered ones
   --per-query   for eval, print a line per query as well as the averages
+
+an <index> is either a single segment, which is what index writes by default,
+or a store holding any number of them, which is what --store writes into. Every
+command that reads one takes either, and a query over a store searches all of
+its segments together.
 
 formats:
   topics    one query per line, the identifier and the text separated by a tab
@@ -189,9 +212,9 @@ fn topics(args: &[String]) -> Result<(), Failure> {
 
     let index = Path::new(index);
     let bytes = Map::open(index).map_err(|error| Failure::Io(index.to_path_buf(), error))?;
-    let segment = open(&bytes, verify)?;
-    let reader = Reader::open(&segment)?;
-    let searcher = Searcher::new(&reader);
+    let segments = segments_in(&bytes, verify)?;
+    let readers = readers_of(&segments)?;
+    let searcher = Searcher::over(&readers)?;
 
     let queries = Path::new(queries);
     let text = fs::read_to_string(queries).map_err(|e| Failure::Io(queries.to_path_buf(), e))?;
@@ -225,7 +248,11 @@ fn topics(args: &[String]) -> Result<(), Failure> {
         let hits = searcher.search(query, depth)?;
         answered += 1;
         for (rank, hit) in hits.iter().enumerate() {
-            let doc = label(&reader, hit.doc, &field, &mut scratch)?;
+            // A run file is read by another program, so an unnamed document is
+            // its number and nothing else. The word "doc" in front of it would
+            // be part of the identifier as far as a scorer is concerned.
+            let doc = label(&searcher, hit.doc, &field, &mut scratch)?
+                .unwrap_or_else(|| hit.doc.to_string());
             writeln!(
                 writer,
                 "{id}\tQ0\t{doc}\t{}\t{:.6}\t{tag}",
@@ -333,19 +360,36 @@ fn want<'a>(args: &'a [String], at: usize, wanted: &str) -> Result<&'a str, Fail
         .ok_or_else(|| Failure::usage(wanted.to_string()))
 }
 
-/// What to call a document in output a person or another tool will read.
+/// What a document is called, according to a stored field of it.
+///
+/// The identifier goes through the searcher first because hits are numbered
+/// across every segment and stored fields are not. A segment holds its own
+/// documents under its own numbering and knows nothing about the segments before
+/// it, so asking one of them for document forty thousand when the number came
+/// out of a search over eight of them gets an answer, and the answer is about
+/// some other document.
+///
+/// Returns nothing when the document has no such field, or none at all, which is
+/// a different situation from a lookup that failed and is left to the caller to
+/// word.
 fn label(
-    index: &Reader<'_>,
+    searcher: &Searcher<'_, '_>,
     doc: kura_core::DocId,
     field: &str,
     scratch: &mut Scratch,
-) -> Result<String, Failure> {
-    match index.store() {
-        Some(store) => match store.get(doc, scratch)?.field(field)? {
-            Some(value) => Ok(String::from_utf8_lossy(value).into_owned()),
-            None => Ok(doc.to_string()),
-        },
-        None => Ok(doc.to_string()),
+) -> Result<Option<String>, Failure> {
+    let Some((at, local)) = searcher.locate(doc) else {
+        return Ok(None);
+    };
+    let Some(index) = searcher.segments().get(at) else {
+        return Ok(None);
+    };
+    let Some(store) = index.store() else {
+        return Ok(None);
+    };
+    match store.get(local, scratch)?.field(field)? {
+        Some(value) => Ok(Some(String::from_utf8_lossy(value).into_owned())),
+        None => Ok(None),
     }
 }
 
@@ -353,9 +397,11 @@ fn label(
 fn index(args: &[String]) -> Result<(), Failure> {
     let mut inputs: Vec<PathBuf> = Vec::new();
     let mut out: Option<PathBuf> = None;
+    let mut into_store = false;
     let mut at = 0;
     while at < args.len() {
         match args[at].as_str() {
+            "--store" => into_store = true,
             "-o" => {
                 at += 1;
                 let path = args
@@ -402,7 +448,12 @@ fn index(args: &[String]) -> Result<(), Failure> {
     }
     let documents = writer.len();
     let segment = writer.finish()?;
-    fs::write(&out, &segment).map_err(|error| Failure::Io(out.clone(), error))?;
+    let held = if into_store {
+        add_to_store(&out, &segment, documents)?
+    } else {
+        fs::write(&out, &segment).map_err(|error| Failure::Io(out.clone(), error))?;
+        1
+    };
     let took = started.elapsed();
 
     println!(
@@ -412,10 +463,71 @@ fn index(args: &[String]) -> Result<(), Failure> {
         report::bytes(segment.len() as u64),
         took
     );
+    if into_store {
+        println!("{} now holds {held} segments", out.display());
+    }
     if skipped > 0 {
         println!("skipped {skipped} files that were not text");
     }
     Ok(())
+}
+
+/// Adds one segment to a store, making the store first if it is not there.
+///
+/// Returns how many segments the store holds afterwards.
+///
+/// Append then commit, which is the order the store insists on and the reason
+/// this is safe to run twice over the same file. If the machine stops between
+/// the two, the segment is bytes nobody names and the next run puts its own over
+/// the top of them. What cannot happen is a store that names a segment which is
+/// not there.
+fn add_to_store(path: &Path, segment: &[u8], documents: usize) -> Result<usize, Failure> {
+    let now = now();
+    let mut store = if path.exists() {
+        Store::open(path)
+    } else {
+        Store::create_with_log(path, identity(path, now), now, LOG_LEN)
+    }
+    .map_err(|trouble| Failure::Store(path.to_path_buf(), trouble))?;
+
+    let docs = u32::try_from(documents)
+        .map_err(|_| Failure::usage("more documents than a single segment can number"))?;
+    let mut manifest = store.manifest().clone();
+    let written = store
+        .append_segment(segment, docs, now)
+        .map_err(|trouble| Failure::Store(path.to_path_buf(), trouble))?;
+    manifest.live = manifest.live.saturating_add(u64::from(docs));
+    manifest.total = manifest.total.saturating_add(u64::from(docs));
+    manifest.segments.push(written);
+    let held = manifest.segments.len();
+    store
+        .commit(manifest, now)
+        .map_err(|trouble| Failure::Store(path.to_path_buf(), trouble))?;
+    Ok(held)
+}
+
+/// Now, in unix nanoseconds, or zero on a machine whose clock is before 1970.
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_nanos()).unwrap_or(u64::MAX)
+        })
+}
+
+/// An identifier for a new store.
+///
+/// It exists so that a segment found loose somewhere can be tested for having
+/// come from this store, which wants two stores made a moment apart on the same
+/// machine to differ. The clock, the process and the path are enough for that.
+/// It is not a random number and it is not trying to be one: nothing here rests
+/// on it being unguessable.
+fn identity(path: &Path, now: u64) -> u128 {
+    let mut seed = Vec::with_capacity(64);
+    seed.extend_from_slice(&now.to_le_bytes());
+    seed.extend_from_slice(&std::process::id().to_le_bytes());
+    seed.extend_from_slice(path.to_string_lossy().as_bytes());
+    kura_core::xxh3::hash128(&seed)
 }
 
 /// Opens a mapped index, checking the checksum only when asked to.
@@ -444,6 +556,54 @@ fn open(bytes: &[u8], verify: bool) -> Result<Segment<'_>, Failure> {
     } else {
         Ok(Segment::open_without_checksum(bytes)?)
     }
+}
+
+/// Every segment in a mapped index file, whatever kind of file it is.
+///
+/// A store and a bare segment are told apart by the first eight bytes rather
+/// than by trying one decoder and falling back to the other when it fails. The
+/// fallback reads fine and behaves badly: a damaged store would fail the store
+/// decode, get handed to the segment decode, fail that too, and report the
+/// second failure, so a person with a torn manifest would be told their file is
+/// not a segment. It is not, and that was never the question.
+fn segments_in(bytes: &[u8], verify: bool) -> Result<Vec<Segment<'_>>, Failure> {
+    Ok(parts_of(bytes, verify)?.0)
+}
+
+/// The segments, and the stretch of the file they sit in.
+///
+/// The second one is for the residency probe, which reports how much of the
+/// index was already in memory and needs to know what counts as the index. In a
+/// store that is the segment region and not the file: the log is a sparse
+/// quarter of the file that a query never reads, and counting it in the
+/// denominator turns a warm index into a cold looking percentage.
+fn parts_of(bytes: &[u8], verify: bool) -> Result<(Vec<Segment<'_>>, Range<usize>), Failure> {
+    if manifest::looks_like_a_store(bytes) {
+        let (superblock, state) = manifest::front(bytes)?;
+        let ranges = manifest::locate(&superblock, &state, bytes.len())?;
+        let start = ranges.iter().map(|range| range.start).min().unwrap_or(0);
+        let end = ranges.iter().map(|range| range.end).max().unwrap_or(0);
+        let segments = ranges
+            .into_iter()
+            .map(|range| open(&bytes[range], verify))
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok((segments, start..end));
+    }
+    Ok((vec![open(bytes, verify)?], 0..bytes.len()))
+}
+
+/// A reader per segment, in the order the segments were written.
+///
+/// Separate from [`segments_in`] because the borrow runs one way down the chain
+/// and cannot be tied in a knot: the mapping owns the bytes, the segments borrow
+/// the mapping, the readers borrow the segments, and the searcher borrows the
+/// readers. Each of those has to be a local of its own in the function that
+/// wants the searcher.
+fn readers_of<'a>(segments: &[Segment<'a>]) -> Result<Vec<Reader<'a>>, Failure> {
+    segments
+        .iter()
+        .map(|segment| Ok(Reader::open(segment)?))
+        .collect()
 }
 
 /// Runs a query, and says what it did when `explaining`.
@@ -485,9 +645,10 @@ fn query(args: &[String], explaining: bool) -> Result<(), Failure> {
     // query cost, and reading the index first charges the query for a copy of
     // an index it will touch a fraction of. See [`map`].
     let bytes = Map::open(path).map_err(|error| Failure::Io(path.to_path_buf(), error))?;
-    let segment = open(&bytes, verify)?;
-    let index = Reader::open(&segment)?;
-    let searcher = Searcher::new(&index);
+    let (segments, region) = parts_of(&bytes, verify)?;
+    let readers = readers_of(&segments)?;
+    let searcher = Searcher::over(&readers)?;
+    let index = &bytes[region];
 
     // Which walk is being explained matters more than it looks. Asking for the
     // total as well as the page means every matching document has to be visited
@@ -501,14 +662,14 @@ fn query(args: &[String], explaining: bool) -> Result<(), Failure> {
         // already in memory and how much of it this query had to fetch. Only
         // `explain` pays for it, and only `explain` prints it.
         (true, false) => {
-            let ((hits, total), counters) = residency::measured(&bytes, || {
+            let ((hits, total), counters) = residency::measured(index, || {
                 let (hits, counters) = searcher.search_explained(&text, k)?;
                 Ok::<_, Failure>(((hits, None), counters))
             })?;
             (hits, total, counters)
         }
         (true, true) => {
-            let ((hits, total), counters) = residency::measured(&bytes, || {
+            let ((hits, total), counters) = residency::measured(index, || {
                 let (hits, total, counters) = searcher.search_and_count_explained(&text, k)?;
                 Ok::<_, Failure>(((hits, Some(total)), counters))
             })?;
@@ -527,7 +688,7 @@ fn query(args: &[String], explaining: bool) -> Result<(), Failure> {
         } else {
             report::Walk::Page
         };
-        report::plan(&text, &index, &mut std::io::stdout()).map_err(Failure::Stdout)?;
+        report::plan(&text, &readers, &mut std::io::stdout()).map_err(Failure::Stdout)?;
         report::counters(&counters, took, walk, &mut std::io::stdout()).map_err(Failure::Stdout)?;
     }
 
@@ -537,14 +698,9 @@ fn query(args: &[String], explaining: bool) -> Result<(), Failure> {
     }
     let mut scratch = Scratch::new();
     for (rank, hit) in hits.iter().enumerate() {
-        let label = match index.store() {
-            Some(store) => match store.get(hit.doc, &mut scratch)?.field(PATH_FIELD)? {
-                Some(path) => String::from_utf8_lossy(path).into_owned(),
-                None => format!("doc {}", hit.doc),
-            },
-            None => format!("doc {}", hit.doc),
-        };
-        println!("{:>3}  {:>8.4}  {label}", rank + 1, hit.score);
+        let named = label(&searcher, hit.doc, PATH_FIELD, &mut scratch)?
+            .unwrap_or_else(|| format!("doc {}", hit.doc));
+        println!("{:>3}  {:>8.4}  {named}", rank + 1, hit.score);
     }
     Ok(())
 }
@@ -625,6 +781,8 @@ enum Failure {
     Empty(PathBuf, &'static str),
     /// The engine refused the data.
     Engine(kura_core::Error),
+    /// A store could not be opened, added to or committed, and which one.
+    Store(PathBuf, Trouble),
     /// An index was read through and found to be damaged, and how badly.
     Damaged(PathBuf, usize),
 }
@@ -650,6 +808,7 @@ impl fmt::Display for Failure {
             Self::Format(path, bad) => write!(f, "{}: {bad}", path.display()),
             Self::Empty(path, why) => write!(f, "{}: {why}", path.display()),
             Self::Engine(error) => write!(f, "{error}"),
+            Self::Store(path, trouble) => write!(f, "{}: {trouble}", path.display()),
             Self::Damaged(path, count) => {
                 write!(f, "{}: {count} checks failed", path.display())
             }
@@ -719,5 +878,154 @@ mod tests {
         let rubbish = vec![0x5a_u8; 4_096];
         assert!(open(&rubbish, false).is_err());
         assert!(open(&rubbish, true).is_err());
+    }
+
+    /// A directory of this test's own, named after the test that asked for it.
+    fn scratch_dir(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("kura-cli-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).expect("a directory to work in");
+        path
+    }
+
+    const WORDS: [&str; 6] = ["ledger", "invoice", "quarter", "ledger", "audit", "ledger"];
+
+    /// Writes `count` files of made up prose into `dir`, numbered from `from`.
+    fn documents(dir: &Path, from: usize, count: usize) -> PathBuf {
+        fs::create_dir_all(dir).expect("a directory");
+        for n in from..from + count {
+            let mut text = String::new();
+            for step in 0..=(n % 5) {
+                text.push_str(WORDS[(n + step) % WORDS.len()]);
+                text.push(' ');
+            }
+            fs::write(dir.join(format!("{n}.txt")), text).expect("a document");
+        }
+        dir.to_path_buf()
+    }
+
+    /// The page a query gets out of an index file, as scores alone, which is
+    /// what has to match across two files holding the same corpus. The labels
+    /// cannot match: they are the paths the documents were indexed from, and the
+    /// two indexes were built from different directories.
+    fn scores(index: &Path, query: &str, k: usize) -> Vec<f32> {
+        let bytes = Map::open(index).expect("a mapped index");
+        let segments = segments_in(&bytes, true).expect("segments");
+        let readers = readers_of(&segments).expect("readers");
+        let searcher = Searcher::over(&readers).expect("a searcher");
+        searcher
+            .search(query, k)
+            .expect("searched")
+            .into_iter()
+            .map(|hit| hit.score)
+            .collect()
+    }
+
+    #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "the two pages are the same arithmetic over the same corpus, so \
+                  anything but an exact match is the merge getting it wrong"
+    )]
+    fn a_store_of_four_segments_answers_the_way_one_segment_does() {
+        // The end of the chain that started with the reader searching across
+        // segments. Four separate runs of `index --store` over a quarter of the
+        // corpus each, against one run over all of it, asked the same questions.
+        let dir = scratch_dir("store-vs-segment");
+        let corpus = documents(&dir.join("corpus"), 0, 120);
+
+        let whole = dir.join("whole.kura");
+        index(&[
+            corpus.to_string_lossy().into_owned(),
+            "-o".into(),
+            whole.to_string_lossy().into_owned(),
+        ])
+        .expect("one segment");
+
+        let store = dir.join("many.kura");
+        for part in 0..4 {
+            let piece = documents(&dir.join(format!("part{part}")), part * 30, 30);
+            index(&[
+                piece.to_string_lossy().into_owned(),
+                "-o".into(),
+                store.to_string_lossy().into_owned(),
+                "--store".into(),
+            ])
+            .expect("a segment in a store");
+        }
+
+        for query in ["ledger", "invoice quarter", "ledger audit invoice"] {
+            let one = scores(&whole, query, 20);
+            let four = scores(&store, query, 20);
+            assert_eq!(one.len(), four.len(), "{query}");
+            for (at, (a, b)) in one.iter().zip(&four).enumerate() {
+                assert_eq!(a, b, "{query} at rank {}", at + 1);
+            }
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_store_is_told_from_a_segment_by_its_first_bytes() {
+        let dir = scratch_dir("told-apart");
+        let corpus = documents(&dir.join("corpus"), 0, 8);
+
+        let bare = dir.join("bare.kura");
+        index(&[
+            corpus.to_string_lossy().into_owned(),
+            "-o".into(),
+            bare.to_string_lossy().into_owned(),
+        ])
+        .expect("one segment");
+        let store = dir.join("store.kura");
+        index(&[
+            corpus.to_string_lossy().into_owned(),
+            "-o".into(),
+            store.to_string_lossy().into_owned(),
+            "--store".into(),
+        ])
+        .expect("a store");
+
+        let bare = Map::open(&bare).expect("mapped");
+        assert!(!manifest::looks_like_a_store(&bare));
+        assert_eq!(segments_in(&bare, true).expect("segments").len(), 1);
+
+        let store = Map::open(&store).expect("mapped");
+        assert!(manifest::looks_like_a_store(&store));
+        assert_eq!(segments_in(&store, true).expect("segments").len(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_plan_says_how_many_segments_the_query_covers() {
+        let dir = scratch_dir("plan-segments");
+        let store = dir.join("store.kura");
+        for part in 0..3 {
+            let piece = documents(&dir.join(format!("part{part}")), part * 10, 10);
+            index(&[
+                piece.to_string_lossy().into_owned(),
+                "-o".into(),
+                store.to_string_lossy().into_owned(),
+                "--store".into(),
+            ])
+            .expect("a segment in a store");
+        }
+
+        let bytes = Map::open(&store).expect("mapped");
+        let segments = segments_in(&bytes, true).expect("segments");
+        let readers = readers_of(&segments).expect("readers");
+        let mut out = Vec::new();
+        report::plan("ledger nonesuch", &readers, &mut out).expect("writes");
+        let text = String::from_utf8(out).expect("ascii");
+
+        assert!(text.contains("segments 3 searched together"), "{text}");
+        // Absent everywhere is absent. Present in one is present, with the count
+        // summed over the three.
+        assert!(text.contains("absent"), "{text}");
+        assert!(text.contains("terms    1 of 2"), "{text}");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -491,25 +491,17 @@ impl Store {
     /// one starts before the segment region does.
     pub fn view(&self) -> Result<View> {
         let map = Map::of(&self.file)?;
-        let segments = self.manifest.segments.clone();
-        let start = self.superblock.segments_offset;
-        for segment in &segments {
-            let end = segment.offset.saturating_add(segment.len);
-            if end > map.len() as u64 {
-                return Err(Trouble::Format(Error::Truncated {
-                    needed: as_usize(end),
-                    available: map.len(),
-                }));
-            }
-            if segment.offset < start {
-                return Err(Trouble::Format(Error::SectionOutOfRange {
-                    kind: 0,
-                    offset: segment.offset,
-                    length: segment.len,
-                }));
-            }
-        }
-        Ok(View { map, segments })
+        // The same check a reader with only the bytes has to make, out of the
+        // same function, so that a descriptor a view refuses is a descriptor the
+        // command line tool refuses too. Two implementations of this would
+        // disagree eventually, and the way they would disagree is that one of
+        // them lets a bad descriptor through.
+        let ranges = crate::manifest::locate(&self.superblock, &self.manifest, map.len())?;
+        Ok(View {
+            map,
+            segments: self.manifest.segments.clone(),
+            ranges,
+        })
     }
 
     /// Walks the records the log holds and hands each one to `each`.
@@ -627,9 +619,11 @@ impl Store {
 pub struct View {
     /// The whole store file.
     map: Map,
-    /// The segments the manifest named when this was taken, checked against the
-    /// mapping so that every slice below is inside it.
+    /// The segments the manifest named when this was taken.
     segments: Vec<Segment>,
+    /// Where each of them sits in the mapping, checked once when the view was
+    /// taken so that every slice below is known to be inside it.
+    ranges: Vec<core::ops::Range<usize>>,
 }
 
 impl View {
@@ -658,10 +652,7 @@ impl View {
     /// that can fail on bytes.
     #[must_use]
     pub fn bytes(&self, at: usize) -> Option<&[u8]> {
-        let segment = self.segments.get(at)?;
-        let start = as_usize(segment.offset);
-        let end = as_usize(segment.offset.saturating_add(segment.len));
-        self.map.get(start..end)
+        self.map.get(self.ranges.get(at)?.clone())
     }
 
     /// Every segment's bytes, oldest first.
