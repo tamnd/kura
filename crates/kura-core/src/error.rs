@@ -151,6 +151,21 @@ pub enum Error {
         at: usize,
     },
 
+    /// A batch worked out what to delete from a view of the store that is no
+    /// longer the committed one.
+    ///
+    /// A batch replacing documents holds a set of deletions per segment, and a
+    /// set is the whole answer for its segment, so it is only right about the
+    /// store it read. Committing it against a store that has moved since would
+    /// undo whatever the commit in between deleted. The batch has to be built
+    /// again on a view of where the store is now.
+    StaleView {
+        /// The epoch the batch read.
+        read: u64,
+        /// The epoch the store is at.
+        committed: u64,
+    },
+
     /// A set of deletions names a document the segment it belongs to does not
     /// have, so the two came from different builds of the same store.
     NoSuchDocument {
@@ -348,6 +363,12 @@ impl fmt::Display for Error {
             }
             Self::RepeatedSegment { at } => {
                 write!(f, "one commit names segment {at} twice")
+            }
+            Self::StaleView { read, committed } => {
+                write!(
+                    f,
+                    "this batch was built on epoch {read} and the store is at {committed}"
+                )
             }
             Self::NoSuchDocument { doc, documents } => {
                 write!(
