@@ -298,7 +298,16 @@ fn counts(manifest: &Manifest, out: &mut impl Write) -> io::Result<usize> {
 ///
 /// `expected` is what a manifest said this segment holds, for a segment that
 /// came out of a store, and nothing for a bare one.
-fn one_segment(bytes: &[u8], expected: Option<u32>, out: &mut impl Write) -> io::Result<Outcome> {
+///
+/// Public to the crate because `repair` decides what to drop out of a store by
+/// asking this about each segment in turn, and a repair that made that decision
+/// on a cheaper check than the one `verify` prints would be a tool that dropped
+/// segments `verify` had just called good.
+pub fn one_segment(
+    bytes: &[u8],
+    expected: Option<u32>,
+    out: &mut impl Write,
+) -> io::Result<Outcome> {
     let mut outcome = Outcome::default();
 
     // Structure first, and fatally. Everything below reads through the section
