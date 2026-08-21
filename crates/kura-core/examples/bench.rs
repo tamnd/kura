@@ -640,6 +640,46 @@ fn bitmaps() {
             black_box(left.len());
         },
     );
+
+    // A reader in a company wide group, which is what a permission filter looks
+    // like most of the time: one long stretch with a few holes punched in it.
+    let allowed: Bitmap = (0..5_000_000u32).filter(|i| i % 100_000 != 0).collect();
+    let candidates: Bitmap = (0..1_000_000u32).map(|i| i * 5).collect();
+    bench(
+        "filter a query by a group wide permission",
+        1_000_000,
+        || {
+            let mut left = candidates.clone();
+            left.intersect_with(black_box(&allowed));
+            black_box(left.len());
+        },
+    );
+
+    // The set a contractor with access to two folders produces: a few thousand
+    // ids scattered across a corpus of a hundred million.
+    let scattered: Bitmap = (0..5_000u32).map(|i| i * 20_000).collect();
+    bench(
+        "filter a query by a scattered permission",
+        1_000_000,
+        || {
+            let mut left = candidates.clone();
+            left.intersect_with(black_box(&scattered));
+            black_box(left.len());
+        },
+    );
+
+    fact(
+        "bitmap_memory",
+        &format!(
+            "bitmaps: {} KiB for a group wide filter of five million, {} bytes for a scattered filter of five thousand",
+            allowed.memory() / 1024,
+            scattered.memory()
+        ),
+        vec![
+            ("group_filter_bytes", allowed.memory() as f64),
+            ("scattered_filter_bytes", scattered.memory() as f64),
+        ],
+    );
 }
 
 /// The two block codecs side by side, on the same ids.
