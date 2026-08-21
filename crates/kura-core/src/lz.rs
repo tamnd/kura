@@ -31,12 +31,70 @@
 //! The last sequence in a block is literals with no match after it, which is
 //! how the decoder knows a block has ended without a terminator.
 //!
-//! The compatibility claim was checked both ways against the reference lz4
-//! binary rather than assumed: half a megabyte of this crate's own source
-//! compressed here and decompressed there, and the same source compressed
-//! there at both ends of its level range and decompressed here. The test that
-//! stays behind is a block written out by hand, which is the part of that check
-//! that does not need a second implementation installed to run.
+//! The compatibility claim is checked both ways against the reference lz4
+//! binary rather than assumed, and rechecked whenever the encoder changes:
+//! nine hundred kilobytes of this crate's own source compressed here and
+//! decompressed there, and the same source compressed there at both ends of its
+//! level range and decompressed here. A block is wrapped in the legacy frame
+//! for that, which is a magic number and a length and carries no checksum, so
+//! it can be written without a second hash function. The test that stays behind
+//! is a block written out by hand, which is the part of that check that does not
+//! need a second implementation installed to run.
+//!
+//! # Finding the matches
+//!
+//! The format says what a block looks like and says nothing about which matches
+//! go in it, and that second part is where the ratio comes from. Two encoders
+//! that both write this format can differ by a third on the same input.
+//!
+//! Every position goes into a table under the hash of its four bytes, and every
+//! table entry points at the position before it that hashed the same way, so a
+//! search can walk the sixteen nearest candidates and keep the longest rather
+//! than take the first one it is handed. It then looks one byte further on, and
+//! when there is a longer match there it spends a literal to reach it, because
+//! a greedy encoder that takes the first match it finds pays for that choice for
+//! the rest of the block: the match it took is where the next search has to
+//! start.
+//!
+//! In blocks of eight kilobytes, which is the size the stored fields are written
+//! in, that is worth eight percent of the section on real prose and twenty two
+//! on generated text. Ten megabytes of markdown compressed to 0.603 of itself
+//! taking the first candidate and 0.557 this way, and the benchmark's corpus to
+//! 0.389 and 0.301. On disk the store went from 0.399 of the corpus to 0.314.
+//!
+//! It costs three to seven times the compression speed in blocks that size, and
+//! thirteen when a whole file is one block and the chains are as long as the
+//! file. That is paid once, when a segment is written. On the other side, which
+//! is the one a query is on, nothing is given up: the blocks are made of fewer
+//! and longer sequences, so eight kilobytes comes back a few percent faster than
+//! it did, and reading one stored document at random got five percent quicker.
+//!
+//! # Why not zstd
+//!
+//! Because it would be the core crate's first dependency, and because writing
+//! one here is a much larger surface than this is.
+//!
+//! It would be smaller. Measured on the same three corpora in the same eight
+//! kilobyte blocks, `zstd -3` reaches 0.423 on the markdown against 0.557 here,
+//! and 0.348 on a directory of Rust source against 0.458. That is a fifth to a
+//! quarter off the largest section in a segment and it is not a rounding error.
+//! Almost all of it is the entropy stage, which is the part no encoder for this
+//! format can have, so it is not something a better match finder closes.
+//!
+//! What it costs is decompression speed, which is the side a query is on.
+//! Blocks of eight kilobytes decompress here at between 1.8 and 2.2 gigabytes a
+//! second and through `zstd -3` at between 0.3 and 0.7, so the section that is a
+//! quarter smaller takes three to five times as long to read back.
+//!
+//! The dependency is the part that settles it rather than the ratio. `zstd-sys`
+//! is a C library, and this crate cross builds for `wasm32-unknown-unknown` in
+//! CI, where there is no C toolchain; `ruzstd` decompresses and does not
+//! compress. Writing zstd here means FSE, Huffman, the sequence format and the
+//! frame, on a decode path that has to refuse every hostile byte sequence
+//! without panicking. That is a project and not a change, so it is
+//! [issue #76][zstd] rather than a paragraph in this one.
+//!
+//! [zstd]: https://github.com/tamnd/kura/issues/76
 
 use crate::error::{Error, Result};
 
@@ -68,12 +126,40 @@ const MF_LIMIT: usize = 12;
 /// The furthest back a match may point, which is what fits in two bytes.
 const MAX_DISTANCE: usize = 65535;
 
-/// How many entries the match finder's table has.
+/// How many entries the match finder's table of heads has.
 ///
 /// Sixteen thousand slots for a block of a few tens of kilobytes, which is
 /// enough that collisions are rare and small enough that the table stays in
 /// cache alongside the block it is indexing.
 const HASH_LOG: u32 = 14;
+
+/// How many positions the chain remembers.
+///
+/// A match cannot point further back than [`MAX_DISTANCE`], so a position more
+/// than that many bytes ago is of no use to anybody and its slot is free to be
+/// reused. Two positions that land in the same slot are 65536 apart, and the
+/// one that is still reachable is the later of them.
+const CHAIN: usize = MAX_DISTANCE + 1;
+
+/// How many candidates the search looks at before it takes what it has.
+///
+/// The chain for a hash is in most recent order, so the search is looking at
+/// the nearest matches first and giving up while the ones left are the distant
+/// ones. Sixteen was measured rather than guessed. Over ten megabytes of prose
+/// in blocks of eight kilobytes, four is 0.9 percent larger and sixty four is
+/// 0.4 percent smaller for half again the time, so the curve has flattened out
+/// by here. It flattens because a block holds eight kilobytes of history and
+/// there is only so much in it to find.
+const SEARCH_DEPTH: usize = 16;
+
+/// The match length at which the search stops looking for a better one.
+///
+/// A match this long already costs about a byte for every sixty four it covers,
+/// so the most a longer one can save is under two percent of what is left, and
+/// the search is not free. This is what keeps a run of one repeated byte from
+/// walking the whole chain at every position: the first candidate covers the
+/// rest of the block, and there is nothing further to ask.
+const LONG_ENOUGH: usize = 64;
 
 /// The multiplier of a Fibonacci hash, which is the odd integer nearest to two
 /// to the thirty second over the golden ratio.
@@ -96,15 +182,34 @@ pub const fn bound(len: usize) -> usize {
     len + len / 255 + 16
 }
 
+/// A match the search settled on, after it had looked at the alternatives.
+struct Found {
+    /// Where the match starts in the input, which is at or before the position
+    /// the hash was taken at, because a match usually reaches back further than
+    /// the four bytes that found it.
+    start: usize,
+    /// Where the earlier copy of those bytes starts.
+    back: usize,
+    /// How many bytes the two have in common from `start` and `back` on.
+    length: usize,
+}
+
 /// Finds matches and writes blocks.
 ///
-/// The table is owned by the compressor rather than made per block, because a
+/// The tables are owned by the compressor rather than made per block, because a
 /// table made per block is either an allocation or a memset on the hot path and
 /// this format is fast enough that either one would show.
 #[derive(Debug)]
 pub struct Compressor {
-    table: Vec<u32>,
-    /// What is added to a position before it goes in the table, so that entries
+    /// The most recent position whose four bytes hashed into each slot.
+    heads: Vec<u32>,
+    /// For each position, the position before it that hashed the same way.
+    ///
+    /// Following this from a head walks every position with that hash, most
+    /// recent first, which is what makes it possible to keep looking after the
+    /// first candidate rather than take it.
+    chain: Vec<u32>,
+    /// What is added to a position before it goes in a table, so that entries
     /// from earlier blocks are recognisably stale without clearing anything.
     base: u32,
 }
@@ -117,10 +222,14 @@ impl Default for Compressor {
 
 impl Compressor {
     /// Creates a compressor.
+    ///
+    /// The two tables together are three hundred and twenty kilobytes, which is
+    /// the price of the chain and is paid once per writer rather than per block.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            table: vec![0; 1 << HASH_LOG],
+            heads: vec![0; 1 << HASH_LOG],
+            chain: vec![0; CHAIN],
             // Positions start at one so that a zeroed table holds nothing that
             // can be mistaken for a position in the first block.
             base: 1,
@@ -144,6 +253,7 @@ impl Compressor {
         }
 
         let limit = input.len() - MF_LIMIT;
+        let end = input.len() - LAST_LITERALS;
         let mut anchor = 0usize;
         // Position zero is never a candidate, which costs one byte of ratio and
         // keeps the table's empty value unambiguous.
@@ -151,44 +261,50 @@ impl Compressor {
         let mut misses: u32 = 1 << SKIP_TRIGGER;
 
         while ip < limit {
-            let sequence = word(input, ip);
-            let slot = hash(sequence);
-            let candidate = self.table[slot];
-            // A block is far smaller than four gigabytes, so the position
-            // fits, and a block that somehow did not would only cost ratio.
-            self.table[slot] = self
-                .base
-                .wrapping_add(u32::try_from(ip).unwrap_or(u32::MAX));
+            let found = self.longest(input, ip, anchor, end);
+            self.insert(input, ip);
 
-            let Some(mut back) = self.candidate(candidate, ip) else {
+            let Some(mut found) = found else {
                 ip += (misses >> SKIP_TRIGGER) as usize;
                 misses += 1;
                 continue;
             };
-            if word(input, back) != sequence {
-                ip += (misses >> SKIP_TRIGGER) as usize;
-                misses += 1;
-                continue;
-            }
             misses = 1 << SKIP_TRIGGER;
 
-            // A match usually starts before the position the hash found, since
-            // the hash only looks at four bytes. Walking backwards costs a byte
-            // comparison each and takes those bytes out of the literal run.
-            let mut start = ip;
-            while start > anchor && back > 0 && input[start - 1] == input[back - 1] {
-                start -= 1;
-                back -= 1;
+            // One byte further on there may be a longer match, and when there
+            // is, spending a literal to reach it costs a byte and saves more.
+            // A greedy encoder takes the first match it finds and pays for that
+            // for the rest of the block, because the match it took is what the
+            // next search has to start after.
+            let mut inserted = ip + 1;
+            if found.length < LONG_ENOUGH && ip + 1 < limit {
+                let later = self.longest(input, ip + 1, anchor, end);
+                self.insert(input, ip + 1);
+                inserted = ip + 2;
+                if let Some(later) = later
+                    && later.length > found.length
+                {
+                    found = later;
+                }
             }
 
-            let mut length = MIN_MATCH;
-            let end = input.len() - LAST_LITERALS;
-            while start + length < end && input[start + length] == input[back + length] {
-                length += 1;
+            let stop = found.start + found.length;
+            sequence_out(
+                out,
+                &input[anchor..found.start],
+                found.start - found.back,
+                found.length,
+            );
+
+            // Every position the match covered still goes into the tables. The
+            // encoder is done with them, but the next search is not, and a chain
+            // with the inside of every match missing from it is a chain that
+            // finds the second copy of a phrase and not the third.
+            for at in inserted.min(stop)..stop.min(limit) {
+                self.insert(input, at);
             }
 
-            sequence_out(out, &input[anchor..start], start - back, length);
-            ip = start + length;
+            ip = stop;
             anchor = ip;
         }
 
@@ -197,13 +313,91 @@ impl Compressor {
 
     /// How many bytes this compressor is holding.
     ///
-    /// The table, which is the same size from the moment it is made and never
-    /// grows. It is here because a caller adding up what it holds would
+    /// The two tables, which are the same size from the moment they are made and
+    /// never grow. It is here because a caller adding up what it holds would
     /// otherwise have to know that number, and a constant somebody else has to
     /// know is a constant that goes stale.
     #[must_use]
     pub fn held(&self) -> usize {
-        self.table.capacity() * core::mem::size_of::<u32>()
+        (self.heads.capacity() + self.chain.capacity()) * core::mem::size_of::<u32>()
+    }
+
+    /// The longest match at `at`, or nothing if there is none worth encoding.
+    ///
+    /// The chain is walked most recent first and the walk stops at
+    /// [`SEARCH_DEPTH`] candidates, or sooner if it reaches one that is out of
+    /// range or is not further back than the one before it. That last check is
+    /// what keeps a chain that two distant positions have shared a slot in from
+    /// being walked in circles.
+    fn longest(&self, input: &[u8], at: usize, anchor: usize, end: usize) -> Option<Found> {
+        let sequence = word(input, at);
+        let mut entry = self.heads[hash(sequence)];
+        let mut nearest = at;
+        let mut best = 0usize;
+        let mut found = None;
+
+        for _ in 0..SEARCH_DEPTH {
+            let Some(candidate) = self.candidate(entry, at) else {
+                break;
+            };
+            if candidate >= nearest {
+                break;
+            }
+            nearest = candidate;
+            entry = self.chain[candidate % CHAIN];
+
+            if word(input, candidate) != sequence {
+                continue;
+            }
+
+            let mut length = MIN_MATCH;
+            while at + length < end && input[at + length] == input[candidate + length] {
+                length += 1;
+            }
+            if length <= best {
+                continue;
+            }
+            best = length;
+            found = Some(candidate);
+            if length >= LONG_ENOUGH {
+                break;
+            }
+        }
+
+        let candidate = found?;
+
+        // A match usually starts before the position the hash found, since the
+        // hash only looks at four bytes. Walking backwards costs a byte
+        // comparison each and takes those bytes out of the literal run. It
+        // happens once, on the candidate that won, rather than on every
+        // candidate the search looked at, because it is the same walk over the
+        // same bytes for most of them and it is not what decides between them.
+        let mut start = at;
+        let mut back = candidate;
+        let mut length = best;
+        while start > anchor && back > 0 && input[start - 1] == input[back - 1] {
+            start -= 1;
+            back -= 1;
+            length += 1;
+        }
+
+        Some(Found {
+            start,
+            back,
+            length,
+        })
+    }
+
+    /// Records that a match starting at `at` is now something to be found.
+    fn insert(&mut self, input: &[u8], at: usize) {
+        let slot = hash(word(input, at));
+        // A block is far smaller than four gigabytes, so the position fits, and
+        // a block that somehow did not would only cost ratio.
+        let stamped = self
+            .base
+            .wrapping_add(u32::try_from(at).unwrap_or(u32::MAX));
+        self.chain[at % CHAIN] = self.heads[slot];
+        self.heads[slot] = stamped;
     }
 
     /// Moves the table's window forward by one block.
@@ -216,9 +410,10 @@ impl Compressor {
             self.base = base;
         } else {
             // Four gigabytes of input later the stamp has nowhere left to go,
-            // so the table is cleared and the count starts again. This happens
-            // once per four gigabytes and costs a memset.
-            self.table.fill(0);
+            // so the tables are cleared and the count starts again. This
+            // happens once per four gigabytes and costs a memset.
+            self.heads.fill(0);
+            self.chain.fill(0);
             self.base = 1;
         }
     }
@@ -569,6 +764,73 @@ mod tests {
         }
         let block = round_trip(&input);
         assert!(block.len() < input.len() / 2, "{} bytes", block.len());
+    }
+
+    #[test]
+    fn looking_past_the_first_candidate_is_what_the_ratio_is_for() {
+        // Text made of a small vocabulary in a scrambled order, which is the
+        // shape that separates a match finder that takes the first candidate it
+        // is handed from one that looks at sixteen and takes the longest. Every
+        // word has been seen before, so there is always a match; which one is
+        // taken is the whole question.
+        //
+        // Taking the first candidate compresses this to 0.404 of itself. The
+        // bound below is 0.30, so it is not a bound this can drift past without
+        // the chain or the step to the next byte having stopped working.
+        let words = [
+            "storage",
+            "index",
+            "the",
+            "a",
+            "segment",
+            "posting",
+            "block",
+            "document",
+            "compress",
+            "retrieval",
+            "of",
+            "and",
+            "list",
+            "term",
+        ];
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut input = String::new();
+        while input.len() < 64 << 10 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            input.push_str(words[(state % words.len() as u64) as usize]);
+            input.push(if state.is_multiple_of(17) { '\n' } else { ' ' });
+        }
+        let block = round_trip(input.as_bytes());
+        assert!(
+            block.len() < input.len() * 3 / 10,
+            "{} bytes of {}",
+            block.len(),
+            input.len()
+        );
+    }
+
+    #[test]
+    fn a_block_longer_than_the_chain_round_trips() {
+        // Two positions 65536 apart share a slot in the chain, so a block this
+        // long is one where the search follows entries that are not the ones
+        // that were put there. The walk has to notice and stop rather than
+        // circle, and whatever it settles on has to still be a match.
+        let mut input = Vec::with_capacity(1 << 20);
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        while input.len() < 1 << 20 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            // Runs of a repeated byte, so the block is full of long matches and
+            // the chains for them are long too.
+            let byte = (state >> 40) as u8;
+            let run = 1 + (state % 40) as usize;
+            input.extend(core::iter::repeat_n(byte, run));
+        }
+        let block = round_trip(&input);
+        assert!(block.len() < input.len() / 3, "{} bytes", block.len());
     }
 
     #[test]
