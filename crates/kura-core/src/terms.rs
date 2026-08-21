@@ -16,8 +16,37 @@
 //! In front of the blocks is one entry per block holding that block's first term
 //! and where the block starts. That is what is searched. A lookup binary
 //! searches the front for the block a term would be in, then walks that block,
-//! which is at most sixteen terms and one cache line or two. Two misses for a
-//! term lookup, against the twenty a search over every term would take.
+//! which is at most sixteen terms and one cache line or two.
+//!
+//! The binary search is over the first four bytes of each block's first term,
+//! kept as a separate array of one word each rather than read out of the entries
+//! themselves. Four bytes padded with zeros sort the same way the whole terms do,
+//! so the search is exact wherever the four bytes differ, and a probe that finds
+//! them equal is the only one that goes and reads a term. On an English
+//! vocabulary that is most probes answered out of an array sixteen blocks to a
+//! cache line, and it is what turns a search of two misses a step into one.
+//!
+//! It costs a quarter of a byte per term, since there is one of them per block
+//! of sixteen. A segment of 17.6 megabytes built from 206 megabytes of markdown
+//! carries 274973 terms and so 68.7 kilobytes of keys, which is four tenths of
+//! one percent of the file.
+//!
+//! # Searching a block without rebuilding its terms
+//!
+//! A term in a block is stored as how much of the previous term it reuses and
+//! what is left, so the obvious way to look one up is to rebuild each term in
+//! turn and compare it. The scan does not do that, and rebuilding is left to the
+//! walk in [`Entries`], which is for the tools and does need the terms.
+//!
+//! Instead the scan carries how many bytes of the term being looked for the
+//! current term matches, and every term in a block settles against it by
+//! arithmetic on that number. A term that reuses less than that many bytes is
+//! already past the one being looked for, so the answer is no and the block
+//! stops. A term that reuses more is still behind it and is skipped without
+//! looking at a byte of it. Only a term that reuses exactly that many is
+//! compared, and then only the part of it that is new. So a lookup reads a
+//! handful of bytes rather than rebuilding sixteen terms, and it does it in
+//! borrowed memory rather than in a buffer it had to allocate first.
 //!
 //! # Why not a hash table
 //!
@@ -26,6 +55,46 @@
 //! segments are all built on. Those are worth more than the difference between
 //! two cache misses and one, on a path a query takes a handful of times rather
 //! than a million times.
+//!
+//! # Why not a finite state transducer
+//!
+//! Because it is worth about one percent of a segment, and it costs five times
+//! the build and three times the walk, and the walk is what merging two segments
+//! and verifying a file are both made of.
+//!
+//! That was measured rather than argued, against the `fst` crate, which is a
+//! general transducer of the kind a term index is usually built on. It is
+//! genuinely better at holding terms. On an English word list of 234456 words it
+//! stores them in 5.11 bytes each against 6.99 here, and on the vocabulary of
+//! ten megabytes of markdown 4.02 against 6.01. That is the shape doing what it
+//! is for: a shared suffix is stored once, and front coding only ever folds out a
+//! shared prefix.
+//!
+//! Most of it goes away once the transducer has to carry what the dictionary
+//! carries. A term here comes with a document count, a posting offset and a
+//! posting length, and a transducer's output is one integer, so two of the three
+//! end up in a side table that the output indexes into. On the word list that is
+//! 11.83 bytes a term against 12.52 here, which is five percent, because the
+//! values are nearly half the dictionary either way and the ordinal the
+//! transducer has to emit to find them costs 1.19 bytes a term on top.
+//!
+//! Five percent of the dictionary is not five percent of a file. Indexing 206
+//! megabytes of markdown gives a segment of 17.6 megabytes with the terms at
+//! 16.6 percent of it, so what is on offer is nine tenths of one percent of the
+//! segment.
+//!
+//! The speed went the other way once the lookup here stopped allocating and the
+//! block search stopped reading a term at every step. A hit on the word list is
+//! 123 nanoseconds through the transducer and 147 here, a miss 146 against 172,
+//! and a walk of every term 52 nanoseconds against 18. Building the dictionary
+//! is 28 nanoseconds a term here and 158 there, which is the minimisation pass,
+//! and it is paid on every segment written.
+//!
+//! So the shape stays. What the measurement bought is the two changes above,
+//! which took between a third and a half of a lookup and would not have been
+//! found by reading the code: the old one allocated a buffer and rebuilt up to
+//! sixteen terms to answer a question about one, and its block search read a
+//! term at every step of the binary search.
 
 use crate::codec::{get_u32, get_uvarint, put_u32, put_uvarint, split_at};
 use crate::error::{Error, Result};
@@ -34,6 +103,15 @@ use crate::error::{Error, Result};
 ///
 /// Sixteen is small enough that walking a block is a scan of one or two cache
 /// lines and large enough that the block index stays a fifteenth of the terms.
+///
+/// The trade is the dictionary's size against the length of the scan at the end
+/// of a lookup, and it was measured again once the scan stopped rebuilding
+/// terms. On an English word list of 234456 words, blocks of eight cost 14.41
+/// bytes a term and answer a hit in 112 nanoseconds, sixteen 12.52 and 149,
+/// thirty two 11.57 and 230, and sixty four 11.10 and 390. Doubling from here
+/// buys eight percent of the section for half again the lookup, and halving
+/// spends fifteen percent of it to save a quarter of the lookup, so sixteen is
+/// where neither direction is clearly worth taking.
 pub const BLOCK_TERMS: usize = 16;
 
 /// What the dictionary holds about one term.
@@ -64,6 +142,9 @@ pub struct Writer {
     /// Where each index entry starts, so the index can be searched without
     /// being walked.
     index_offsets: Vec<u32>,
+    /// The first four bytes of each block's first term, which is what the
+    /// binary search compares before it reads anything.
+    index_keys: Vec<u32>,
 
     /// The previous term, which the next one folds its prefix against.
     previous: Vec<u8>,
@@ -107,6 +188,7 @@ impl Writer {
             let start = u32::try_from(self.index.len()).map_err(|_| Error::Overflow)?;
             let offset = u32::try_from(self.blocks.len()).map_err(|_| Error::Overflow)?;
             self.index_offsets.push(start);
+            self.index_keys.push(key(term));
             put_uvarint(&mut self.index, term.len() as u64);
             self.index.extend_from_slice(term);
             put_u32(&mut self.index, offset);
@@ -146,9 +228,12 @@ impl Writer {
     #[must_use]
     pub fn finish(self) -> Vec<u8> {
         let blocks = self.index_offsets.len();
-        let mut out = Vec::with_capacity(self.blocks.len() + self.index.len() + blocks * 4 + 24);
+        let mut out = Vec::with_capacity(self.blocks.len() + self.index.len() + blocks * 8 + 24);
         put_uvarint(&mut out, u64::from(self.terms));
         put_uvarint(&mut out, blocks as u64);
+        for key in &self.index_keys {
+            put_u32(&mut out, *key);
+        }
         for offset in &self.index_offsets {
             put_u32(&mut out, *offset);
         }
@@ -169,6 +254,7 @@ impl Writer {
 pub struct Reader<'a> {
     terms: u32,
     blocks: usize,
+    keys: &'a [u8],
     offsets: &'a [u8],
     index: &'a [u8],
     body: &'a [u8],
@@ -188,6 +274,7 @@ impl<'a> Reader<'a> {
         let blocks = usize::try_from(blocks).map_err(|_| Error::Overflow)?;
 
         let offsets_len = blocks.checked_mul(4).ok_or(Error::Overflow)?;
+        let (keys, rest) = split_at(rest, offsets_len)?;
         let (offsets, rest) = split_at(rest, offsets_len)?;
 
         let (index_len, rest) = get_uvarint(rest)?;
@@ -201,6 +288,7 @@ impl<'a> Reader<'a> {
         Ok(Self {
             terms: u32::try_from(terms).map_err(|_| Error::Overflow)?,
             blocks,
+            keys,
             offsets,
             index,
             body,
@@ -233,17 +321,7 @@ impl<'a> Reader<'a> {
         let Some(block) = self.block_for(term)? else {
             return Ok(None);
         };
-        let mut walk = self.walk(block)?;
-        while let Some((found, entry)) = walk.next_term()? {
-            match found.cmp(term) {
-                std::cmp::Ordering::Less => {}
-                std::cmp::Ordering::Equal => return Ok(Some(entry)),
-                // The block is in order, so the first term past the one being
-                // looked for settles it.
-                std::cmp::Ordering::Greater => return Ok(None),
-            }
-        }
-        Ok(None)
+        self.scan(block, term)
     }
 
     /// Walks every term in the dictionary, in order.
@@ -268,18 +346,115 @@ impl<'a> Reader<'a> {
         if self.blocks == 0 {
             return Ok(None);
         }
+        let wanted = key(term);
         let (mut low, mut high) = (0usize, self.blocks);
         while low < high {
             let middle = low + (high - low) / 2;
-            let (first, _) = self.index_entry(middle)?;
-            if first <= term {
-                low = middle + 1;
-            } else {
+            let found = self.key(middle)?;
+            // The four byte keys sort the way the whole terms do, so a step
+            // that finds them different is settled and the term stays on disk.
+            // Only a step that finds them equal has to go and read one.
+            let after = match found.cmp(&wanted) {
+                std::cmp::Ordering::Less => false,
+                std::cmp::Ordering::Greater => true,
+                std::cmp::Ordering::Equal => self.index_entry(middle)?.0 > term,
+            };
+            if after {
                 high = middle;
+            } else {
+                low = middle + 1;
             }
         }
         // Every block starts after the term, so no block can hold it.
         Ok((low > 0).then(|| low - 1))
+    }
+
+    /// The four byte key of a block's first term.
+    fn key(&self, block: usize) -> Result<u32> {
+        let at = block.checked_mul(4).ok_or(Error::Overflow)?;
+        let slot = self.keys.get(at..at + 4).ok_or(Error::Truncated {
+            needed: at + 4,
+            available: self.keys.len(),
+        })?;
+        Ok(get_u32(slot)?.0)
+    }
+
+    /// Looks `term` up inside one block.
+    ///
+    /// The terms are never rebuilt. What moves is `matched`, the number of
+    /// leading bytes of `term` that the term the scan is on agrees with, and
+    /// every term after the first settles against it without a comparison
+    /// unless it reuses exactly that many bytes.
+    fn scan(&self, block: usize, term: &[u8]) -> Result<Option<Entry>> {
+        let mut rest = self.block_bytes(block)?;
+
+        let (len, tail) = get_uvarint(rest)?;
+        let len = usize::try_from(len).map_err(|_| Error::Overflow)?;
+        let (first, tail) = split_at(tail, len)?;
+        rest = tail;
+
+        let (mut matched, ordering) = common(first, term);
+        if ordering == std::cmp::Ordering::Greater {
+            // The block index picked this block because its first term is not
+            // after the one being looked for, so this is a dictionary that has
+            // been damaged rather than a term that is missing.
+            return Ok(None);
+        }
+        let mut offset = 0u64;
+        let (entry, tail) = payload(rest, &mut offset)?;
+        if ordering == std::cmp::Ordering::Equal {
+            return Ok(Some(entry));
+        }
+        rest = tail;
+
+        while !rest.is_empty() {
+            let (shared, tail) = get_uvarint(rest)?;
+            let shared = usize::try_from(shared).map_err(|_| Error::Overflow)?;
+            let (len, tail) = get_uvarint(tail)?;
+            let len = usize::try_from(len).map_err(|_| Error::Overflow)?;
+            let (suffix, tail) = split_at(tail, len)?;
+
+            // A term that reuses fewer bytes than the scan has matched differs
+            // from the one being looked for inside that prefix, and it is after
+            // it, so every term left in the block is too.
+            if shared < matched {
+                return Ok(None);
+            }
+            // A term that reuses more is still inside the prefix the term
+            // before it was already behind on, so it is behind too.
+            let mut found = false;
+            if shared == matched {
+                let (further, ordering) = common(suffix, &term[matched..]);
+                match ordering {
+                    std::cmp::Ordering::Less => matched += further,
+                    std::cmp::Ordering::Equal => found = true,
+                    std::cmp::Ordering::Greater => return Ok(None),
+                }
+            }
+
+            let (entry, tail) = payload(tail, &mut offset)?;
+            if found {
+                return Ok(Some(entry));
+            }
+            rest = tail;
+        }
+        Ok(None)
+    }
+
+    /// The encoded bytes of one block.
+    fn block_bytes(&self, block: usize) -> Result<&'a [u8]> {
+        let (_, offset) = self.index_entry(block)?;
+        let end = if block + 1 < self.blocks {
+            self.index_entry(block + 1)?.1
+        } else {
+            self.body.len()
+        };
+        self.body
+            .get(offset..end.max(offset))
+            .ok_or(Error::Truncated {
+                needed: end,
+                available: self.body.len(),
+            })
     }
 
     /// The first term of a block and the byte offset the block starts at.
@@ -304,21 +479,8 @@ impl<'a> Reader<'a> {
 
     /// Starts a walk over one block.
     fn walk(&self, block: usize) -> Result<Walk<'a>> {
-        let (_, offset) = self.index_entry(block)?;
-        let end = if block + 1 < self.blocks {
-            self.index_entry(block + 1)?.1
-        } else {
-            self.body.len()
-        };
-        let bytes = self
-            .body
-            .get(offset..end.max(offset))
-            .ok_or(Error::Truncated {
-                needed: end,
-                available: self.body.len(),
-            })?;
         Ok(Walk {
-            rest: bytes,
+            rest: self.block_bytes(block)?,
             term: Vec::new(),
             offset: 0,
             first: true,
@@ -423,26 +585,57 @@ impl Walk<'_> {
             self.rest = rest;
         }
 
-        let (docs, rest) = get_uvarint(self.rest)?;
-        let (gap, rest) = get_uvarint(rest)?;
-        let (len, rest) = get_uvarint(rest)?;
+        let (entry, rest) = payload(self.rest, &mut self.offset)?;
         self.rest = rest;
-        self.offset = self.offset.checked_add(gap).ok_or(Error::Overflow)?;
-
-        Ok(Some((
-            self.term.as_slice(),
-            Entry {
-                docs: u32::try_from(docs).map_err(|_| Error::Overflow)?,
-                offset: self.offset,
-                len,
-            },
-        )))
+        Ok(Some((self.term.as_slice(), entry)))
     }
 }
 
 /// How many leading bytes two terms have in common.
 fn shared_prefix(a: &[u8], b: &[u8]) -> usize {
     a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
+
+/// How many leading bytes two terms have in common, and which one sorts first.
+///
+/// The two answers come from the same walk because the scan needs both and
+/// walking twice would be walking the same bytes twice.
+fn common(a: &[u8], b: &[u8]) -> (usize, std::cmp::Ordering) {
+    let shared = shared_prefix(a, b);
+    let ordering = match (a.get(shared), b.get(shared)) {
+        (Some(x), Some(y)) => x.cmp(y),
+        // One ran out inside the other, so the shorter one sorts first.
+        (left, right) => left.is_some().cmp(&right.is_some()),
+    };
+    (shared, ordering)
+}
+
+/// The first four bytes of a term, as a number that sorts the way it does.
+///
+/// A term shorter than four bytes is padded with zeros, which keeps the order:
+/// a term that runs out where another carries on sorts before it, and zero is
+/// below every byte the other one could have there.
+fn key(term: &[u8]) -> u32 {
+    let mut bytes = [0u8; 4];
+    let take = term.len().min(4);
+    bytes[..take].copy_from_slice(&term[..take]);
+    u32::from_be_bytes(bytes)
+}
+
+/// Reads the three numbers stored after a term, carrying the posting offset.
+fn payload<'a>(input: &'a [u8], offset: &mut u64) -> Result<(Entry, &'a [u8])> {
+    let (docs, rest) = get_uvarint(input)?;
+    let (gap, rest) = get_uvarint(rest)?;
+    let (len, rest) = get_uvarint(rest)?;
+    *offset = offset.checked_add(gap).ok_or(Error::Overflow)?;
+    Ok((
+        Entry {
+            docs: u32::try_from(docs).map_err(|_| Error::Overflow)?,
+            offset: *offset,
+            len,
+        },
+        rest,
+    ))
 }
 
 #[cfg(test)]
@@ -665,6 +858,116 @@ mod tests {
                 let _ = reader.get(&[0xff; 64]);
             }
         }
+    }
+
+    /// Terms of every shape the scan and the block key have to survive: short
+    /// ones the key has to pad, ones that extend each other, ones holding the
+    /// byte the padding uses, and ones that agree on far more than the four
+    /// bytes the key looks at.
+    fn awkward() -> Vec<Vec<u8>> {
+        let mut terms: Vec<Vec<u8>> = Vec::new();
+        for base in ["", "a", "ab", "abc", "abcd", "abcde", "zzzz"] {
+            terms.push(base.as_bytes().to_vec());
+            for tail in [0u8, 1, b'a', 0xff] {
+                let mut t = base.as_bytes().to_vec();
+                t.push(tail);
+                terms.push(t.clone());
+                t.push(b'q');
+                terms.push(t);
+            }
+        }
+        // Enough terms sharing a long prefix to fill several blocks, which is
+        // where every step of the binary search finds the keys equal and has to
+        // fall back on comparing whole terms.
+        for i in 0..200 {
+            terms.push(format!("configuration{i:06}").into_bytes());
+        }
+        terms.sort();
+        terms.dedup();
+        terms
+    }
+
+    /// A dictionary of arbitrary byte terms, with the same entries `build` uses.
+    fn build_bytes(terms: &[Vec<u8>]) -> Vec<u8> {
+        let mut writer = Writer::new();
+        let mut offset = 0u64;
+        for (i, term) in terms.iter().enumerate() {
+            let len = (i as u64 % 7) + 1;
+            writer
+                .push(
+                    term,
+                    Entry {
+                        docs: u32::try_from(i).expect("small") + 1,
+                        offset,
+                        len,
+                    },
+                )
+                .expect("ascending input");
+            offset += len;
+        }
+        writer.finish()
+    }
+
+    #[test]
+    fn a_lookup_agrees_with_a_walk_on_every_probe() {
+        // The scan settles most terms by arithmetic on how much of the probe it
+        // has matched so far, without looking at them, so the only way to know
+        // it settles them the way a comparison would is to ask it about every
+        // term and every near miss and check it against the walk, which does
+        // rebuild the terms.
+        let terms = awkward();
+        let encoded = build_bytes(&terms);
+        let reader = Reader::new(&encoded).expect("header");
+        let table = walked(&encoded);
+        assert_eq!(table.len(), terms.len());
+
+        let mut probes: Vec<Vec<u8>> = Vec::new();
+        for term in &terms {
+            probes.push(term.clone());
+            for extra in [0u8, b'a', 0xff] {
+                let mut longer = term.clone();
+                longer.push(extra);
+                probes.push(longer);
+            }
+            for cut in 0..term.len() {
+                probes.push(term[..cut].to_vec());
+                let mut bent = term.clone();
+                bent[cut] = bent[cut].wrapping_add(1);
+                probes.push(bent);
+            }
+        }
+
+        for probe in probes {
+            let expected = table
+                .iter()
+                .find(|(term, _)| *term == probe)
+                .map(|(_, entry)| *entry);
+            assert_eq!(
+                reader.get(&probe).expect("lookup"),
+                expected,
+                "probe {:?}",
+                String::from_utf8_lossy(&probe)
+            );
+        }
+    }
+
+    #[test]
+    fn the_block_key_only_looks_at_four_bytes_and_the_search_still_lands() {
+        // Every one of these shares the four bytes the block key is made of, so
+        // the binary search finds them equal at every step and the whole answer
+        // comes from the comparison it falls back on. There are enough of them
+        // to be several blocks.
+        let terms: Vec<Vec<u8>> = (0..500)
+            .map(|i| format!("term{i:08}").into_bytes())
+            .collect();
+        let encoded = build_bytes(&terms);
+        let reader = Reader::new(&encoded).expect("header");
+        for (i, term) in terms.iter().enumerate() {
+            let found = reader.get(term).expect("lookup").expect("term is there");
+            assert_eq!(found.docs, u32::try_from(i).expect("small") + 1);
+        }
+        assert_eq!(reader.get(b"term").expect("lookup"), None);
+        assert_eq!(reader.get(b"terma").expect("lookup"), None);
     }
 
     #[test]
