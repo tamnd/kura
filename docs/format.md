@@ -149,11 +149,27 @@ The dictionary and the stored fields are intact, the postings are not, and that 
 | 7 | graph | entities and edges |
 | 8 | tombstones | documents deleted by a later segment |
 | 9 | norms | how long each document is, and how long they are on average |
+| 10 | bounds | the best score each block of postings can reach, which is what block max pruning compares against |
 
 A section may be absent, and an absent section is not the same as an empty one.
 A term dictionary with no terms is a fact about the segment.
 A missing term dictionary is a fact about the build that wrote it.
 The reader keeps them apart, and so should anything built on top.
+
+## Sections that are worked out from other sections
+
+Most sections hold something only the writer knew.
+The bounds section does not.
+Every byte in it is a function of the postings and the lengths that are already in the file, so a segment written before that kind existed is not missing data, it is missing a calculation.
+
+That distinction is what lets the kind be added without moving the version.
+A reader that has never heard of kind 10 returns the same hits as one that has, because the section only ever says which work can be skipped and never which document wins.
+Adding it is a shrug, in the sense above, not a refusal.
+
+It does change what a migration owes.
+`kura_core::migrate` promises that a migrated file is what this build would have written, and this build writes the bounds, so the migration runs a second pass after the version steps that rebuilds every derived section from the sections beside it.
+That pass runs whether or not the old file had one, and it writes the section in the same place in the table that the indexer would have.
+`crates/kura-core/tests/format.rs` is what holds the two paths together: the fixture written by the indexer and the fixture produced by migrating the version 1 file have to come out byte for byte identical, which means the inline calculation in the writer and the decode and recompute in the migration cannot drift apart without a test going red.
 
 ## What the reader refuses
 

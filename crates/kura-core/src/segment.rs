@@ -708,6 +708,7 @@ pub const fn name(kind: u16) -> Option<&'static str> {
         kind::GRAPH => Some("graph"),
         kind::TOMBSTONES => Some("tombstones"),
         kind::NORMS => Some("norms"),
+        kind::BOUNDS => Some("bounds"),
         _ => None,
     }
 }
@@ -743,6 +744,7 @@ mod tests {
     fn a_kind_has_a_name_and_an_unknown_kind_does_not() {
         assert_eq!(name(kind::POSTINGS), Some("postings"));
         assert_eq!(name(kind::NORMS), Some("norms"));
+        assert_eq!(name(kind::BOUNDS), Some("bounds"));
         // Not an error, because a reader skips a section it has never heard of
         // and a tool printing the table should say so rather than hide it.
         assert_eq!(name(4_242), None);
