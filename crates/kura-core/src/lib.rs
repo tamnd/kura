@@ -32,6 +32,7 @@ pub mod index;
 #[cfg(feature = "fs")]
 pub mod ingest;
 pub mod keys;
+pub mod length;
 pub mod lz;
 pub mod manifest;
 #[cfg(feature = "fs")]

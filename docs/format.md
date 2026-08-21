@@ -152,6 +152,7 @@ The dictionary and the stored fields are intact, the postings are not, and that 
 | 10 | bounds | the best score each block of postings can reach, which is what block max pruning compares against |
 | 11 | keys | the primary key of each document that has one, sorted, with the document number beside it |
 | 12 | key filter | a bloom filter over those keys, so a segment that does not hold a key can say so without the table being read |
+| 13 | rounded | how long each document is again, in one byte apiece, which is what scoring divides by when the segment carries it |
 
 A section may be absent, and an absent section is not the same as an empty one.
 A term dictionary with no terms is a fact about the segment.
@@ -165,16 +166,21 @@ A segment with one and not the other is refused rather than read.
 ## Sections that are worked out from other sections
 
 Most sections hold something only the writer knew.
-The bounds section does not.
-Every byte in it is a function of the postings and the lengths that are already in the file, so a segment written before that kind existed is not missing data, it is missing a calculation.
+The bounds and the rounded lengths do not.
+Every byte in either is a function of the postings and the lengths that are already in the file, so a segment written before those kinds existed is not missing data, it is missing a calculation.
 
-That distinction is what lets the kind be added without moving the version.
+That distinction is what lets a kind be added without moving the version.
 A reader that has never heard of kind 10 returns the same hits as one that has, because the section only ever says which work can be skipped and never which document wins.
-Adding it is a shrug, in the sense above, not a refusal.
+A reader that has never heard of kind 13 divides by the four byte length instead of the byte, which moves a score by well under a percent and can in principle reorder two documents that were already scoring within that of each other.
+Neither is a refusal.
+
+The two have to stay sound together, and the rule that keeps them so is that the bounds are worked out from the exact lengths even though the scorer divides by the rounded ones.
+Rounding a length goes upwards and a longer document scores lower, so a ceiling from the exact length bounds the rounded score as well as the exact one.
+Rounding on the way into the bounds would give a slightly tighter ceiling that only holds for a reader that rounds too, and a build that has never heard of kind 13 still reads kind 10.
 
 It does change what a migration owes.
-`kura_core::migrate` promises that a migrated file is what this build would have written, and this build writes the bounds, so the migration runs a second pass after the version steps that rebuilds every derived section from the sections beside it.
-That pass runs whether or not the old file had one, and it writes the section in the same place in the table that the indexer would have.
+`kura_core::migrate` promises that a migrated file is what this build would have written, and this build writes both, so the migration runs a second pass after the version steps that rebuilds every derived section from the sections beside it.
+That pass runs whether or not the old file had them, and it writes each section in the same place in the table that the indexer would have.
 `crates/kura-core/tests/format.rs` is what holds the two paths together: the fixture written by the indexer and the fixture produced by migrating the version 1 file have to come out byte for byte identical, which means the inline calculation in the writer and the decode and recompute in the migration cannot drift apart without a test going red.
 
 ## What the reader refuses

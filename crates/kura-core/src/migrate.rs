@@ -63,7 +63,7 @@ use crate::error::{Error, Result};
 use crate::index::average;
 use crate::search::{B, K1};
 use crate::segment::{self, Segment};
-use crate::{DocId, FORMAT_VERSION, bound, posting, terms};
+use crate::{DocId, FORMAT_VERSION, bound, length, posting, terms};
 
 /// Brings one segment forward to [`FORMAT_VERSION`].
 ///
@@ -132,11 +132,12 @@ pub fn segment(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
 
 /// Rebuilds the sections that are worked out from the others.
 ///
-/// At present that is one section, the block score ceilings, which are a
-/// function of the postings and the document lengths. It is rebuilt rather than
-/// kept, because a file old enough to be migrated is old enough that whatever it
-/// holds was computed by rules this build has moved on from, and recomputing is
-/// cheaper to reason about than deciding which old ones are still good.
+/// Two of them: the rounded document lengths, which are a function of the four
+/// byte lengths, and the block score ceilings, which are a function of the
+/// postings and the rounded lengths. Both are rebuilt rather than kept, because
+/// a file old enough to be migrated is old enough that whatever it holds was
+/// computed by rules this build has moved on from, and recomputing is cheaper to
+/// reason about than deciding which old ones are still good.
 ///
 /// A segment missing the postings or the lengths gets nothing and is not an
 /// error. That is a segment holding something other than an index, which the
@@ -155,21 +156,44 @@ fn derive(sections: &mut Vec<(u16, Vec<u8>)>) -> Result<()> {
     ) else {
         return Ok(());
     };
+    let short = rounded(norms)?;
     let built = ceilings(dictionary, postings, norms)?;
 
-    sections.retain(|(kind, _)| *kind != segment::kind::BOUNDS);
-    let Some(built) = built else {
-        return Ok(());
-    };
-    // Straight after the lengths it was computed from, which is where the
-    // indexer puts it. The order of the section table is part of what a byte for
-    // byte comparison against a freshly built segment is comparing.
-    let at = sections
+    sections.retain(|(kind, _)| *kind != segment::kind::BOUNDS && *kind != segment::kind::ROUNDED);
+    // Straight after the lengths they were computed from, in the order the
+    // indexer adds them. The order of the section table is part of what a byte
+    // for byte comparison against a freshly built segment is comparing.
+    let mut at = sections
         .iter()
         .position(|(kind, _)| *kind == segment::kind::NORMS)
         .map_or(sections.len(), |at| at + 1);
-    sections.insert(at, (segment::kind::BOUNDS, built));
+    sections.insert(at, (segment::kind::ROUNDED, short));
+    at += 1;
+    if let Some(built) = built {
+        sections.insert(at, (segment::kind::BOUNDS, built));
+    }
     Ok(())
+}
+
+/// One byte per document, from the four byte lengths beside them.
+fn rounded(norms: &[u8]) -> Result<Vec<u8>> {
+    let (documents, rest) = get_u32(norms)?;
+    let (_, lengths) = get_u64(rest)?;
+    let needed = (documents as usize).checked_mul(4).ok_or(Error::Overflow)?;
+    if lengths.len() < needed {
+        return Err(Error::Truncated {
+            needed,
+            available: lengths.len(),
+        });
+    }
+    Ok(lengths[..needed]
+        .chunks_exact(4)
+        .map(|bytes| {
+            let mut four = [0u8; 4];
+            four.copy_from_slice(bytes);
+            length::round(u32::from_le_bytes(four))
+        })
+        .collect())
 }
 
 /// The block score ceilings of a segment, worked out from its own sections.

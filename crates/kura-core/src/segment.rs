@@ -152,6 +152,9 @@ pub mod kind {
     /// A bloom filter over those keys, so a segment that does not hold a key can
     /// say so without the table being read at all.
     pub const KEY_FILTER: u16 = 12;
+    /// How long each document is, in one byte apiece, which is what scoring
+    /// reads when it is there.
+    pub const ROUNDED: u16 = 13;
 }
 
 /// Builds a segment.
@@ -717,6 +720,7 @@ pub const fn name(kind: u16) -> Option<&'static str> {
         kind::BOUNDS => Some("bounds"),
         kind::KEYS => Some("keys"),
         kind::KEY_FILTER => Some("key filter"),
+        kind::ROUNDED => Some("rounded"),
         _ => None,
     }
 }
@@ -753,6 +757,7 @@ mod tests {
         assert_eq!(name(kind::POSTINGS), Some("postings"));
         assert_eq!(name(kind::NORMS), Some("norms"));
         assert_eq!(name(kind::BOUNDS), Some("bounds"));
+        assert_eq!(name(kind::ROUNDED), Some("rounded"));
         // Not an error, because a reader skips a section it has never heard of
         // and a tool printing the table should say so rather than hide it.
         assert_eq!(name(4_242), None);
