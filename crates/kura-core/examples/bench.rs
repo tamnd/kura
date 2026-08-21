@@ -52,6 +52,7 @@ use kura_core::segment::{self, Segment};
 use kura_core::store;
 use kura_core::terms;
 use kura_core::vector::{Quantised, cosine, dot, normalise};
+use kura_core::xxh3;
 
 /// How many times each measurement is repeated.
 ///
@@ -772,33 +773,68 @@ fn segments(postings: &[u8]) {
     });
 }
 
-/// The checksum on its own, at a size that does not fit in cache.
+/// The checksums on their own, at a size that does not fit in cache.
 ///
 /// The pair above says what verifying costs against not verifying it on a
 /// segment of a few megabytes. This says what the rate is, which is the number
 /// that decides whether verifying a real index on open is a rounding error or a
 /// visible pause. Thirty two megabytes because a smaller buffer measures the
 /// last level cache rather than the loop.
+///
+/// Both algorithms, because the format is moving from one to the other and the
+/// case for moving rests entirely on the ratio between these two lines. A
+/// checksum that is affordable on open buys one number over a whole file. One
+/// that is affordable on every touch buys a number per block, which is what
+/// makes damage locatable.
 fn checksums() {
     let data: Vec<u8> = (0..32u32 << 20)
         .map(|i| (i.wrapping_mul(37) % 251) as u8)
         .collect();
-    bench("checksum thirty two megabytes", data.len(), || {
+    bench("crc32 thirty two megabytes", data.len(), || {
         black_box(crc32(black_box(&data)));
     });
+    bench("xxh3-64 thirty two megabytes", data.len(), || {
+        black_box(xxh3::hash64(black_box(&data)));
+    });
+    bench("xxh3-128 thirty two megabytes", data.len(), || {
+        black_box(xxh3::hash128(black_box(&data)));
+    });
 
+    let crc = rate(&data, |bytes| {
+        black_box(crc32(bytes));
+    });
+    let short = rate(&data, |bytes| {
+        black_box(xxh3::hash64(bytes));
+    });
+    let long = rate(&data, |bytes| {
+        black_box(xxh3::hash128(bytes));
+    });
+    fact(
+        "checksum",
+        &format!(
+            "checksum: crc32 {crc:.0} MB/s, xxh3-64 {short:.0} MB/s, \
+             xxh3-128 {long:.0} MB/s, {:.1}x",
+            long / crc
+        ),
+        vec![
+            ("bytes", data.len() as f64),
+            ("mb_per_second", crc),
+            ("xxh3_64_mb_per_second", short),
+            ("xxh3_128_mb_per_second", long),
+        ],
+    );
+}
+
+/// Megabytes a second, taking the best of five so the answer describes the code
+/// rather than whatever else the machine was doing.
+fn rate(data: &[u8], mut f: impl FnMut(&[u8])) -> f64 {
     let mut best = Duration::MAX;
     for _ in 0..5 {
         let start = Instant::now();
-        black_box(crc32(&data));
+        f(black_box(data));
         best = best.min(start.elapsed());
     }
-    let rate = data.len() as f64 / best.as_secs_f64() / 1e6;
-    fact(
-        "checksum",
-        &format!("checksum: {rate:.0} MB/s"),
-        vec![("bytes", data.len() as f64), ("mb_per_second", rate)],
-    );
+    data.len() as f64 / best.as_secs_f64() / 1e6
 }
 
 /// Similarity, at full width and quantised, which is the memory for time trade
