@@ -124,6 +124,40 @@ A query where blocks skipped is zero over a long list is a query where the pruni
 The default explains the walk that produces a page of results.
 Pass `--total` to explain the walk that produces a page and the total count instead, which has to visit every match and so skips much less by construction.
 
+## Measuring whether the answers were any good
+
+`explain` says what a query cost. It says nothing about whether the results were the right ones, and a ranking change that nobody measured is a ranking change nobody can defend.
+
+```sh
+./target/release/kura-cli topics /tmp/docs.kura topics.tsv -o run.txt
+./target/release/kura-cli eval qrels.txt run.txt --per-query
+```
+
+`topics` reads a file of queries, one per line, with the identifier and the text separated by a tab, and writes a TREC run file.
+`eval` scores that run file against a file of judgments.
+They are separate commands because a run written here can be scored by `trec_eval` and a run written by another engine can be scored here.
+
+```
+judged   5 queries
+answered 4 queries
+scored   4 queries
+
+  query                   ndcg@10 recall@100     mrr@10
+  q1                       0.9037     1.0000     1.0000
+  q2                       0.7724     1.0000     1.0000
+  q3                       1.0000     1.0000     1.0000
+  q4                       1.0000     1.0000     1.0000
+
+  ndcg_cut_10      0.9190
+  recall_100       1.0000
+  recip_rank_10    1.0000
+```
+
+The measures are named the way `trec_eval` names them and computed the way `trec_eval` computes them, which is not always the way a textbook defines them.
+The rank column in a run file is ignored and the score decides the order, ties break by document identifier in reverse order, an unjudged document is not relevant, and the gain is linear rather than exponential.
+By default a query the run did not answer is not scored at all, which is `trec_eval` without its `-c` flag.
+Pass `--complete` to score it as a zero instead, which is the honest choice when comparing two engines, because an engine that returns nothing for its hard queries should not score as though nobody asked them.
+
 ## Calling it from C
 
 ```c

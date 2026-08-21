@@ -1,6 +1,6 @@
 //! Command line access to a kura index.
 //!
-//! Three commands, and only one of them is really the point.
+//! Five commands, in two groups.
 //!
 //! `index` builds an index out of a directory so there is something to ask
 //! questions of. `search` runs a query and prints what came back. `explain`
@@ -13,13 +13,21 @@
 //! The counters that separate them live in `kura_core::explain`, and this is
 //! how a person points them at a query.
 //!
+//! `topics` and `eval` are the other half of the same argument. `explain` says
+//! what a query cost, and those two say whether the answer was any good.
+//! `topics` runs a file of queries and writes a run file, `eval` scores a run
+//! file against judgments, and between them a ranking change stops being a
+//! matter of opinion. See [`eval`] for what the numbers mean.
+//!
 //! There are no dependencies here for the same reason there are none in the
 //! engine. Argument parsing is forty lines and a crate is forever.
 
+mod eval;
 mod report;
 
 use std::fmt;
 use std::fs;
+use std::io::{BufWriter, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
@@ -33,8 +41,17 @@ use kura_core::store::Scratch;
 /// How many results a command prints when nobody says otherwise.
 const DEFAULT_HITS: usize = 10;
 
+/// How deep a run file goes when nobody says otherwise.
+///
+/// A thousand is the depth TREC pools to and the depth every published run is
+/// written at, and recall at a hundred needs a hundred of them to be there.
+const DEFAULT_DEPTH: usize = 1_000;
+
 /// The field an indexed file carries so a hit can be traced back to it.
 const PATH_FIELD: &str = "path";
+
+/// What a run file calls a run that nobody named.
+const DEFAULT_TAG: &str = "kura";
 
 fn main() -> ExitCode {
     match run() {
@@ -52,14 +69,26 @@ fn main() -> ExitCode {
 
 const USAGE: &str = "\
 usage:
-  kura-cli index <path>... -o <index>   index files and directories into <index>
-  kura-cli search <index> <query>       print the best matches
-  kura-cli explain <index> <query>      print what the query did to find them
+  kura-cli index <path>... -o <index>        index files and directories into <index>
+  kura-cli search <index> <query>            print the best matches
+  kura-cli explain <index> <query>           print what the query did to find them
+  kura-cli topics <index> <topics> -o <run>  answer a file of queries into a run file
+  kura-cli eval <qrels> <run>                score a run file against judgments
 
 options:
   -k <n>        how many results, for search and explain (default 10)
-  -o <file>     where to write, for index
-  --total       for explain, walk for the total as well as the page";
+  -o <file>     where to write, for index and topics
+  --total       for explain, walk for the total as well as the page
+  --depth <n>   how deep a run file goes, for topics (default 1000)
+  --tag <name>  what the run file calls this run (default kura)
+  --field <f>   which stored field names a document (default path)
+  --complete    for eval, score every judged query and not only the answered ones
+  --per-query   for eval, print a line per query as well as the averages
+
+formats:
+  topics    one query per line, the identifier and the text separated by a tab
+  qrels     query, iteration, document, relevance
+  run       query, iteration, document, rank, score, tag";
 
 fn run() -> Result<(), Failure> {
     let mut args = std::env::args().skip(1);
@@ -69,11 +98,218 @@ fn run() -> Result<(), Failure> {
         "index" => index(&rest),
         "search" => query(&rest, false),
         "explain" => query(&rest, true),
+        "topics" => topics(&rest),
+        "eval" => evaluate(&rest),
         "-h" | "--help" | "help" => {
             println!("{USAGE}");
             Ok(())
         }
         other => Err(Failure::usage(format!("unknown command {other}"))),
+    }
+}
+
+/// Answers every query in a topics file and writes a run file.
+///
+/// The half of a relevance measurement that needs the engine. The other half is
+/// [`evaluate`], which needs only the run file and the judgments, so the two are
+/// separate commands and a run written here can be scored by `trec_eval` and a
+/// run written by another engine can be scored here.
+fn topics(args: &[String]) -> Result<(), Failure> {
+    let mut positional: Vec<&str> = Vec::new();
+    let mut out: Option<PathBuf> = None;
+    let mut depth = DEFAULT_DEPTH;
+    let mut tag = DEFAULT_TAG.to_string();
+    let mut field = PATH_FIELD.to_string();
+    let mut at = 0;
+    while at < args.len() {
+        match args[at].as_str() {
+            "-o" => {
+                at += 1;
+                out = Some(PathBuf::from(want(args, at, "-o wants a file")?));
+            }
+            "--depth" => {
+                at += 1;
+                let value = want(args, at, "--depth wants a number")?;
+                depth = value
+                    .parse()
+                    .map_err(|_| Failure::usage(format!("--depth wants a number, got {value}")))?;
+            }
+            "--tag" => {
+                at += 1;
+                tag = want(args, at, "--tag wants a name")?.to_string();
+            }
+            "--field" => {
+                at += 1;
+                field = want(args, at, "--field wants a name")?.to_string();
+            }
+            other => positional.push(other),
+        }
+        at += 1;
+    }
+    let [index, queries] = positional.as_slice() else {
+        return Err(Failure::usage("wanted an index and a topics file"));
+    };
+    let out = out.ok_or_else(|| Failure::usage("no -o, so nowhere to write the run"))?;
+
+    let index = Path::new(index);
+    let bytes = fs::read(index).map_err(|error| Failure::Io(index.to_path_buf(), error))?;
+    let segment = Segment::open(&bytes)?;
+    let reader = Reader::open(&segment)?;
+    let searcher = Searcher::new(&reader);
+
+    let queries = Path::new(queries);
+    let text = fs::read_to_string(queries).map_err(|e| Failure::Io(queries.to_path_buf(), e))?;
+
+    let file = fs::File::create(&out).map_err(|error| Failure::Io(out.clone(), error))?;
+    let mut writer = BufWriter::new(file);
+    let mut scratch = Scratch::new();
+    let started = Instant::now();
+    let mut answered = 0usize;
+    let mut lines = 0u64;
+
+    for (at, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // A tab if there is one, and the first run of whitespace if there is
+        // not, so a file written with spaces is not silently read as a query
+        // with no identifier.
+        let (id, query) = line
+            .split_once('\t')
+            .or_else(|| line.split_once(char::is_whitespace))
+            .ok_or_else(|| {
+                Failure::usage(format!(
+                    "{}: line {} has an identifier and no query",
+                    queries.display(),
+                    at + 1
+                ))
+            })?;
+        let query = query.trim();
+        let hits = searcher.search(query, depth)?;
+        answered += 1;
+        for (rank, hit) in hits.iter().enumerate() {
+            let doc = label(&reader, hit.doc, &field, &mut scratch)?;
+            writeln!(
+                writer,
+                "{id}\tQ0\t{doc}\t{}\t{:.6}\t{tag}",
+                rank + 1,
+                hit.score
+            )
+            .map_err(|error| Failure::Io(out.clone(), error))?;
+            lines += 1;
+        }
+    }
+    writer
+        .flush()
+        .map_err(|error| Failure::Io(out.clone(), error))?;
+    let took = started.elapsed();
+
+    println!(
+        "answered {answered} queries into {}, {lines} lines in {:.1?}",
+        out.display(),
+        took
+    );
+    if answered > 0 {
+        println!(
+            "{:.3?} per query",
+            took / u32::try_from(answered).unwrap_or(1)
+        );
+    }
+    Ok(())
+}
+
+/// Scores a run file against judgments.
+fn evaluate(args: &[String]) -> Result<(), Failure> {
+    let mut positional: Vec<&str> = Vec::new();
+    let mut coverage = eval::Coverage::Answered;
+    let mut per_query = false;
+    for arg in args {
+        match arg.as_str() {
+            "--complete" => coverage = eval::Coverage::Complete,
+            "--per-query" => per_query = true,
+            other => positional.push(other),
+        }
+    }
+    let [qrels, run] = positional.as_slice() else {
+        return Err(Failure::usage("wanted a qrels file and a run file"));
+    };
+
+    let qrels_path = Path::new(qrels);
+    let qrels_text =
+        fs::read_to_string(qrels_path).map_err(|e| Failure::Io(qrels_path.to_path_buf(), e))?;
+    let qrels = eval::Qrels::parse(&qrels_text)
+        .map_err(|bad| Failure::Format(qrels_path.to_path_buf(), bad))?;
+
+    let run_path = Path::new(run);
+    let run_text =
+        fs::read_to_string(run_path).map_err(|e| Failure::Io(run_path.to_path_buf(), e))?;
+    let run =
+        eval::Run::parse(&run_text).map_err(|bad| Failure::Format(run_path.to_path_buf(), bad))?;
+
+    // An empty file scores zero on every measure, which reads exactly like a
+    // ranking that found nothing, so say which one it was.
+    if qrels.is_empty() {
+        return Err(Failure::Empty(
+            qrels_path.to_path_buf(),
+            "no judgments, so there is nothing to score against",
+        ));
+    }
+    if run.is_empty() {
+        return Err(Failure::Empty(
+            run_path.to_path_buf(),
+            "no results, so every measure would be zero",
+        ));
+    }
+
+    let scores = eval::score(&run, &qrels, coverage);
+    println!("judged   {} queries", qrels.len());
+    println!("answered {} queries", run.len());
+    println!("scored   {} queries", scores.queries);
+    println!();
+
+    if per_query {
+        println!(
+            "  {:<20} {:>10} {:>10} {:>10}",
+            "query", "ndcg@10", "recall@100", "mrr@10"
+        );
+        for (query, one) in eval::each(&run, &qrels, coverage) {
+            println!(
+                "  {query:<20} {:>10.4} {:>10.4} {:>10.4}",
+                one.ndcg_10, one.recall_100, one.mrr_10
+            );
+        }
+        println!();
+    }
+
+    // Named the way trec_eval names them, so a number from here and a number
+    // from there can be put in the same table without a footnote.
+    println!("  {:<16} {:.4}", "ndcg_cut_10", scores.ndcg_10);
+    println!("  {:<16} {:.4}", "recall_100", scores.recall_100);
+    println!("  {:<16} {:.4}", "recip_rank_10", scores.mrr_10);
+    Ok(())
+}
+
+/// The argument at `at`, or a usage failure saying what was wanted.
+fn want<'a>(args: &'a [String], at: usize, wanted: &str) -> Result<&'a str, Failure> {
+    args.get(at)
+        .map(String::as_str)
+        .ok_or_else(|| Failure::usage(wanted.to_string()))
+}
+
+/// What to call a document in output a person or another tool will read.
+fn label(
+    index: &Reader<'_>,
+    doc: kura_core::DocId,
+    field: &str,
+    scratch: &mut Scratch,
+) -> Result<String, Failure> {
+    match index.store() {
+        Some(store) => match store.get(doc, scratch)?.field(field)? {
+            Some(value) => Ok(String::from_utf8_lossy(value).into_owned()),
+            None => Ok(doc.to_string()),
+        },
+        None => Ok(doc.to_string()),
     }
 }
 
@@ -305,6 +541,10 @@ enum Failure {
     Io(PathBuf, std::io::Error),
     /// Writing the report failed, which in practice is a closed pipe.
     Stdout(std::io::Error),
+    /// A qrels or run file did not parse, and which line of it.
+    Format(PathBuf, eval::Bad),
+    /// A file that parsed and held nothing.
+    Empty(PathBuf, &'static str),
     /// The engine refused the data.
     Engine(kura_core::Error),
 }
@@ -327,6 +567,8 @@ impl fmt::Display for Failure {
             Self::Usage(what) => write!(f, "{what}"),
             Self::Io(path, error) => write!(f, "{}: {error}", path.display()),
             Self::Stdout(error) => write!(f, "writing the report: {error}"),
+            Self::Format(path, bad) => write!(f, "{}: {bad}", path.display()),
+            Self::Empty(path, why) => write!(f, "{}: {why}", path.display()),
             Self::Engine(error) => write!(f, "{error}"),
         }
     }
