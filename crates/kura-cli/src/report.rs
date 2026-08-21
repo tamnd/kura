@@ -11,6 +11,7 @@ use std::time::Duration;
 use kura_core::explain::Counters;
 use kura_core::index::Reader;
 use kura_core::posting::BLOCK_SIZE;
+use kura_core::residency::Residency;
 
 use crate::analyse;
 
@@ -137,6 +138,9 @@ pub fn counters(
     line(out, "cursor seeks", counters.seeks, None)?;
     line(out, "cursor advances", counters.advances, None)?;
     writeln!(out)?;
+    if let Some(residency) = counters.residency {
+        memory(&residency, out)?;
+    }
     writeln!(
         out,
         "took     {took:.3?}, and {:.1}% of the postings were never read",
@@ -144,6 +148,73 @@ pub fn counters(
     )?;
     writeln!(out)?;
     Ok(())
+}
+
+/// Prints what the query cost in memory.
+///
+/// Separate from the walk counters above and printed under its own heading,
+/// because it is measured differently. Those are counted by the walk as it goes
+/// and are exact. These are read from the operating system before and after, and
+/// what they include depends on the platform and on what else the process was
+/// doing. Running them together in one table would make them look equally
+/// trustworthy, and they are not.
+fn memory(residency: &Residency, out: &mut impl Write) -> io::Result<()> {
+    writeln!(out, "  memory")?;
+    match residency.resident_before {
+        Some(resident) => {
+            let warm = residency.warm().unwrap_or(0.0);
+            writeln!(
+                out,
+                "  {:<24} {:>12}  of {:<12} {:>5.1}%",
+                "index resident before",
+                bytes(resident),
+                bytes(residency.total),
+                f64::from(warm) * 100.0
+            )?;
+        }
+        None => writeln!(out, "  {:<24} {:>12}", "index resident before", "unknown")?,
+    }
+    fault_line(out, "page faults", residency.faults, residency.faulted())?;
+    fault_line(
+        out,
+        "of those, from disk",
+        residency.faults_from_disk,
+        residency.faulted_from_disk(),
+    )?;
+    if let Some(note) = residency.note {
+        writeln!(out, "         {note}")?;
+    }
+    // Nobody should read these as belonging to the query alone without being
+    // told where they came from, and the place to tell them is here.
+    writeln!(
+        out,
+        "         faults are counted by the operating system around the query rather"
+    )?;
+    writeln!(
+        out,
+        "         than inside it, so anything else this process did lands here too"
+    )?;
+    writeln!(out)?;
+    Ok(())
+}
+
+/// One fault count, and the size it works out to.
+///
+/// Both, because the count is exact and the size is a floor. A fault can hand
+/// over more than one page where the kernel uses huge pages, and printing only
+/// the size would quietly turn that into a wrong answer instead of a small one.
+fn fault_line(
+    out: &mut impl Write,
+    name: &str,
+    count: Option<u64>,
+    size: Option<u64>,
+) -> io::Result<()> {
+    match (count, size) {
+        (Some(count), Some(size)) => {
+            writeln!(out, "  {name:<24} {count:>12}  {:>12}", bytes(size))
+        }
+        _ => writeln!(out, "  {name:<24} {:>12}", "unknown"),
+    }
 }
 
 /// One counter, against its denominator when it has one.
@@ -231,6 +302,7 @@ mod tests {
             documents_scored: 256,
             seeks: 6,
             advances: 256,
+            residency: None,
         };
         let mut out = Vec::new();
         super::counters(
@@ -249,6 +321,52 @@ mod tests {
     }
 
     #[test]
+    fn a_memory_reading_is_printed_against_the_size_of_the_index() {
+        let residency = Residency {
+            faults: Some(512),
+            faults_from_disk: Some(256),
+            resident_before: Some(8 * 1_048_576),
+            total: 32 * 1_048_576,
+            page: 4096,
+            note: None,
+        };
+        let mut out = Vec::new();
+        memory(&residency, &mut out).expect("writes");
+        let text = String::from_utf8(out).expect("ascii");
+
+        assert!(text.contains("8.0 MB"), "{text}");
+        assert!(text.contains("32.0 MB"), "{text}");
+        assert!(text.contains("25.0%"), "{text}");
+        // The count and the size it works out to, for both kinds of fault.
+        assert!(text.contains("512"), "{text}");
+        assert!(text.contains("2.0 MB"), "{text}");
+        assert!(text.contains("256"), "{text}");
+        assert!(text.contains("1.0 MB"), "{text}");
+        assert!(!text.contains("unknown"), "{text}");
+    }
+
+    #[test]
+    fn a_platform_that_cannot_answer_is_printed_as_unknown_and_not_as_zero() {
+        // The whole reason these are options. A zero here would read as a cold
+        // index that faulted nothing, which is the opposite of not knowing.
+        let residency = Residency {
+            faults: None,
+            faults_from_disk: None,
+            resident_before: None,
+            total: 32 * 1_048_576,
+            page: 4096,
+            note: Some("this platform does not account for page faults"),
+        };
+        let mut out = Vec::new();
+        memory(&residency, &mut out).expect("writes");
+        let text = String::from_utf8(out).expect("ascii");
+
+        assert_eq!(text.matches("unknown").count(), 3, "{text}");
+        assert!(text.contains("does not account for page faults"), "{text}");
+        assert!(!text.contains(" 0 B"), "{text}");
+    }
+
+    #[test]
     fn the_walk_that_counts_says_why_it_skipped_nothing() {
         // A reader who sees zeroes without the reason spends the afternoon
         // looking for a bug in the pruning that is not there.
@@ -262,6 +380,7 @@ mod tests {
             documents_scored: 247,
             seeks: 41,
             advances: 10_567,
+            residency: None,
         };
         let mut out = Vec::new();
         super::counters(

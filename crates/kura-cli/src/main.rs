@@ -35,6 +35,7 @@ use std::time::Instant;
 
 use kura_core::analysis::Analyzer;
 use kura_core::index::{Reader, Writer};
+use kura_core::residency;
 use kura_core::search::Searcher;
 use kura_core::segment::Segment;
 use kura_core::store::Scratch;
@@ -467,13 +468,22 @@ fn query(args: &[String], explaining: bool) -> Result<(), Failure> {
     // applies to, and `--total` explains the other one on purpose.
     let started = Instant::now();
     let (hits, total, counters) = match (explaining, with_total) {
+        // Wrapped in a probe, so the report can say how much of the index was
+        // already in memory and how much of it this query had to fetch. Only
+        // `explain` pays for it, and only `explain` prints it.
         (true, false) => {
-            let (hits, counters) = searcher.search_explained(&text, k)?;
-            (hits, None, counters)
+            let ((hits, total), counters) = residency::measured(&bytes, || {
+                let (hits, counters) = searcher.search_explained(&text, k)?;
+                Ok::<_, Failure>(((hits, None), counters))
+            })?;
+            (hits, total, counters)
         }
         (true, true) => {
-            let (hits, total, counters) = searcher.search_and_count_explained(&text, k)?;
-            (hits, Some(total), counters)
+            let ((hits, total), counters) = residency::measured(&bytes, || {
+                let (hits, total, counters) = searcher.search_and_count_explained(&text, k)?;
+                Ok::<_, Failure>(((hits, Some(total)), counters))
+            })?;
+            (hits, total, counters)
         }
         (false, _) => {
             let (hits, total) = searcher.search_and_count(&text, k)?;
