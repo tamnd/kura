@@ -174,14 +174,13 @@ fn memory(residency: &Residency, out: &mut impl Write) -> io::Result<()> {
         }
         None => writeln!(out, "  {:<24} {:>12}", "index resident before", "unknown")?,
     }
-    match residency.faulted {
-        Some(faulted) => writeln!(out, "  {:<24} {:>12}", "faulted in", bytes(faulted))?,
-        None => writeln!(out, "  {:<24} {:>12}", "faulted in", "unknown")?,
-    }
-    match residency.faulted_from_disk {
-        Some(disk) => writeln!(out, "  {:<24} {:>12}", "of that, from disk", bytes(disk))?,
-        None => writeln!(out, "  {:<24} {:>12}", "of that, from disk", "unknown")?,
-    }
+    fault_line(out, "page faults", residency.faults, residency.faulted())?;
+    fault_line(
+        out,
+        "of those, from disk",
+        residency.faults_from_disk,
+        residency.faulted_from_disk(),
+    )?;
     if let Some(note) = residency.note {
         writeln!(out, "         {note}")?;
     }
@@ -197,6 +196,25 @@ fn memory(residency: &Residency, out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(out)?;
     Ok(())
+}
+
+/// One fault count, and the size it works out to.
+///
+/// Both, because the count is exact and the size is a floor. A fault can hand
+/// over more than one page where the kernel uses huge pages, and printing only
+/// the size would quietly turn that into a wrong answer instead of a small one.
+fn fault_line(
+    out: &mut impl Write,
+    name: &str,
+    count: Option<u64>,
+    size: Option<u64>,
+) -> io::Result<()> {
+    match (count, size) {
+        (Some(count), Some(size)) => {
+            writeln!(out, "  {name:<24} {count:>12}  {:>12}", bytes(size))
+        }
+        _ => writeln!(out, "  {name:<24} {:>12}", "unknown"),
+    }
 }
 
 /// One counter, against its denominator when it has one.
@@ -305,10 +323,11 @@ mod tests {
     #[test]
     fn a_memory_reading_is_printed_against_the_size_of_the_index() {
         let residency = Residency {
-            faulted: Some(2 * 1_048_576),
-            faulted_from_disk: Some(1_048_576),
+            faults: Some(512),
+            faults_from_disk: Some(256),
             resident_before: Some(8 * 1_048_576),
             total: 32 * 1_048_576,
+            page: 4096,
             note: None,
         };
         let mut out = Vec::new();
@@ -318,7 +337,10 @@ mod tests {
         assert!(text.contains("8.0 MB"), "{text}");
         assert!(text.contains("32.0 MB"), "{text}");
         assert!(text.contains("25.0%"), "{text}");
+        // The count and the size it works out to, for both kinds of fault.
+        assert!(text.contains("512"), "{text}");
         assert!(text.contains("2.0 MB"), "{text}");
+        assert!(text.contains("256"), "{text}");
         assert!(text.contains("1.0 MB"), "{text}");
         assert!(!text.contains("unknown"), "{text}");
     }
@@ -328,10 +350,11 @@ mod tests {
         // The whole reason these are options. A zero here would read as a cold
         // index that faulted nothing, which is the opposite of not knowing.
         let residency = Residency {
-            faulted: None,
-            faulted_from_disk: None,
+            faults: None,
+            faults_from_disk: None,
             resident_before: None,
             total: 32 * 1_048_576,
+            page: 4096,
             note: Some("this platform does not account for page faults"),
         };
         let mut out = Vec::new();

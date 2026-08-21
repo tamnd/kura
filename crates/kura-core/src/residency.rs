@@ -55,6 +55,15 @@
 //! has, and not as how much of the file the machine has somewhere in memory.
 //! The `faulted from disk` count is the one that separates those two, and it is
 //! why both are reported.
+//!
+//! Faults are counted and not measured. A size is the count times the page size,
+//! and a single fault can hand over more than one page: Linux gives out
+//! anonymous memory two megabytes at a time when transparent huge pages are on,
+//! so a ninety six megabyte region is twenty four thousand pages and forty eight
+//! faults. A file backed mapping, which is what an index is, takes ordinary page
+//! sized faults on every system we build for, so for the case this exists to
+//! measure the two agree. The counts are exact either way, which is why they are
+//! what the type carries and the sizes are derived from them.
 
 use crate::explain::Counters;
 
@@ -65,23 +74,48 @@ use crate::explain::Counters;
 /// than a counter that is missing.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Residency {
-    /// How many bytes the query faulted in, from disk or from cache.
-    pub faulted: Option<u64>,
-    /// How many of those bytes needed a read from storage.
+    /// How many times the query faulted, from storage or from cache.
+    pub faults: Option<u64>,
+    /// How many of those faults needed a read from storage.
     ///
-    /// The expensive kind. A query where this is zero and `faulted` is large
-    /// paid for page table entries, which is microseconds. A query where the two
-    /// are equal paid for storage, which is milliseconds.
-    pub faulted_from_disk: Option<u64>,
+    /// The expensive kind. A query where this is zero and `faults` is large paid
+    /// for page table entries, which is microseconds. A query where the two are
+    /// equal paid for storage, which is milliseconds.
+    pub faults_from_disk: Option<u64>,
     /// How many bytes of the index were already resident when the query started.
     pub resident_before: Option<u64>,
     /// How many bytes the index is, so the rest have a denominator.
     pub total: u64,
+    /// How big a page is here, which is what turns a count into a size.
+    pub page: u64,
     /// Why something above is missing, when something is.
     pub note: Option<&'static str>,
 }
 
 impl Residency {
+    /// How many bytes the query faulted in, at least.
+    ///
+    /// At least, because this is the fault count times the page size and a
+    /// single fault can bring in more than one page. Linux does that routinely:
+    /// a ninety six megabyte anonymous region is twenty four thousand pages and
+    /// faults forty eight times, because transparent huge pages hand it over two
+    /// megabytes at a time. A file backed mapping, which is what an index is,
+    /// takes ordinary page sized faults on every system we build for, so for the
+    /// case this exists to measure the floor and the answer are the same number.
+    /// It is worth knowing which one is being read.
+    #[must_use]
+    pub fn faulted(&self) -> Option<u64> {
+        self.faults.map(|faults| faults.saturating_mul(self.page))
+    }
+
+    /// How many of those bytes came from storage, at least.
+    ///
+    /// The same caveat as [`Residency::faulted`].
+    #[must_use]
+    pub fn faulted_from_disk(&self) -> Option<u64> {
+        self.faults_from_disk
+            .map(|faults| faults.saturating_mul(self.page))
+    }
     /// What fraction of the index was resident before the query.
     ///
     /// One is a fully warm file, zero is a cold one, and `None` is either an
@@ -159,10 +193,11 @@ impl Probe {
     pub fn finish(self) -> Residency {
         let after = platform::faults();
         let mut residency = Residency {
-            faulted: None,
-            faulted_from_disk: None,
+            faults: None,
+            faults_from_disk: None,
             resident_before: self.resident_before,
             total: self.total,
+            page: self.page,
             note: self.why_not,
         };
 
@@ -173,9 +208,9 @@ impl Probe {
                 // back something we do not understand. Zero is the truthful
                 // answer to "how many more than before". A wrapped count of
                 // eighteen quintillion is not.
-                residency.faulted = Some(after.faults.saturating_sub(before.faults) * self.page);
-                residency.faulted_from_disk = match (before.from_disk, after.from_disk) {
-                    (Some(before), Some(after)) => Some(after.saturating_sub(before) * self.page),
+                residency.faults = Some(after.faults.saturating_sub(before.faults));
+                residency.faults_from_disk = match (before.from_disk, after.from_disk) {
+                    (Some(before), Some(after)) => Some(after.saturating_sub(before)),
                     _ => None,
                 };
             }
@@ -621,27 +656,29 @@ mod tests {
         }
         let second = second.finish();
 
-        let Some(first) = first.faulted else {
+        let Some(first) = first.faults else {
             // A platform that says it cannot answer is allowed to say so, and
             // this test is about the ones that can.
             assert!(first.note.is_some());
             return;
         };
-        let second = second.faulted.expect("the same platform answered once");
+        let second = second.faults.expect("the same platform answered once");
 
-        // Half the region rather than all of it, because the allocator may have
-        // touched some of it already and a system is free to hand back more than
-        // one page per fault.
+        // Counts rather than sizes, and a floor of forty rather than one page
+        // per page of the region. Linux hands anonymous memory over two megabytes
+        // at a time, so ninety six megabytes is forty eight faults there and
+        // twenty four thousand on a system without huge pages. Both are the first
+        // pass collecting the region, which is what is under test.
         assert!(
-            first >= as_u64(REGION) / 2,
-            "the first pass over {REGION} bytes faulted {first}"
+            first >= 40,
+            "the first pass over {REGION} bytes faulted {first} times"
         );
         // Not zero, because the other test threads are faulting too and the
         // counter is process wide on three platforms out of four. A tenth is far
         // below anything a real second pass could cost and far above the noise.
         assert!(
             second < first / 10,
-            "the second pass faulted {second} against {first} for the first"
+            "the second pass faulted {second} times against {first} for the first"
         );
     }
 
@@ -668,7 +705,7 @@ mod tests {
         // failure this guards against, because it cannot be told apart from
         // nobody having asked.
         let residency = Probe::start(&[1u8; 64]).finish();
-        if residency.faulted.is_none() || residency.resident_before.is_none() {
+        if residency.faults.is_none() || residency.resident_before.is_none() {
             assert!(residency.note.is_some(), "{residency:?}");
         }
     }
@@ -677,9 +714,27 @@ mod tests {
     fn faults_from_disk_are_never_more_than_faults() {
         let residency = Probe::start(&[]).finish();
 
-        if let (Some(faulted), Some(from_disk)) = (residency.faulted, residency.faulted_from_disk) {
-            assert!(from_disk <= faulted, "{from_disk} of {faulted} from disk");
+        if let (Some(faults), Some(from_disk)) = (residency.faults, residency.faults_from_disk) {
+            assert!(from_disk <= faults, "{from_disk} of {faults} from disk");
         }
+    }
+
+    #[test]
+    fn a_size_is_the_count_times_the_page() {
+        let residency = Residency {
+            faults: Some(3),
+            faults_from_disk: Some(1),
+            resident_before: Some(0),
+            total: 1 << 20,
+            page: 4096,
+            note: None,
+        };
+        assert_eq!(residency.faulted(), Some(12288));
+        assert_eq!(residency.faulted_from_disk(), Some(4096));
+
+        let unknown = Residency::default();
+        assert_eq!(unknown.faulted(), None);
+        assert_eq!(unknown.faulted_from_disk(), None);
     }
 
     #[test]
