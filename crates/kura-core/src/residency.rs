@@ -644,16 +644,27 @@ mod tests {
         // Started on an empty slice on purpose. The residency scan allocates,
         // and a scan of this region would fault pages of its own buffer into
         // the window being measured.
+        //
+        // The region is handed to `black_box` after each pass because nothing
+        // in the test reads what was written, and an optimiser that can see
+        // that is entitled to drop the first pass entirely: the second one
+        // overwrites every byte it touched. Which is what an optimising build
+        // did, leaving the first pass with no faults to its name and the test
+        // failing on a claim that was true about the source and not about the
+        // program. `black_box` makes the address opaque, so the stores before
+        // it have to happen.
         let first = Probe::start(&[]);
         for at in (0..REGION).step_by(page) {
             region[at] = 1;
         }
+        core::hint::black_box(&region);
         let first = first.finish();
 
         let second = Probe::start(&[]);
         for at in (0..REGION).step_by(page) {
             region[at] = 2;
         }
+        core::hint::black_box(&region);
         let second = second.finish();
 
         let Some(first) = first.faults else {
