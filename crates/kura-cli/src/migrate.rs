@@ -35,9 +35,11 @@
 //! the store with something that flushes it first.
 //!
 //! A store with tombstones, because a tombstone bitmap lives outside the segment
-//! it belongs to and moving segments moves it. Nothing writes tombstones yet, so
-//! this is a guard against a later build rather than a case anybody will hit,
-//! and a guard that refuses is better than one that quietly drops deletions.
+//! it belongs to and moving segments moves it. A store that has had anything
+//! deleted from it hits this, and refusing is better than quietly dropping the
+//! deletions and answering with documents somebody deleted. Compact the store
+//! first, which is what turns a segment and its tombstones into a segment with
+//! nothing deleted, then migrate that.
 
 use std::io::Write;
 use std::path::Path;

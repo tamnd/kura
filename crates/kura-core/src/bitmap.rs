@@ -279,6 +279,30 @@ impl Bitmap {
         Some(DocId::from(chunk.key) << 16 | DocId::from(low))
     }
 
+    /// The smallest ordinal the set does not hold.
+    ///
+    /// Zero for a set that does not start at zero, which includes the empty set.
+    ///
+    /// This is how a set of deletions says where the documents that are still
+    /// worth reading begin. A store that deletes from the front, which is what
+    /// deleting the oldest of anything looks like, ends up with a long prefix of
+    /// gone documents in its first segment, and a compaction that knows where
+    /// the prefix ends can skip it without asking about each one.
+    ///
+    /// The walk costs the length of that prefix and stops at the first gap, so
+    /// it is as long as the answer is and no longer.
+    #[must_use]
+    pub fn first_absent(&self) -> DocId {
+        let mut next = 0;
+        for ordinal in self {
+            if ordinal != next {
+                break;
+            }
+            next = ordinal.saturating_add(1);
+        }
+        next
+    }
+
     /// Returns roughly what the set costs in memory, in bytes.
     ///
     /// This is the number the whole module is about, so it is readable rather
@@ -2191,6 +2215,33 @@ mod tests {
         let mut many = Bitmap::from_sorted(&(0..1_000).collect::<Vec<_>>());
         many.insert(u32::MAX);
         assert_eq!(many.max(), Some(u32::MAX));
+    }
+
+    #[test]
+    fn the_first_ordinal_the_set_does_not_hold_is_where_the_prefix_ends() {
+        assert_eq!(Bitmap::new().first_absent(), 0);
+        // A set that does not start at zero has no prefix, so the answer is
+        // zero and not the first member.
+        assert_eq!(sparse(&[3, 4, 5]).first_absent(), 0);
+        assert_eq!(sparse(&[0]).first_absent(), 1);
+        assert_eq!(sparse(&[0, 1, 2, 7]).first_absent(), 3);
+        // Across a chunk boundary, where the prefix is one whole container and
+        // the first member of the next.
+        let chunk = DocId::try_from(CHUNK).expect("a chunk is sixty five thousand wide");
+        let mut over = dense(chunk);
+        over.insert(chunk);
+        over.insert(chunk + 2);
+        assert_eq!(over.first_absent(), chunk + 1);
+    }
+
+    #[test]
+    fn the_first_absent_ordinal_moves_back_when_the_prefix_is_broken() {
+        let mut map = Bitmap::from_sorted(&(0..1_000).collect::<Vec<_>>());
+        assert_eq!(map.first_absent(), 1_000);
+        map.remove(500);
+        assert_eq!(map.first_absent(), 500);
+        map.remove(0);
+        assert_eq!(map.first_absent(), 0);
     }
 
     #[test]

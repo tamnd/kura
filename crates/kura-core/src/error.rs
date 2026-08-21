@@ -124,6 +124,22 @@ pub enum Error {
         count: u64,
     },
 
+    /// A commit names an older set of deletions for a segment than the one that
+    /// is already committed.
+    ///
+    /// Deletions only ever accumulate until a compaction rewrites the segment,
+    /// so a generation that goes backwards means two writers are working from
+    /// different ideas of what is deleted and one of them is about to bring
+    /// documents back.
+    StaleGeneration {
+        /// Where the segment is in the file, which is what identifies it.
+        offset: u64,
+        /// The generation the committed manifest has.
+        committed: u32,
+        /// The generation the commit was asked to write.
+        given: u32,
+    },
+
     /// A set of deletions names a document the segment it belongs to does not
     /// have, so the two came from different builds of the same store.
     NoSuchDocument {
@@ -306,6 +322,17 @@ impl fmt::Display for Error {
                     f,
                     "these segments hold {count} documents between them, which is more than one \
                      search can number"
+                )
+            }
+            Self::StaleGeneration {
+                offset,
+                committed,
+                given,
+            } => {
+                write!(
+                    f,
+                    "a commit puts the segment at {offset} back to tombstone \
+                     generation {given} from {committed}"
                 )
             }
             Self::NoSuchDocument { doc, documents } => {
