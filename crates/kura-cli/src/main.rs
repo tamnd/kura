@@ -112,6 +112,7 @@ options:
   -k <n>        how many results, for search and explain (default 10)
   -o <file>     where to write, for index and topics
   --store       for index, add a segment to a store rather than write a bare one
+  --flush-every <size>  for index, start a new segment once this much text has gone in
   --total       for explain, walk for the total as well as the page
   --depth <n>   how deep a run file goes, for topics (default 1000)
   --tag <name>  what the run file calls this run (default kura)
@@ -129,6 +130,11 @@ an <index> is either a single segment, which is what index writes by default,
 or a store holding any number of them, which is what --store writes into. Every
 command that reads one takes either, and a query over a store searches all of
 its segments together.
+
+--flush-every takes a plain number of bytes or a number with k, m or g after it,
+and it is what bounds how much of a corpus an index run holds at once. Without
+it a run keeps every posting in memory until the last file has been read, so the
+memory it needs is the size of what it was pointed at.
 
 a dump is tab separated with a comment line naming its columns, and every line
 says which segment it came from. It prints terms and stored fields, which is to
@@ -535,10 +541,18 @@ fn index(args: &[String]) -> Result<(), Failure> {
     let mut inputs: Vec<PathBuf> = Vec::new();
     let mut out: Option<PathBuf> = None;
     let mut into_store = false;
+    let mut flush_every: Option<u64> = None;
     let mut at = 0;
     while at < args.len() {
         match args[at].as_str() {
             "--store" => into_store = true,
+            "--flush-every" => {
+                at += 1;
+                let value = args
+                    .get(at)
+                    .ok_or_else(|| Failure::usage("--flush-every wants a size"))?;
+                flush_every = Some(size(value)?);
+            }
             "-o" => {
                 at += 1;
                 let path = args
@@ -554,6 +568,11 @@ fn index(args: &[String]) -> Result<(), Failure> {
         return Err(Failure::usage("nothing to index"));
     }
     let out = out.ok_or_else(|| Failure::usage("no -o, so nowhere to write"))?;
+    if flush_every.is_some() && !into_store {
+        // A file that is one segment can hold one segment, and the whole of
+        // what this option does is write more than one.
+        return Err(Failure::usage("--flush-every needs --store to flush into"));
+    }
 
     let mut files = Vec::new();
     for input in &inputs {
@@ -564,7 +583,11 @@ fn index(args: &[String]) -> Result<(), Failure> {
     let started = Instant::now();
     let mut writer = Writer::new();
     let mut bytes = 0u64;
+    let mut written = 0u64;
+    let mut pending = 0u64;
+    let mut documents = 0usize;
     let mut skipped = 0usize;
+    let mut held = 0usize;
     for file in &files {
         let Ok(content) = fs::read(file) else {
             skipped += 1;
@@ -580,24 +603,46 @@ fn index(args: &[String]) -> Result<(), Failure> {
             continue;
         }
         bytes += content.len() as u64;
+        pending += content.len() as u64;
         let path = file.to_string_lossy().into_owned();
         writer.add_with_fields(&text, [(PATH_FIELD, path.as_bytes())])?;
+
+        // The budget is checked after the document rather than before it,
+        // because a budget that stopped short of a document would be a budget
+        // that refused documents larger than itself.
+        if flush_every.is_some_and(|budget| pending >= budget) {
+            let count = writer.len();
+            let segment = std::mem::replace(&mut writer, Writer::new()).finish()?;
+            written += segment.len() as u64;
+            documents += count;
+            held = add_to_store(&out, &segment, count)?;
+            pending = 0;
+        }
     }
-    let documents = writer.len();
-    let segment = writer.finish()?;
-    let held = if into_store {
-        add_to_store(&out, &segment, documents)?
-    } else {
-        fs::write(&out, &segment).map_err(|error| Failure::Io(out.clone(), error))?;
-        1
-    };
+
+    // The last flush, and on a run without the option the only one. A writer
+    // holding nothing is not written out, because a segment of no documents is a
+    // segment every later reader has to skip over for the rest of the file's
+    // life.
+    if !writer.is_empty() || documents == 0 {
+        let count = writer.len();
+        let segment = writer.finish()?;
+        written += segment.len() as u64;
+        documents += count;
+        held = if into_store {
+            add_to_store(&out, &segment, count)?
+        } else {
+            fs::write(&out, &segment).map_err(|error| Failure::Io(out.clone(), error))?;
+            1
+        };
+    }
     let took = started.elapsed();
 
     println!(
         "indexed {documents} documents, {} of text into {}, {} in {:.1?}",
         report::bytes(bytes),
         out.display(),
-        report::bytes(segment.len() as u64),
+        report::bytes(written),
         took
     );
     if into_store {
@@ -607,6 +652,32 @@ fn index(args: &[String]) -> Result<(), Failure> {
         println!("skipped {skipped} files that were not text");
     }
     Ok(())
+}
+
+/// A size on the command line, in bytes or with a unit after it.
+///
+/// The units are powers of two, which is what everything else here prints, and
+/// a run that has to be typed as 268435456 is a run somebody gets wrong once and
+/// then does not repeat.
+fn size(value: &str) -> Result<u64, Failure> {
+    let (digits, scale) = match value.as_bytes().last() {
+        Some(b'k' | b'K') => (&value[..value.len() - 1], 1 << 10),
+        Some(b'm' | b'M') => (&value[..value.len() - 1], 1 << 20),
+        Some(b'g' | b'G') => (&value[..value.len() - 1], 1 << 30),
+        _ => (value, 1),
+    };
+    let count: u64 = digits
+        .parse()
+        .map_err(|_| Failure::usage(format!("{value} is not a size")))?;
+    let bytes = count
+        .checked_mul(scale)
+        .ok_or_else(|| Failure::usage(format!("{value} is larger than this machine can count")))?;
+    if bytes == 0 {
+        return Err(Failure::usage(
+            "a size of zero would flush after every document",
+        ));
+    }
+    Ok(bytes)
 }
 
 /// Adds one segment to a store, making the store first if it is not there.
@@ -1102,6 +1173,148 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "the two pages are the same arithmetic over the same corpus, so \
+                  anything but an exact match is the merge getting it wrong"
+    )]
+    fn flushing_part_way_through_answers_the_way_one_segment_does() {
+        // The same claim as the test above, made about one run rather than four,
+        // which is the case a corpus that does not arrive in pieces produces.
+        // The same files, in the same order, so the two indexes differ in how
+        // many segments they are cut into and in nothing else.
+        let dir = scratch_dir("flush-vs-segment");
+        let corpus = documents(&dir.join("corpus"), 0, 200);
+
+        let whole = dir.join("whole.kura");
+        index(&[
+            corpus.to_string_lossy().into_owned(),
+            "-o".into(),
+            whole.to_string_lossy().into_owned(),
+        ])
+        .expect("one segment");
+
+        let cut = dir.join("cut.kura");
+        index(&[
+            corpus.to_string_lossy().into_owned(),
+            "-o".into(),
+            cut.to_string_lossy().into_owned(),
+            "--store".into(),
+            "--flush-every".into(),
+            "512".into(),
+        ])
+        .expect("several segments");
+
+        let bytes = Map::open(&cut).expect("mapped");
+        let held = segments_in(&bytes, true).expect("segments").len();
+        assert!(held > 1, "the corpus went into {held} segments");
+
+        for query in ["ledger", "invoice quarter", "ledger audit invoice"] {
+            let one = scores(&whole, query, 20);
+            let many = scores(&cut, query, 20);
+            assert_eq!(one.len(), many.len(), "{query}");
+            for (at, (a, b)) in one.iter().zip(&many).enumerate() {
+                assert_eq!(a, b, "{query} at rank {}", at + 1);
+            }
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_document_survives_being_cut_into_segments() {
+        // A flush that dropped the document it flushed on, or counted one twice,
+        // would still answer queries and would answer them over the wrong
+        // corpus, so the count is worth asserting separately from the scores.
+        let dir = scratch_dir("flush-counts");
+        let corpus = documents(&dir.join("corpus"), 0, 137);
+
+        let cut = dir.join("cut.kura");
+        index(&[
+            corpus.to_string_lossy().into_owned(),
+            "-o".into(),
+            cut.to_string_lossy().into_owned(),
+            "--store".into(),
+            "--flush-every".into(),
+            "1k".into(),
+        ])
+        .expect("several segments");
+
+        let store = Store::open(&cut).expect("the store opens");
+        assert_eq!(store.manifest().total, 137);
+        assert_eq!(store.manifest().live, 137);
+        let counted: u64 = store
+            .manifest()
+            .segments
+            .iter()
+            .map(|segment| u64::from(segment.docs))
+            .sum();
+        assert_eq!(counted, 137);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_budget_nothing_reaches_leaves_one_segment_and_no_empty_one() {
+        // A corpus smaller than the budget never flushes, so the whole of it
+        // comes out of the last flush, and there must not be a second segment
+        // holding nothing behind it.
+        let dir = scratch_dir("flush-never");
+        let corpus = documents(&dir.join("corpus"), 0, 10);
+
+        let cut = dir.join("cut.kura");
+        index(&[
+            corpus.to_string_lossy().into_owned(),
+            "-o".into(),
+            cut.to_string_lossy().into_owned(),
+            "--store".into(),
+            "--flush-every".into(),
+            "1g".into(),
+        ])
+        .expect("one segment");
+
+        let store = Store::open(&cut).expect("the store opens");
+        assert_eq!(store.manifest().segments.len(), 1);
+        assert_eq!(store.manifest().total, 10);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn flushing_needs_somewhere_to_flush_into() {
+        let dir = scratch_dir("flush-bare");
+        let corpus = documents(&dir.join("corpus"), 0, 4);
+        let refused = index(&[
+            corpus.to_string_lossy().into_owned(),
+            "-o".into(),
+            dir.join("bare.kura").to_string_lossy().into_owned(),
+            "--flush-every".into(),
+            "1k".into(),
+        ]);
+        assert!(refused.is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_size_takes_a_unit_or_goes_without_one() {
+        assert_eq!(size("4096").expect("plain bytes"), 4096);
+        assert_eq!(size("64k").expect("kibibytes"), 64 << 10);
+        assert_eq!(size("2M").expect("mebibytes"), 2 << 20);
+        assert_eq!(size("1g").expect("gibibytes"), 1 << 30);
+    }
+
+    #[test]
+    fn a_size_that_is_not_one_is_refused_rather_than_guessed_at() {
+        // Nothing here should turn into a number by accident, and a zero is the
+        // one that would otherwise be accepted and then flush after every
+        // document.
+        for value in ["", "k", "-1", "1kb", "1.5g", "0", "0k", "many"] {
+            assert!(size(value).is_err(), "{value} was taken as a size");
+        }
+        assert!(size("99999999999g").is_err());
     }
 
     #[test]
