@@ -1,6 +1,6 @@
 //! Command line access to a kura index.
 //!
-//! Five commands, in two groups.
+//! Seven commands, in three groups.
 //!
 //! `index` builds an index out of a directory so there is something to ask
 //! questions of. `search` runs a query and prints what came back. `explain`
@@ -19,9 +19,15 @@
 //! file against judgments, and between them a ranking change stops being a
 //! matter of opinion. See [`eval`] for what the numbers mean.
 //!
+//! `verify` and `dump` are the third group, and they are for the file rather
+//! than for the answers. `verify` reads an index all the way through and says
+//! whether it is intact. `dump` prints what is in it, one record to a line, for
+//! the questions that start with somebody not believing what came back.
+//!
 //! There are no dependencies here for the same reason there are none in the
 //! engine. Argument parsing is forty lines and a crate is forever.
 
+mod dump;
 mod eval;
 mod report;
 mod verify;
@@ -95,6 +101,7 @@ usage:
   kura-cli topics <index> <topics> -o <run>  answer a file of queries into a run file
   kura-cli eval <qrels> <run>                score a run file against judgments
   kura-cli verify <index>                    read an index through and report what is wrong
+  kura-cli dump <index>                      print what is in an index, one record to a line
 
 options:
   -k <n>        how many results, for search and explain (default 10)
@@ -107,11 +114,20 @@ options:
   --verify      check the index checksum before querying, which reads all of it
   --complete    for eval, score every judged query and not only the answered ones
   --per-query   for eval, print a line per query as well as the averages
+  --postings    for dump, a line per posting rather than a line per term
+  --documents   for dump, a line per stored field rather than a line per term
+  --term <t>    for dump, only this term, which reads no others
+  --limit <n>   for dump, stop after this many records
 
 an <index> is either a single segment, which is what index writes by default,
 or a store holding any number of them, which is what --store writes into. Every
 command that reads one takes either, and a query over a store searches all of
 its segments together.
+
+a dump is tab separated with a comment line naming its columns, and every line
+says which segment it came from. It prints terms and stored fields, which is to
+say it prints the corpus, so treat what comes out of it the way the corpus it
+came from has to be treated.
 
 formats:
   topics    one query per line, the identifier and the text separated by a tab
@@ -129,11 +145,84 @@ fn run() -> Result<(), Failure> {
         "topics" => topics(&rest),
         "eval" => evaluate(&rest),
         "verify" => check(&rest),
+        "dump" => show(&rest),
         "-h" | "--help" | "help" => {
             println!("{USAGE}");
             Ok(())
         }
         other => Err(Failure::usage(format!("unknown command {other}"))),
+    }
+}
+
+/// Prints what is inside an index, one record to a line.
+///
+/// See [`dump`] for the shape of the output and for what it means that this is
+/// the one command here which prints the corpus back out.
+fn show(args: &[String]) -> Result<(), Failure> {
+    let mut positional = Vec::new();
+    let mut what = dump::What::Terms;
+    let mut chosen: Option<&str> = None;
+    let mut term: Option<Vec<u8>> = None;
+    let mut limit: Option<u64> = None;
+    let mut at = 0;
+    while at < args.len() {
+        match args[at].as_str() {
+            // Two modes at once is a typo rather than a request, and the two
+            // answers it could be given, the first flag or the last, are both
+            // wrong half the time.
+            flag @ ("--postings" | "--documents") => {
+                if let Some(already) = chosen {
+                    return Err(Failure::usage(format!("{already} and {flag} at once")));
+                }
+                chosen = Some(flag);
+                what = if flag == "--postings" {
+                    dump::What::Postings
+                } else {
+                    dump::What::Documents
+                };
+            }
+            "--term" => {
+                at += 1;
+                term = Some(want(args, at, "--term wants a term")?.as_bytes().to_vec());
+            }
+            "--limit" => {
+                at += 1;
+                let value = want(args, at, "--limit wants a number")?;
+                limit =
+                    Some(value.parse().map_err(|_| {
+                        Failure::usage(format!("--limit wants a number, got {value}"))
+                    })?);
+            }
+            other => positional.push(other),
+        }
+        at += 1;
+    }
+    let [path] = positional.as_slice() else {
+        return Err(Failure::usage("wanted one index file"));
+    };
+
+    // A term on its own means the postings of that term, because a person who
+    // names a term wants to see its list and the one line the dictionary holds
+    // about it is already in the terms mode they did not ask for.
+    if term.is_some() && chosen.is_none() {
+        what = dump::What::Postings;
+    }
+
+    let path = Path::new(path);
+    let bytes = Map::open(path).map_err(|error| Failure::Io(path.to_path_buf(), error))?;
+    let segments = segments_in(&bytes, false)?;
+    let readers = readers_of(&segments)?;
+
+    let request = dump::Request {
+        what,
+        term: term.as_deref(),
+        limit,
+    };
+    let mut out = BufWriter::new(std::io::stdout());
+    dump::to_stdout(&readers, request, &mut out)?;
+    match out.flush() {
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        other => other.map_err(Failure::Stdout),
     }
 }
 

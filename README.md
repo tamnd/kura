@@ -159,6 +159,32 @@ The rank column in a run file is ignored and the score decides the order, ties b
 By default a query the run did not answer is not scored at all, which is `trec_eval` without its `-c` flag.
 Pass `--complete` to score it as a zero instead, which is the honest choice when comparing two engines, because an engine that returns nothing for its hard queries should not score as though nobody asked them.
 
+## Looking at the file itself
+
+```sh
+./target/release/kura-cli verify /tmp/docs.kura
+./target/release/kura-cli dump /tmp/docs.kura | head
+```
+
+`verify` reads an index all the way through and reports what is wrong with it, one line per check.
+It takes a store or a single segment, it keeps going after a failure so the report says how much of the file is damaged rather than only that it is, and it names the section a bad byte landed in, which is the difference between rebuilding one segment and restoring from backup.
+
+`dump` prints what is in an index, one record to a line, tab separated, with a comment line naming the columns.
+The default is the dictionary, `--postings` is a line per posting with its frequency, `--documents` is a line per stored field, and `--term` narrows any of it to one term.
+Every line says which segment it came from, including when there is only one, so a script never has to know which kind of file it is reading.
+
+```
+# segment	term	document	frequency
+1	storage	0	1
+1	storage	1	2
+```
+
+It is meant to be diffed.
+The same corpus indexed by two builds produces two identical dumps, and where they stop being identical is what changed.
+
+A dump prints terms and stored fields, which is to say it prints the corpus back out.
+Whatever rules the corpus came with apply to what comes out of here.
+
 ## Calling it from C
 
 ```c
