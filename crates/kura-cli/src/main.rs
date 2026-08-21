@@ -112,6 +112,7 @@ options:
   -k <n>        how many results, for search and explain (default 10)
   -o <file>     where to write, for index and topics
   --store       for index, add a segment to a store rather than write a bare one
+  --memory <size>       for index, start a new segment once the writer holds this much
   --flush-every <size>  for index, start a new segment once this much text has gone in
   --total       for explain, walk for the total as well as the page
   --depth <n>   how deep a run file goes, for topics (default 1000)
@@ -131,10 +132,20 @@ or a store holding any number of them, which is what --store writes into. Every
 command that reads one takes either, and a query over a store searches all of
 its segments together.
 
---flush-every takes a plain number of bytes or a number with k, m or g after it,
-and it is what bounds how much of a corpus an index run holds at once. Without
-it a run keeps every posting in memory until the last file has been read, so the
-memory it needs is the size of what it was pointed at.
+--memory and --flush-every both take a plain number of bytes or a number with k,
+m or g after it, and each of them bounds how much of a corpus an index run holds
+at once. Without one of them a run keeps every posting in memory until the last
+file has been read, so the memory it needs is the size of what it was pointed at.
+
+--memory is the one to reach for. It is measured in what the writer is holding,
+which is the number the run reports as held, so the budget and the report are in
+the same units. --flush-every is measured in the text that went in, which is a
+different number by a factor that depends on the corpus, and it is there for the
+case where somebody wants segments of a size rather than a ceiling on memory.
+
+Neither of them bounds the whole process. A run also holds the allocator's slack
+and the file it is reading, and on a real corpus the process peaks tens of
+megabytes above what the writer says it holds.
 
 a dump is tab separated with a comment line naming its columns, and every line
 says which segment it came from. It prints terms and stored fields, which is to
@@ -606,6 +617,7 @@ struct Plan {
     out: PathBuf,
     into_store: bool,
     flush_every: Option<u64>,
+    memory: Option<u64>,
 }
 
 impl Plan {
@@ -615,6 +627,7 @@ impl Plan {
         let mut out: Option<PathBuf> = None;
         let mut into_store = false;
         let mut flush_every: Option<u64> = None;
+        let mut memory: Option<u64> = None;
         let mut at = 0;
         while at < args.len() {
             match args[at].as_str() {
@@ -625,6 +638,13 @@ impl Plan {
                         .get(at)
                         .ok_or_else(|| Failure::usage("--flush-every wants a size"))?;
                     flush_every = Some(size(value)?);
+                }
+                "--memory" => {
+                    at += 1;
+                    let value = args
+                        .get(at)
+                        .ok_or_else(|| Failure::usage("--memory wants a size"))?;
+                    memory = Some(size(value)?);
                 }
                 "-o" => {
                     at += 1;
@@ -646,11 +666,32 @@ impl Plan {
             // what this option does is write more than one.
             return Err(Failure::usage("--flush-every needs --store to flush into"));
         }
+        if memory.is_some() && !into_store {
+            return Err(Failure::usage("--memory needs --store to flush into"));
+        }
+        // A writer holds the compressor's match table before it has been given
+        // anything, so a budget under that is a segment per document rather than
+        // a small run, and somebody who asked for a kilobyte meant a megabyte.
+        let floor = Writer::new().held().total();
+        if memory.is_some_and(|budget| budget < floor) {
+            return Err(Failure::usage(format!(
+                "a writer holds {} before it has been given a document, so --memory under that is one segment per document",
+                report::bytes(floor)
+            )));
+        }
+        if memory.is_some() && flush_every.is_some() {
+            // Both would work, and a run that flushed on whichever tripped first
+            // would be a run nobody could read the numbers of afterwards.
+            return Err(Failure::usage(
+                "--memory and --flush-every are two answers to the same question, so pick one",
+            ));
+        }
         Ok(Self {
             inputs,
             out,
             into_store,
             flush_every,
+            memory,
         })
     }
 }
@@ -662,6 +703,7 @@ fn index(args: &[String]) -> Result<(), Failure> {
         out,
         into_store,
         flush_every,
+        memory,
     } = Plan::read(args)?;
 
     let mut files = Vec::new();
@@ -671,7 +713,7 @@ fn index(args: &[String]) -> Result<(), Failure> {
     files.sort();
 
     let started = Instant::now();
-    let mut writer = Writer::new();
+    let mut writer = fresh(memory);
     let mut bytes = 0u64;
     let mut written = 0u64;
     let mut pending = 0u64;
@@ -709,12 +751,11 @@ fn index(args: &[String]) -> Result<(), Failure> {
         // The budget is checked after the document rather than before it,
         // because a budget that stopped short of a document would be a budget
         // that refused documents larger than itself.
-        if flush_every.is_some_and(|budget| pending >= budget) {
-            let count = writer.len();
-            let built = Writer::build(vec![std::mem::replace(&mut writer, Writer::new())])?;
-            written += built.size() as u64;
+        if writer.is_full() || flush_every.is_some_and(|budget| pending >= budget) {
+            let (held, size, count) = flush(&out, &mut writer, memory)?;
+            segments = held;
+            written += size;
             documents += count;
-            segments = add_to_store(&out, built, count)?;
             pending = 0;
         }
     }
@@ -796,6 +837,26 @@ fn size(value: &str) -> Result<u64, Failure> {
         ));
     }
     Ok(bytes)
+}
+
+/// An empty writer, carrying whatever memory budget the run was given.
+fn fresh(memory: Option<u64>) -> Writer {
+    memory.map_or_else(Writer::new, Writer::with_budget)
+}
+
+/// Puts what a writer holds into the store as a segment and empties the writer.
+///
+/// Hands back how many segments the store holds afterwards, how large the
+/// segment was, and how many documents were in it.
+fn flush(
+    out: &Path,
+    writer: &mut Writer,
+    memory: Option<u64>,
+) -> Result<(usize, u64, usize), Failure> {
+    let count = writer.len();
+    let built = Writer::build(vec![std::mem::replace(writer, fresh(memory))])?;
+    let size = built.size() as u64;
+    Ok((add_to_store(out, built, count)?, size, count))
 }
 
 /// Adds one segment to a store, making the store first if it is not there.
@@ -1456,6 +1517,48 @@ mod tests {
             assert!(size(value).is_err(), "{value} was taken as a size");
         }
         assert!(size("99999999999g").is_err());
+    }
+
+    #[test]
+    fn a_memory_budget_is_read_and_is_in_the_units_a_size_is_in() {
+        let args = |extra: &[&str]| {
+            let mut args = vec!["corpus".to_string(), "-o".to_string(), "out".to_string()];
+            args.extend(extra.iter().map(|part| (*part).to_string()));
+            args
+        };
+        let plan = Plan::read(&args(&["--store", "--memory", "32m"])).expect("a plan");
+        assert_eq!(plan.memory, Some(32 << 20));
+        assert_eq!(plan.flush_every, None);
+
+        let plan = Plan::read(&args(&["--store"])).expect("a plan");
+        assert_eq!(plan.memory, None);
+    }
+
+    #[test]
+    fn a_memory_budget_that_would_not_do_what_it_says_is_refused() {
+        let args = |extra: &[&str]| {
+            let mut args = vec!["corpus".to_string(), "-o".to_string(), "out".to_string()];
+            args.extend(extra.iter().map(|part| (*part).to_string()));
+            args
+        };
+        // Nowhere to put the segments it would make.
+        assert!(Plan::read(&args(&["--memory", "32m"])).is_err());
+        // Two answers to the same question.
+        assert!(
+            Plan::read(&args(&[
+                "--store",
+                "--memory",
+                "32m",
+                "--flush-every",
+                "8m"
+            ]))
+            .is_err()
+        );
+        // Under what a writer holds before it has been given a document, which
+        // would be a segment per document rather than a small run.
+        assert!(Plan::read(&args(&["--store", "--memory", "4096"])).is_err());
+        // And the size itself still has to be a size.
+        assert!(Plan::read(&args(&["--store", "--memory"])).is_err());
     }
 
     #[test]

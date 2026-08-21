@@ -153,6 +153,9 @@ pub struct Writer {
     /// section is written at all. An index nobody asks values back from should
     /// not carry eight bytes per document saying so.
     stored: bool,
+    /// How much this writer is willing to hold before it says it is full, if
+    /// anybody said.
+    budget: Option<u64>,
 }
 
 /// How much memory a writer is holding, and where it is.
@@ -204,6 +207,57 @@ impl Writer {
         Self::default()
     }
 
+    /// Creates an empty index that says it is full once it holds `budget` bytes.
+    ///
+    /// The writer does not act on it. It has nowhere to write a segment to and
+    /// no way to know where the caller wants one, so all it does is answer
+    /// [`Writer::is_full`] and leave the decision where the decision belongs.
+    /// What a caller does with a full writer is finish it, put the segment
+    /// somewhere, and carry on with a fresh one.
+    ///
+    /// The budget is bytes of what the writer holds, which is
+    /// [`Held::total`], and not bytes of text that went in. Those differ by a
+    /// factor that depends on the vocabulary and on how repetitive the corpus
+    /// is, so the second is not a budget anybody can set on purpose.
+    ///
+    /// It is also not the memory the process will use. A run holds the writer,
+    /// the allocator's slack and whatever the caller is reading documents
+    /// through, and on real corpora the process peaks at several times what the
+    /// writer says it holds. This bounds the part the engine is responsible for.
+    ///
+    /// There is a floor. A writer holds the compressor's match table before it
+    /// has been given anything, so `Writer::new().held().total()` is the least
+    /// any budget can mean, and a budget under it makes a writer that is full
+    /// from the first document. That is a legal thing to ask for and it is
+    /// almost certainly not what the caller meant.
+    #[must_use]
+    pub fn with_budget(budget: u64) -> Self {
+        Self {
+            budget: Some(budget),
+            ..Self::default()
+        }
+    }
+
+    /// What this writer was told it may hold, if anything.
+    #[must_use]
+    pub const fn budget(&self) -> Option<u64> {
+        self.budget
+    }
+
+    /// Whether it is holding as much as it was told it may.
+    ///
+    /// Always false on a writer nobody gave a budget to, which is what a writer
+    /// that keeps everything until the end has always done.
+    ///
+    /// Ask it after adding a document rather than before. A writer asked first
+    /// would refuse a document larger than the whole budget, and a budget that
+    /// cannot index a large file is not a budget, it is a corpus filter.
+    #[must_use]
+    pub fn is_full(&self) -> bool {
+        self.budget
+            .is_some_and(|budget| self.held().total() >= budget)
+    }
+
     /// Adds a document and returns the identifier it was given.
     ///
     /// # Errors
@@ -243,6 +297,7 @@ impl Writer {
             total,
             store,
             stored,
+            budget: _,
         } = self;
         let length = analyzer.analyze(text, |term, _| postings.count(term, stamp));
         postings.flush(doc);
@@ -1343,5 +1398,64 @@ mod tests {
             writer.held().total() < before,
             "a writer that has been replaced still holds what the old one did"
         );
+    }
+
+    #[test]
+    fn a_writer_nobody_gave_a_budget_to_is_never_full() {
+        let mut writer = Writer::new();
+        assert_eq!(writer.budget(), None);
+        for _ in 0..256 {
+            for doc in DOCS {
+                writer.add(doc).expect("adds");
+            }
+        }
+        assert!(writer.held().total() > 0);
+        assert!(!writer.is_full(), "a writer with no budget filled up");
+    }
+
+    #[test]
+    fn a_writer_says_it_is_full_once_it_holds_what_it_was_told_it_may() {
+        // Small enough that a handful of documents reaches it, since what is
+        // being tested is the comparison and not the size of anything.
+        // Over the floor a writer costs before it has been given anything, and
+        // small enough that a handful of documents crosses it.
+        let budget = Writer::new().held().total() + (64 << 10);
+        let mut writer = Writer::with_budget(budget);
+        assert_eq!(writer.budget(), Some(budget));
+        assert!(!writer.is_full(), "an empty writer is full");
+
+        let mut added = 0;
+        while !writer.is_full() {
+            for doc in DOCS {
+                writer.add(doc).expect("adds");
+                added += 1;
+            }
+            assert!(added < 100_000, "the writer never filled up");
+        }
+        assert!(writer.held().total() >= budget);
+
+        // And a fresh one with the same budget starts empty, which is what makes
+        // this a bound on a run rather than on a segment.
+        let held = writer.held().total();
+        let next = core::mem::replace(&mut writer, Writer::with_budget(budget));
+        next.finish().expect("finishes");
+        assert!(!writer.is_full());
+        assert!(writer.held().total() < held);
+        assert_eq!(writer.budget(), Some(budget));
+    }
+
+    #[test]
+    fn a_budget_under_what_an_empty_writer_costs_is_full_from_the_first_document() {
+        // The edge somebody will pass eventually. A writer holds the
+        // compressor's match table before it has seen a document, so a budget
+        // under that is a budget of one document per segment, and the thing that
+        // must not happen is a loop that flushes an empty writer forever.
+        let floor = Writer::new().held().total();
+        assert!(floor > 0);
+        let mut writer = Writer::with_budget(floor / 2);
+        assert!(writer.is_full(), "a budget under the floor has room");
+        writer.add(DOCS[0]).expect("adds");
+        assert!(writer.is_full());
+        assert_eq!(writer.len(), 1);
     }
 }
