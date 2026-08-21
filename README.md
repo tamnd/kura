@@ -166,15 +166,45 @@ Pass `--complete` to score it as a zero instead, which is the honest choice when
 ## Bounding what an index run holds at once
 
 ```sh
-./target/release/kura-cli index ./corpus -o /tmp/docs.kura --store --flush-every 32m
+./target/release/kura-cli index ./corpus -o /tmp/docs.kura --store --memory 32m
 ```
 
-Without that option an index run keeps every posting in memory until the last file has been read, so the memory it needs is set by the size of what it was pointed at rather than by anything the machine can promise.
-`--flush-every` finishes a segment once that much text has gone in and starts a new one, so the memory is set by the budget instead.
+Without a budget an index run keeps every posting in memory until the last file has been read, so the memory it needs is set by the size of what it was pointed at rather than by anything the machine can promise.
+`--memory` finishes a segment once the writer is holding that much and starts a new one, so the memory is set by the budget instead.
 
-The Go source tree at go1.26.6, which is 10,888 text files and 106.4 MB, on an M4 with the files already in page cache, five runs each and the range across them:
+The budget is in the same units the run reports, which is what the writer holds, and the writer is asked after every document.
+That makes it a floor rather than a ceiling: the writer stops when it has crossed the budget, not before, so what it holds at its largest is the budget plus whatever the document that crossed it added.
+Usually that is small and once it is not, which is the 8m row below, and the reason is written under the table.
 
-| budget | segments | wall | peak RSS |
+The Go source tree at go1.26.6, which is 10,888 text files and 106.4 MB, on an M4 with the files already in page cache, three runs each:
+
+| `--memory` | segments | held at most | peak RSS | wall |
+| --- | --- | --- | --- | --- |
+| none | 1 | 60.7 MB | 91 to 110 MB | 0.92 to 0.95 s |
+| 128m | 1 | 60.7 MB | 103 to 119 MB | 0.95 to 1.0 s |
+| 64m | 1 | 60.7 MB | 98 to 106 MB | 0.96 to 1.0 s |
+| 32m | 2 | 32.0 MB | 64 to 94 MB | 0.95 to 0.98 s |
+| 16m | 5 | 16.5 MB | 71 to 85 MB | 0.98 to 1.0 s |
+| 8m | 9 | 16.3 MB | 54 to 67 MB | 1.0 s |
+
+Two things to read out of that.
+
+A budget is honoured within a document at every size except 8m, where the writer ends up holding twice what it was told.
+That is the tables that grow by doubling.
+There are seven vectors with an entry per term beside the postings, and a term dictionary, and all of them double, so a document that arrives when they are full takes the writer from just under the budget to well over it in a single step.
+Counted on a synthetic corpus of 200,000 documents each carrying a term nothing else has, the largest step one document took was 4.7 MB, of which 3.7 MB was those seven vectors growing together and 1.0 MB was the dictionary.
+It is the same problem the posting arena had before it was changed to grow in blocks, and it is worth fixing the same way.
+
+The process holds about 40 MB more than the writer says it holds, at every budget.
+That is the allocator's slack, the file being read, and the segment going down, and it is additive rather than proportional, so a machine with 200 MB to spare can be told 150m and be believed.
+Both of those numbers are this corpus on this machine, and neither is a promise about a corpus with a different vocabulary.
+
+There is also `--flush-every`, which counts the text that has gone in rather than what the writer holds.
+It is the older option and the worse one for this, because the ratio between text read and memory held depends on the vocabulary and on how repetitive the corpus is, so a number that bounds one does not bound the other.
+It stays because segments of a size is a reasonable thing to want for its own sake.
+The same tree, five runs each and the range across them:
+
+| `--flush-every` | segments | wall | peak RSS |
 | --- | --- | --- | --- |
 | none | 1 | 0.92 to 0.95 s | 91 to 110 MB |
 | 32m | 4 | 0.93 to 0.95 s | 69 to 102 MB |
