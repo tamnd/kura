@@ -15,8 +15,8 @@
 //! was what this file did until it turned out to be most of what opening an
 //! index costs. Every iteration reads the state the previous iteration wrote,
 //! so the loop is a chain of dependent loads with nothing for the processor to
-//! overlap, and it settles at about 256 MB/s. On a 700 MB segment that is two
-//! and a half seconds spent before the first query is even parsed.
+//! overlap, and it settles at 538 MB/s. On a 700 MB segment that is a second
+//! and a third spent before the first query is even parsed.
 //!
 //! Slicing consumes sixteen bytes at a time instead of one. The sixteen lookups
 //! within an iteration do not depend on each other, so they issue together, and
@@ -29,6 +29,10 @@
 //! The polynomial does not change and neither do the values. This is the same
 //! CRC-32 in a different order, so every file any previous build wrote still
 //! verifies.
+//!
+//! Measured on the same machine and the same thirty two megabytes, 538 MB/s
+//! becomes 3103 MB/s, which is 5.8 times. `cargo run --release --example bench`
+//! prints both that and what it does to opening a segment.
 //!
 //! The cost is sixteen kilobytes of static tables instead of one. That is
 //! binary size rather than startup work, and it is the whole price.
