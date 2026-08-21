@@ -1,6 +1,6 @@
 //! Command line access to a kura index.
 //!
-//! Eight commands, in three groups.
+//! Nine commands, in three groups.
 //!
 //! `index` builds an index out of a directory so there is something to ask
 //! questions of. `search` runs a query and prints what came back. `explain`
@@ -19,19 +19,21 @@
 //! file against judgments, and between them a ranking change stops being a
 //! matter of opinion. See [`eval`] for what the numbers mean.
 //!
-//! `verify`, `dump` and `repair` are the third group, and they are for the file
-//! rather than for the answers. `verify` reads an index all the way through and
-//! says whether it is intact. `dump` prints what is in it, one record to a line,
-//! for the questions that start with somebody not believing what came back.
-//! `repair` is what comes after a `verify` that failed, and it does the one
-//! repair a store supports, which is committing a manifest that leaves out the
-//! segments that no longer read.
+//! `verify`, `dump`, `repair` and `migrate` are the third group, and they are
+//! for the file rather than for the answers. `verify` reads an index all the way
+//! through and says whether it is intact. `dump` prints what is in it, one
+//! record to a line, for the questions that start with somebody not believing
+//! what came back. `repair` is what comes after a `verify` that failed, and it
+//! does the one repair a store supports, which is committing a manifest that
+//! leaves out the segments that no longer read. `migrate` reads a file written
+//! by an older build and writes today's format beside it.
 //!
 //! There are no dependencies here for the same reason there are none in the
 //! engine. Argument parsing is forty lines and a crate is forever.
 
 mod dump;
 mod eval;
+mod migrate;
 mod repair;
 mod report;
 mod verify;
@@ -107,10 +109,11 @@ usage:
   kura-cli verify <index>                    read an index through and report what is wrong
   kura-cli dump <index>                      print what is in an index, one record to a line
   kura-cli repair <store>                    drop the segments that no longer read
+  kura-cli migrate <index> -o <new>          write an older index out in today's format
 
 options:
   -k <n>        how many results, for search and explain (default 10)
-  -o <file>     where to write, for index and topics
+  -o <file>     where to write, for index, topics and migrate
   --store       for index, add a segment to a store rather than write a bare one
   --flush-every <size>  for index, start a new segment once this much text has gone in
   --total       for explain, walk for the total as well as the page
@@ -141,6 +144,11 @@ says which segment it came from. It prints terms and stored fields, which is to
 say it prints the corpus, so treat what comes out of it the way the corpus it
 came from has to be treated.
 
+a migrate never writes in place and never writes over a file that is there. It
+reads one index and writes another, and what to do with the original is left to
+whoever ran it. An index that is already in today's format is left alone and
+nothing is written.
+
 a repair prints what it would do and writes nothing until it is given --commit,
 because what it does is throw documents away. It never touches a segment, only
 the manifest that names them, and the manifest it replaces stays in the store
@@ -164,6 +172,7 @@ fn run() -> Result<(), Failure> {
         "verify" => check(&rest),
         "dump" => show(&rest),
         "repair" => mend(&rest),
+        "migrate" => forward(&rest),
         "-h" | "--help" | "help" => {
             println!("{USAGE}");
             Ok(())
@@ -306,6 +315,47 @@ fn mend(args: &[String]) -> Result<(), Failure> {
         return Ok(());
     }
     Err(Failure::Damaged(path.to_path_buf(), outcome.damaged))
+}
+
+/// Writes an index that an older build wrote out in today's format.
+///
+/// The exit code answers one question, which is whether there is now a file this
+/// build will open. An index that was migrated and an index that needed no
+/// migration both succeed, and a refusal fails, because a refusal means the file
+/// is still one this build will not read and a script should not carry on as
+/// though it had been fixed. See [`migrate`] for what it refuses and why.
+fn forward(args: &[String]) -> Result<(), Failure> {
+    let mut positional = Vec::new();
+    let mut into: Option<PathBuf> = None;
+    let mut at = 0;
+    while at < args.len() {
+        match args[at].as_str() {
+            "-o" => {
+                at += 1;
+                into = Some(PathBuf::from(want(args, at, "-o wants a file")?));
+            }
+            other if other.starts_with("--") => {
+                return Err(Failure::usage(format!("unknown option {other}")));
+            }
+            other => positional.push(other),
+        }
+        at += 1;
+    }
+    let [path] = positional[..] else {
+        return Err(Failure::usage("wanted one index file"));
+    };
+    let path = Path::new(path);
+    let into = into.ok_or_else(|| Failure::usage("migrate wants -o, and never writes in place"))?;
+
+    let mut out = BufWriter::new(std::io::stdout());
+    let outcome = migrate::migrate(path, &into, now(), &mut out)
+        .map_err(|trouble| Failure::Store(path.to_path_buf(), trouble))?;
+    out.flush().map_err(Failure::Stdout)?;
+
+    if outcome.settled() {
+        return Ok(());
+    }
+    Err(Failure::Refused(path.to_path_buf()))
 }
 
 /// Answers every query in a topics file and writes a run file.
@@ -1135,6 +1185,8 @@ enum Failure {
     Store(PathBuf, Trouble),
     /// An index was read through and found to be damaged, and how badly.
     Damaged(PathBuf, usize),
+    /// A migration would not touch the file, and the report said why.
+    Refused(PathBuf),
 }
 
 impl Failure {
@@ -1161,6 +1213,9 @@ impl fmt::Display for Failure {
             Self::Store(path, trouble) => write!(f, "{}: {trouble}", path.display()),
             Self::Damaged(path, count) => {
                 write!(f, "{}: {count} checks failed", path.display())
+            }
+            Self::Refused(path) => {
+                write!(f, "{}: nothing was written, see above", path.display())
             }
         }
     }
