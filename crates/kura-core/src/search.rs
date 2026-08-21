@@ -81,6 +81,7 @@ use crate::bound;
 use crate::error::{Error, Result};
 use crate::explain::{Counters, Off, Tally};
 use crate::index::Reader;
+use crate::length;
 use crate::posting::{self, BLOCK_SIZE, Cursor};
 
 /// How quickly a term's contribution saturates as it repeats.
@@ -409,7 +410,7 @@ impl<'a, 'b> Searcher<'a, 'b> {
             return Ok((Vec::new(), self.count_terms(terms)?));
         }
         let mut shards = self.open(terms, tally)?;
-        let norm = Norm::new(self.k1, self.b, self.average_length());
+        let norm = &Norm::new(self.k1, self.b, self.average_length());
         let mut top = TopK::new(k);
         let mut total = 0u64;
         for shard in &mut shards {
@@ -434,7 +435,7 @@ impl<'a, 'b> Searcher<'a, 'b> {
     fn page_and_total_of<T: Tally>(
         &self,
         shard: &mut Shard<'a, 'b>,
-        norm: Norm,
+        norm: &Norm,
         top: &mut TopK,
         tally: &mut T,
     ) -> Result<u64> {
@@ -556,7 +557,14 @@ impl<'a, 'b> Searcher<'a, 'b> {
             return Ok(Vec::new());
         }
         let mut shards = self.open(terms, tally)?;
-        let norm = Norm::new(self.k1, self.b, self.average_length());
+        // A query whose terms are in none of the segments has nothing to divide
+        // by a length, and building the table of lengths would be the only work
+        // it did. That is not a rare query: it is what a spelling mistake looks
+        // like from here, and what a term nobody has indexed yet looks like.
+        if shards.iter().all(|shard| shard.lists.is_empty()) {
+            return Ok(Vec::new());
+        }
+        let norm = &Norm::new(self.k1, self.b, self.average_length());
         let mut top = TopK::new(k);
         // In order, into the one heap. What the segments before this one found
         // is what this one has to beat, so the pruning gets stronger as the
@@ -577,7 +585,7 @@ impl<'a, 'b> Searcher<'a, 'b> {
     fn page_of<T: Tally>(
         &self,
         shard: &mut Shard<'a, 'b>,
-        norm: Norm,
+        norm: &Norm,
         top: &mut TopK,
         tally: &mut T,
     ) -> Result<()> {
@@ -710,7 +718,7 @@ impl<'a, 'b> Searcher<'a, 'b> {
     fn page_of_one<T: Tally>(
         &self,
         shard: &mut Shard<'a, 'b>,
-        norm: Norm,
+        norm: &Norm,
         top: &mut TopK,
         tally: &mut T,
     ) -> Result<()> {
@@ -750,7 +758,7 @@ impl<'a, 'b> Searcher<'a, 'b> {
     fn page_of_one_by_bound<T: Tally>(
         &self,
         shard: &mut Shard<'a, 'b>,
-        norm: Norm,
+        norm: &Norm,
         top: &mut TopK,
         tally: &mut T,
     ) -> Result<bool> {
@@ -806,7 +814,7 @@ impl<'a, 'b> Searcher<'a, 'b> {
     fn page_of_one_by_document<T: Tally>(
         &self,
         shard: &mut Shard<'a, 'b>,
-        norm: Norm,
+        norm: &Norm,
         top: &mut TopK,
         tally: &mut T,
     ) -> Result<()> {
@@ -1345,23 +1353,65 @@ fn length_of(index: &Reader<'_>, doc: DocId) -> f32 {
 /// average)`, which is a division per document scored. Nothing in it varies
 /// with the document except the length, so the rest is worked out once when the
 /// query starts and what is left is a multiply and an add.
-#[derive(Debug, Clone, Copy)]
+///
+/// And when the segment carries rounded lengths, not even that. A rounded length
+/// is one byte, so there are two hundred and fifty six of them, so every
+/// normalisation the query can ever need fits in a table of a kilobyte that
+/// costs two hundred and fifty six multiplies to fill. See
+/// [`length`](crate::length).
+#[derive(Debug, Clone)]
 struct Norm {
     base: f32,
     per_term: f32,
+    /// The normalisation of each of the lengths a byte stands for.
+    table: [f32; 256],
 }
 
 impl Norm {
     fn new(k1: f32, b: f32, average: f32) -> Self {
+        let base = k1 * (1.0 - b);
+        let per_term = k1 * b / average.max(1.0);
+        let mut table = [0.0f32; 256];
+        for (code, place) in table.iter_mut().enumerate() {
+            let code = u8::try_from(code).unwrap_or(u8::MAX);
+            *place = per_term.mul_add(length_of_code(code), base);
+        }
         Self {
-            base: k1 * (1.0 - b),
-            per_term: k1 * b / average.max(1.0),
+            base,
+            per_term,
+            table,
         }
     }
 
-    fn of(self, index: &Reader<'_>, doc: DocId) -> f32 {
+    /// The normalisation of one document, whichever lengths the segment keeps.
+    fn of(&self, index: &Reader<'_>, doc: DocId) -> f32 {
+        match index.rounded().get(doc as usize) {
+            // The escape is not a length, it is a document too long to have
+            // one, and the four byte length beside it is the answer.
+            Some(&length::ESCAPE) | None => self.exact(index, doc),
+            Some(&code) => self.table[code as usize],
+        }
+    }
+
+    /// The normalisation of a rounded length, straight out of the table.
+    fn of_code(&self, code: u8) -> f32 {
+        self.table[code as usize]
+    }
+
+    /// The normalisation worked out from the four byte length.
+    fn exact(&self, index: &Reader<'_>, doc: DocId) -> f32 {
         self.per_term.mul_add(length_of(index, doc), self.base)
     }
+}
+
+/// The length a rounded byte stands for, as a float.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "every length a byte can hold is exact in f32, the largest of them \
+              being thirty one times a power of two"
+)]
+fn length_of_code(code: u8) -> f32 {
+    length::of(code) as f32
 }
 
 /// Room to work out a whole block of scores before looking at any of them.
@@ -1384,6 +1434,7 @@ impl Norm {
 struct Scratch {
     norms: [f32; BLOCK_SIZE],
     scores: [f32; BLOCK_SIZE],
+    codes: [u8; BLOCK_SIZE],
 }
 
 impl Scratch {
@@ -1391,6 +1442,7 @@ impl Scratch {
         Self {
             norms: [0.0; BLOCK_SIZE],
             scores: [0.0; BLOCK_SIZE],
+            codes: [0; BLOCK_SIZE],
         }
     }
 
@@ -1410,7 +1462,7 @@ impl Scratch {
         index: &Reader<'_>,
         docs: &[DocId],
         freqs: &[u32],
-        norm: Norm,
+        norm: &Norm,
         idf: f32,
         k1: f32,
     ) -> &[f32] {
@@ -1420,8 +1472,34 @@ impl Scratch {
         let norms = &mut self.norms[..len];
         let scores = &mut self.scores[..len];
 
-        for (place, &doc) in norms.iter_mut().zip(docs) {
-            *place = norm.of(index, doc);
+        // Asked once for the segment rather than once for each document. Which
+        // lengths a segment keeps does not change halfway through a block, and
+        // the branch it saves is in the tightest loop there is.
+        let rounded = index.rounded();
+        if rounded.len() >= index.documents() as usize {
+            let codes = &mut self.codes[..len];
+            for (place, &doc) in codes.iter_mut().zip(docs) {
+                *place = rounded.get(doc as usize).copied().unwrap_or(0);
+            }
+            for (place, &code) in norms.iter_mut().zip(codes.iter()) {
+                *place = norm.of_code(code);
+            }
+            // A document too long for a byte reads its four byte length, and
+            // asked once for the block rather than once for each document. The
+            // scan is over a hundred and twenty eight bytes already in cache
+            // and it comes back empty on every corpus without a book in it, so
+            // the loop above stays the shape a compiler will widen.
+            if codes.contains(&length::ESCAPE) {
+                for ((place, &code), &doc) in norms.iter_mut().zip(codes.iter()).zip(docs) {
+                    if code == length::ESCAPE {
+                        *place = norm.exact(index, doc);
+                    }
+                }
+            }
+        } else {
+            for (place, &doc) in norms.iter_mut().zip(docs) {
+                *place = norm.exact(index, doc);
+            }
         }
         for ((place, &frequency), &norm) in scores.iter_mut().zip(freqs).zip(norms.iter()) {
             let frequency = frequency as f32;
@@ -1551,6 +1629,139 @@ mod tests {
         writer.finish().expect("what was written decodes")
     }
 
+    /// A corpus whose documents are long enough for the rounding to bite.
+    ///
+    /// Lengths from a few dozen words to a few thousand, which is where a byte
+    /// stops being exact and starts being a bound, and a term in every document
+    /// so that every document gets a score worth comparing.
+    fn long_documents(documents: usize) -> Vec<String> {
+        (0..documents)
+            .map(|at| {
+                let filler = 20 + at * 13 % 3000;
+                let mut words = vec!["common"; 1 + at % 7];
+                words.resize(words.len() + filler, "filler");
+                words.join(" ")
+            })
+            .collect()
+    }
+
+    /// The same segment without its rounded lengths, the way an index written
+    /// before the section existed looks.
+    fn without_the_rounded_lengths(bytes: &[u8]) -> Vec<u8> {
+        use crate::segment::{Writer as SegmentWriter, kind};
+
+        let segment = Segment::open(bytes).expect("opens");
+        let mut stripped = SegmentWriter::new();
+        for kind in [
+            kind::TERMS,
+            kind::POSTINGS,
+            kind::NORMS,
+            kind::BOUNDS,
+            kind::FIELDS,
+        ] {
+            if let Some(payload) = segment.section(kind) {
+                stripped.add(kind, payload.to_vec()).expect("adds");
+            }
+        }
+        stripped.finish()
+    }
+
+    #[test]
+    fn a_document_too_long_for_a_byte_scores_by_its_exact_length() {
+        // The bug the escape code exists to stop, in the shape it was found in:
+        // a real corpus held a book concatenated with itself as compression
+        // test data, and a byte that clamped rather than escaped lifted its
+        // score by nearly a quarter and put it on pages it did not belong on.
+        //
+        // The document has to be genuinely longer than the top code, so this
+        // test builds a few million words. It is the slowest test in the file
+        // and it is the only way to reach the branch it is checking.
+        let huge = vec!["common"; length::LONGEST as usize + 1000].join(" ");
+        let mut docs: Vec<String> = long_documents(BLOCK_SIZE * 2);
+        docs.push(huge);
+        let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+        let bytes = build(&refs);
+        let segment = Segment::open(&bytes).expect("opens");
+        let index = Reader::open(&segment).expect("opens");
+
+        let last = index.documents() - 1;
+        assert!(
+            index.length(last) > length::LONGEST,
+            "the corpus grew shorter"
+        );
+        assert_eq!(index.rounded()[last as usize], length::ESCAPE);
+
+        // Every document, not only the page, because the point is the score and
+        // not the rank. `by_hand` reads the exact length for an escaped code, so
+        // agreeing with it is agreeing that the walk did too.
+        let hits = Searcher::new(&index)
+            .search("common", docs.len())
+            .expect("searches");
+        let wanted = by_hand(&index, &[b"common"], K1, B);
+        same(&hits, &wanted[..hits.len()]);
+    }
+
+    #[test]
+    fn a_segment_without_the_rounded_lengths_scores_by_the_exact_ones() {
+        // The fallback, end to end. Long enough for the pruning to fire, so the
+        // ceilings are being read as well, and those were worked out from the
+        // exact lengths, which is what makes them hold on both sides.
+        let docs = long_documents(BLOCK_SIZE * 4);
+        let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+        let bytes = build(&refs);
+        let stripped = without_the_rounded_lengths(&bytes);
+
+        let segment = Segment::open(&stripped).expect("opens");
+        let index = Reader::open(&segment).expect("opens");
+        assert!(index.rounded().is_empty());
+
+        let hits = Searcher::new(&index)
+            .search("common", 10)
+            .expect("searches");
+        let wanted = by_hand(&index, &[b"common"], K1, B);
+        same(&hits, &wanted[..10]);
+    }
+
+    #[test]
+    fn dropping_the_rounded_lengths_barely_moves_a_score() {
+        // The whole bet of the section in one assertion, and the bound is
+        // arithmetic rather than a number somebody watched go past.
+        //
+        // Rounding raises a length by at most a sixteenth, so it raises the
+        // length part of the norm by at most a sixteenth of itself. A score is
+        // f * (k1 + 1) / (f + norm), so raising the norm by d lowers the score
+        // by d / (f + norm), which with d at most norm / 16 is at most
+        // norm / (16 * (f + norm)), and that is under a sixteenth for every f
+        // and every norm there are. The worst this corpus reaches is a quarter
+        // of it, on the longest documents holding the term once, which are the
+        // documents nobody was going to see.
+        let docs = long_documents(BLOCK_SIZE * 4);
+        let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+        let bytes = build(&refs);
+        let stripped = without_the_rounded_lengths(&bytes);
+
+        let with = Segment::open(&bytes).expect("opens");
+        let with = Reader::open(&with).expect("opens");
+        let without = Segment::open(&stripped).expect("opens");
+        let without = Reader::open(&without).expect("opens");
+
+        let rounded = by_hand(&with, &[b"common"], K1, B);
+        let exact = by_hand(&without, &[b"common"], K1, B);
+        let exact: std::collections::BTreeMap<DocId, f32> =
+            exact.iter().map(|hit| (hit.doc, hit.score)).collect();
+        let mut worst = 0.0f32;
+        for hit in &rounded {
+            let was = exact[&hit.doc];
+            assert!(
+                hit.score <= was,
+                "document {} scored higher on a longer length",
+                hit.doc
+            );
+            worst = worst.max((was - hit.score) / was);
+        }
+        assert!(worst < 1.0 / 16.0, "a score moved by {}%", worst * 100.0);
+    }
+
     /// Scores every document the slow, obvious way, which is what the fast way
     /// has to agree with.
     ///
@@ -1576,7 +1787,14 @@ mod tests {
                     continue;
                 }
                 let f = frequency as f32;
-                let norm = k1 * (1.0 - b + b * index.length(doc) as f32 / average);
+                // The rounded length when the segment has one, because that is
+                // what the walk divides by, and a check against a different
+                // denominator would be checking a different ranking.
+                let len = match index.rounded().get(doc as usize) {
+                    Some(&length::ESCAPE) | None => index.length(doc),
+                    Some(&code) => length::of(code),
+                };
+                let norm = k1 * (1.0 - b + b * len as f32 / average);
                 scores[doc as usize] += idf * (f * (k1 + 1.0)) / (f + norm);
             }
         }

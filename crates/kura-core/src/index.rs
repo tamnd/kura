@@ -22,7 +22,7 @@ use crate::codec::{get_u32, get_u64, get_uvarint, put_u32, put_u64, put_uvarint}
 use crate::error::{Error, Result};
 use crate::search::{B, K1};
 use crate::segment::{Segment, Writer as SegmentWriter, kind};
-use crate::{DocId, bitmap::Bitmap, bound, filter, keys, posting, store, terms};
+use crate::{DocId, bitmap::Bitmap, bound, filter, keys, length, posting, store, terms};
 
 /// The size of one link in a term's posting chain, in bytes.
 ///
@@ -713,6 +713,17 @@ impl Writer {
             }
         }
 
+        // One byte per document, in the same order as the four byte lengths
+        // beside them. Worked out from those rather than kept alongside, which
+        // is what makes this a section a reader can rebuild and a reader that
+        // has never heard of it can ignore.
+        let mut rounded = Vec::with_capacity(documents as usize);
+        for part in &parts {
+            for length in &part.lengths {
+                rounded.push(length::round(*length));
+            }
+        }
+
         // The stores are folded last and into the first of them rather than
         // into a new one, so the largest thing here is moved once instead of
         // twice.
@@ -737,6 +748,7 @@ impl Writer {
         segment.add(kind::TERMS, dictionary.finish())?;
         segment.add(kind::POSTINGS, blob)?;
         segment.add(kind::NORMS, norms)?;
+        segment.add(kind::ROUNDED, rounded)?;
         // A segment whose every list is shorter than a block has nothing to skip,
         // and an empty section would cost a row in the table to say so.
         if !ceilings.is_empty() {
@@ -943,6 +955,13 @@ impl Accumulator {
             writer.push(shifted, frequency)?;
             // The lengths are the part's own, indexed the way the part numbers
             // its documents, which is before the shift and not after it.
+            //
+            // Exact, not rounded, even though the scorer divides by the rounded
+            // ones. Rounding is upwards and a longer document is a lower score,
+            // so a ceiling worked out from the exact length bounds the rounded
+            // score as well as the exact one. Rounding here would give a tighter
+            // ceiling that only holds for a reader that rounds too, and a build
+            // that has never heard of the rounded section still reads this one.
             ceilings.push(frequency, lengths.get(doc as usize).copied().unwrap_or(0));
         }
         Ok(())
@@ -1180,6 +1199,14 @@ pub struct Reader<'a> {
     terms: terms::Reader<'a>,
     postings: &'a [u8],
     lengths: &'a [u8],
+    /// The same lengths again, one byte each, when the segment carries them.
+    ///
+    /// Empty for a segment written before the section existed, and for one whose
+    /// section is the wrong size for its documents, which is a damaged file
+    /// rather than an old one. Either way the scorer falls back to the four byte
+    /// lengths, and the ceilings in such a segment were worked out from those,
+    /// so the pair stay consistent by never being mixed.
+    rounded: &'a [u8],
     bounds: Option<bound::Reader<'a>>,
     store: Option<store::Reader<'a>>,
     keys: Option<Keys<'a>>,
@@ -1217,6 +1244,12 @@ impl<'a> Reader<'a> {
                 available: lengths.len(),
             });
         }
+        // One byte per document, and a section that does not have exactly that
+        // many is not this segment's, so it is left alone rather than read into.
+        let rounded = segment
+            .section(kind::ROUNDED)
+            .filter(|bytes| bytes.len() == documents as usize)
+            .unwrap_or_default();
         let store = match segment.section(kind::FIELDS) {
             Some(bytes) => Some(store::Reader::new(bytes)?),
             None => None,
@@ -1232,6 +1265,7 @@ impl<'a> Reader<'a> {
             terms: terms::Reader::new(dictionary)?,
             postings,
             lengths,
+            rounded,
             bounds,
             store,
             keys: Keys::open(segment)?,
@@ -1346,6 +1380,16 @@ impl<'a> Reader<'a> {
             .get(doc as usize * 4..)
             .and_then(<[u8]>::first_chunk::<4>)
             .map_or(0, |bytes| u32::from_le_bytes(*bytes))
+    }
+
+    /// The rounded lengths, one byte a document, or nothing.
+    ///
+    /// Nothing is a segment written before the section existed, and it is what
+    /// tells a scorer to work from the four byte lengths instead. See
+    /// the [`length`] module for what a byte holds and why it is enough.
+    #[must_use]
+    pub const fn rounded(&self) -> &'a [u8] {
+        self.rounded
     }
 
     /// How many terms the index holds across all of its documents.
@@ -1491,6 +1535,96 @@ mod tests {
     }
 
     #[test]
+    fn every_document_has_a_rounded_length_that_matches_its_exact_one() {
+        // The section is a calculation over the section beside it, so the only
+        // thing worth checking is that it is the calculation it claims to be,
+        // for every document rather than for a sample.
+        let docs: Vec<String> = (0..300)
+            .map(|at| {
+                let words = 1 + at * 7 % 900;
+                vec!["word"; words].join(" ")
+            })
+            .collect();
+        let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+        let bytes = build(&refs);
+        let segment = Segment::open(&bytes).expect("opens");
+        let index = Reader::open(&segment).expect("opens");
+
+        let rounded = index.rounded();
+        assert_eq!(rounded.len(), index.documents() as usize);
+        for doc in 0..index.documents() {
+            let exact = index.length(doc);
+            let code = rounded[doc as usize];
+            assert_eq!(code, length::round(exact), "document {doc} is {exact} long");
+            assert!(
+                length::of(code) >= exact,
+                "document {doc} rounded down, {exact} to {}",
+                length::of(code)
+            );
+        }
+    }
+
+    #[test]
+    fn a_segment_without_the_rounded_lengths_reads_as_one_that_never_had_them() {
+        // What an index written before the section existed looks like, which is
+        // the only way to reach the fallback in the scorer from a test.
+        let bytes = build(&DOCS);
+        let segment = Segment::open(&bytes).expect("opens");
+        let mut without = SegmentWriter::new();
+        for kind in [
+            kind::TERMS,
+            kind::POSTINGS,
+            kind::NORMS,
+            kind::BOUNDS,
+            kind::FIELDS,
+        ] {
+            if let Some(payload) = segment.section(kind) {
+                without.add(kind, payload.to_vec()).expect("adds");
+            }
+        }
+        let bytes = without.finish();
+        let segment = Segment::open(&bytes).expect("opens");
+        let index = Reader::open(&segment).expect("opens");
+
+        assert!(index.rounded().is_empty());
+        assert_eq!(index.documents(), u32::try_from(DOCS.len()).expect("four"));
+        for doc in 0..index.documents() {
+            assert!(index.length(doc) > 0, "document {doc} lost its length");
+        }
+    }
+
+    #[test]
+    fn a_rounded_section_the_wrong_size_for_the_segment_is_left_alone() {
+        // A section of the right kind and the wrong length is a damaged file
+        // rather than an old one, and reading into it would divide by whatever
+        // happened to be there. The four byte lengths are still right, so the
+        // answer is to use those and say nothing.
+        let bytes = build(&DOCS);
+        let segment = Segment::open(&bytes).expect("opens");
+        let mut damaged = SegmentWriter::new();
+        for kind in [
+            kind::TERMS,
+            kind::POSTINGS,
+            kind::NORMS,
+            kind::ROUNDED,
+            kind::BOUNDS,
+            kind::FIELDS,
+        ] {
+            if let Some(payload) = segment.section(kind) {
+                let mut payload = payload.to_vec();
+                if kind == kind::ROUNDED {
+                    payload.pop();
+                }
+                damaged.add(kind, payload).expect("adds");
+            }
+        }
+        let bytes = damaged.finish();
+        let segment = Segment::open(&bytes).expect("opens");
+        let index = Reader::open(&segment).expect("opens");
+        assert!(index.rounded().is_empty());
+    }
+
+    #[test]
     fn stored_fields_come_back_with_the_document_they_went_in_with() {
         let mut writer = Writer::new();
         writer
@@ -1553,7 +1687,7 @@ mod tests {
 
         let left = Segment::open(&one).expect("opens");
         let right = Segment::open(&many).expect("opens");
-        for kind in [kind::TERMS, kind::POSTINGS, kind::NORMS] {
+        for kind in [kind::TERMS, kind::POSTINGS, kind::NORMS, kind::ROUNDED] {
             assert_eq!(
                 left.section(kind),
                 right.section(kind),
