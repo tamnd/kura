@@ -487,6 +487,8 @@ impl<'a> Reader<'a> {
             block: 0,
             len: 0,
             at: 0,
+            decoded_blocks: 0,
+            decoded_postings: 0,
             started: false,
             done: false,
         }
@@ -597,6 +599,14 @@ pub struct Cursor<'a> {
     /// How many entries of `docs` and `freqs` are valid.
     len: usize,
     at: usize,
+    /// How many blocks this cursor has unpacked, and how many postings that was.
+    ///
+    /// Kept unconditionally because unpacking a block is a hundred and twenty
+    /// eight postings of work and two increments beside it do not register, and
+    /// because a caller that wants to know what a query cost cannot go back and
+    /// ask for it afterwards if nobody was counting.
+    decoded_blocks: u64,
+    decoded_postings: u64,
     started: bool,
     done: bool,
 }
@@ -750,6 +760,18 @@ impl Cursor<'_> {
         self.len.saturating_sub(self.at)
     }
 
+    /// How many blocks this cursor has unpacked, and how many postings that
+    /// came to.
+    ///
+    /// Held against the list's own length, this is what says whether a walk
+    /// skipped anything. The postings count is the block size times the block
+    /// count except for the leftovers, so it can exceed the list's length by up
+    /// to a block short of one.
+    #[must_use]
+    pub const fn decoded(&self) -> (u64, u64) {
+        (self.decoded_blocks, self.decoded_postings)
+    }
+
     /// Decodes block `index`, or the leftovers when `index` is the one past the
     /// last block, or ends the walk when it is past that.
     ///
@@ -768,6 +790,8 @@ impl Cursor<'_> {
             self.list.decode_block(index, &mut self.docs)?;
             self.list.decode_freqs(index, &mut self.freqs)?;
             self.len = BLOCK;
+            self.decoded_blocks += 1;
+            self.decoded_postings += BLOCK as u64;
             return Ok(());
         }
 
@@ -790,6 +814,8 @@ impl Cursor<'_> {
             return Ok(());
         }
         self.len = filled;
+        self.decoded_blocks += 1;
+        self.decoded_postings += filled as u64;
         Ok(())
     }
 }
