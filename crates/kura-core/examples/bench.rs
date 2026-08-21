@@ -84,6 +84,7 @@ fn main() {
 
     let encoded = postings();
     engine();
+    across_segments();
     parallel();
     stores();
     blocks();
@@ -1247,6 +1248,134 @@ fn parallel() {
             ],
         );
     }
+}
+
+/// The same corpus as one segment and as eight, which is the shape a store is
+/// really in.
+///
+/// A store writes a segment per flush and does not fold them back together until
+/// it compacts, so a query nearly always runs over several. Two things are worth
+/// knowing about that. Whether the page changes, which it must not, and what the
+/// page costs, which is the ratio at the bottom of this section.
+///
+/// The cost is not free and should not be. Eight segments mean eight
+/// dictionaries to look a term up in, eight posting lists to open for it and
+/// eight short blocks at the ends of those lists that a single segment would not
+/// have had. What keeps it small is that the heap is shared, so the threshold
+/// the first segment reached is the threshold the eighth has to beat.
+fn across_segments() {
+    let corpus = corpus(50_000);
+    let refs: Vec<&str> = corpus.iter().map(String::as_str).collect();
+    let whole = write(&refs);
+    let parts: Vec<Vec<u8>> = refs.chunks(refs.len().div_ceil(8)).map(write).collect();
+
+    let single = Segment::open(&whole).expect("a segment this writer wrote opens");
+    let single = index::Reader::open(&single).expect("the sections are all there");
+    let one = Searcher::new(&single);
+
+    let segments: Vec<Segment<'_>> = parts
+        .iter()
+        .map(|bytes| Segment::open(bytes).expect("a segment this writer wrote opens"))
+        .collect();
+    let readers: Vec<index::Reader<'_>> = segments
+        .iter()
+        .map(|segment| index::Reader::open(segment).expect("the sections are all there"))
+        .collect();
+    let many = Searcher::over(&readers).expect("fifty thousand documents are numberable");
+
+    let words = vocabulary(4_000);
+    let picked: Vec<&str> = words.iter().step_by(37).map(String::as_str).collect();
+    let queries: Vec<String> = picked
+        .chunks(2)
+        .filter(|pair| pair.len() == 2)
+        .map(|pair| format!("{} {} {}", pair[0], pair[1], words[0]))
+        .collect();
+
+    // The measurement is worthless if the two are not answering the same
+    // question, so this is checked before either is timed rather than claimed
+    // afterwards.
+    for query in &queries {
+        let from_one = one.search(query, 10).expect("searches");
+        let from_many = many.search(query, 10).expect("searches");
+        assert_eq!(
+            from_one.len(),
+            from_many.len(),
+            "{query}: different number of hits"
+        );
+        for (a, b) in from_one.iter().zip(&from_many) {
+            assert_eq!(a.doc, b.doc, "{query}: different document");
+            assert!(
+                (a.score - b.score).abs() < 1e-4,
+                "{query}: document {} scored {} in one segment and {} in eight",
+                a.doc,
+                a.score,
+                b.score
+            );
+        }
+    }
+
+    bench("query three terms, one segment", queries.len(), || {
+        for query in &queries {
+            black_box(one.search(query, 10).expect("searches"));
+        }
+    });
+    let flat = last_case();
+    bench("query three terms, eight segments", queries.len(), || {
+        for query in &queries {
+            black_box(many.search(query, 10).expect("searches"));
+        }
+    });
+    let split = last_case();
+
+    // Both, and the fastest round first, because the two rows are measured
+    // seconds apart on a machine that is doing other things. The median carries
+    // whatever else the machine was doing between them, and on a laptop that is
+    // most of the difference between the two rows.
+    let best = ratio(split.0, flat.0);
+    let median = ratio(split.1, flat.1);
+    fact(
+        "eight_segments_against_one",
+        &format!(
+            "eight segments against one: {best:.2}x at best, {median:.2}x at the median, \
+             same page either way"
+        ),
+        vec![
+            ("queries", queries.len() as f64),
+            ("one_segment_best_nanos", flat.0.as_nanos() as f64),
+            ("eight_segments_best_nanos", split.0.as_nanos() as f64),
+            ("one_segment_median_nanos", flat.1.as_nanos() as f64),
+            ("eight_segments_median_nanos", split.1.as_nanos() as f64),
+            ("best_ratio", best),
+            ("median_ratio", median),
+        ],
+    );
+}
+
+/// How much longer `a` took than `b`.
+fn ratio(a: Duration, b: Duration) -> f64 {
+    a.as_secs_f64() / b.as_secs_f64().max(f64::MIN_POSITIVE)
+}
+
+/// Writes a segment holding `docs`.
+fn write(docs: &[&str]) -> Vec<u8> {
+    let mut writer = index::Writer::new();
+    for text in docs {
+        writer.add(text).expect("fifty thousand documents fit");
+    }
+    writer.finish().expect("what was written decodes")
+}
+
+/// The fastest round and the median of the case just measured, so a row can be
+/// compared with the row before it.
+fn last_case() -> (Duration, Duration) {
+    REPORT
+        .lock()
+        .expect("nothing panicked holding the report")
+        .cases
+        .last()
+        .map_or((Duration::ZERO, Duration::ZERO), |case| {
+            (case.best, case.median)
+        })
 }
 
 /// Documents made of words drawn from a heavy tailed distribution.

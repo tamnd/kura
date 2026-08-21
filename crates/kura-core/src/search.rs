@@ -21,13 +21,36 @@
 //! What makes that cheap here is that the ceiling per block is already on disk.
 //! It is the byte per block the posting format writes, and reading it costs one
 //! indexed load rather than a decode.
+//!
+//! # More than one segment
+//!
+//! A store is not one segment and never becomes one. Writes land in a new
+//! segment beside the ones already there, so a query runs over all of them and
+//! still has to come back with one page, and that page is only right if a
+//! document's score does not depend on which segment it happens to sit in.
+//!
+//! Which rules out searching each segment on its own and merging the answers.
+//! Two of the three quantities BM25 needs belong to the corpus rather than to a
+//! segment: how many documents there are, and how many of them hold the term. A
+//! word in one document of a small segment and in a thousand documents of a
+//! large one is one word with one weight, and giving it two weights produces a
+//! page that reorders itself the moment those segments are merged. So the counts
+//! are taken across every segment before anything is walked, and the walk uses
+//! them everywhere.
+//!
+//! The merge is the heap the single segment walk was already filling. Segments
+//! go into it one after another, which means the threshold the first segment
+//! reached prunes the second, and by the last one the bar is as high as it is
+//! going to get. Filling a heap per segment and merging at the end gives the
+//! same page for more work, because every segment would start again from a
+//! threshold of zero.
 
 use crate::DocId;
 use crate::analysis::Analyzer;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::explain::{Counters, Off, Tally};
 use crate::index::Reader;
-use crate::posting::{BLOCK_SIZE, Cursor};
+use crate::posting::{self, BLOCK_SIZE, Cursor};
 
 /// How quickly a term's contribution saturates as it repeats.
 ///
@@ -46,39 +69,160 @@ pub const B: f32 = 0.75;
 /// A document and what it scored.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Hit {
-    /// Which document.
+    /// Which document, numbered across the segments the searcher was given.
+    ///
+    /// For a searcher over one segment that is the segment's own identifier.
+    /// Over several it is the segment's identifier plus the documents in the
+    /// segments before it, which is what lets hits from different segments sit
+    /// in one ordered page. [`Searcher::locate`] takes it back apart, and the
+    /// numbering only means anything for the searcher that produced it, because
+    /// it depends on which segments that searcher was given and in what order.
     pub doc: DocId,
     /// What it scored. Higher is better, and the number is only comparable
     /// against other hits for the same query.
     pub score: f32,
 }
 
-/// Runs queries against an index.
+/// Runs queries against one segment or across several.
 #[derive(Debug)]
 pub struct Searcher<'a, 'b> {
-    index: &'a Reader<'b>,
+    segments: &'a [Reader<'b>],
+    /// How many documents the segments hold between them, which is the `N` of
+    /// the inverse document frequency.
+    documents: u32,
+    /// How many terms they hold between them, which over that count is the mean
+    /// length BM25 normalises by.
+    total: u64,
     k1: f32,
     b: f32,
 }
 
 impl<'a, 'b> Searcher<'a, 'b> {
-    /// A searcher with the usual BM25 parameters.
+    /// A searcher over one segment, with the usual BM25 parameters.
     #[must_use]
     pub const fn new(index: &'a Reader<'b>) -> Self {
-        Self {
-            index,
-            k1: K1,
-            b: B,
-        }
+        Self::one(index, K1, B)
     }
 
-    /// A searcher with parameters of the caller's choosing.
+    /// A searcher over one segment with parameters of the caller's choosing.
     ///
     /// Worth tuning per corpus and not worth guessing at. Code is short and
     /// title fields want a different `b` from long prose.
     #[must_use]
     pub const fn with_parameters(index: &'a Reader<'b>, k1: f32, b: f32) -> Self {
-        Self { index, k1, b }
+        Self::one(index, k1, b)
+    }
+
+    /// A searcher over several segments, which scores them as one corpus.
+    ///
+    /// The order matters, because it is what decides the numbering the hits come
+    /// back with. Give the same segments in the same order and the same query
+    /// gives the same page.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::TooManyDocuments`] if the segments hold more documents
+    /// between them than one numbering can address. A segment counts its own
+    /// documents in 32 bits, so the store that trips this has upwards of four
+    /// billion of them and wants sharding rather than a wider integer.
+    pub fn over(segments: &'a [Reader<'b>]) -> Result<Self> {
+        Self::over_with_parameters(segments, K1, B)
+    }
+
+    /// A searcher over several segments with parameters of the caller's
+    /// choosing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::TooManyDocuments`] for the same reason
+    /// [`over`](Self::over) does.
+    pub fn over_with_parameters(segments: &'a [Reader<'b>], k1: f32, b: f32) -> Result<Self> {
+        let mut documents = 0u64;
+        let mut total = 0u64;
+        for index in segments {
+            documents = documents.saturating_add(u64::from(index.documents()));
+            total = total.saturating_add(index.total_length());
+        }
+        // Strictly under the largest identifier there is, rather than up to it,
+        // because that one means a spent list everywhere else in this module and
+        // a hit is not the place to start making it mean two things.
+        let Ok(documents) = u32::try_from(documents) else {
+            return Err(Error::TooManyDocuments { count: documents });
+        };
+        if documents == DocId::MAX {
+            return Err(Error::TooManyDocuments {
+                count: u64::from(documents),
+            });
+        }
+        Ok(Self {
+            segments,
+            documents,
+            total,
+            k1,
+            b,
+        })
+    }
+
+    /// The shared part of the single segment constructors, which cannot fail and
+    /// so does not say that it might.
+    #[must_use]
+    const fn one(index: &'a Reader<'b>, k1: f32, b: f32) -> Self {
+        Self {
+            segments: core::slice::from_ref(index),
+            documents: index.documents(),
+            total: index.total_length(),
+            k1,
+            b,
+        }
+    }
+
+    /// The segments this searcher runs over, in the order it numbers them.
+    #[must_use]
+    pub const fn segments(&self) -> &'a [Reader<'b>] {
+        self.segments
+    }
+
+    /// How many documents those segments hold between them.
+    #[must_use]
+    pub const fn documents(&self) -> u32 {
+        self.documents
+    }
+
+    /// The mean document length across every segment.
+    ///
+    /// Not the mean of the segments' own means, which is only the same number
+    /// when the segments are the same size, and segments are not the same size.
+    #[must_use]
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        reason = "an average over a corpus is wanted to a few significant figures, \
+                  and the division runs in f64 so that only the result is narrowed"
+    )]
+    pub fn average_length(&self) -> f32 {
+        if self.documents == 0 {
+            return 0.0;
+        }
+        (self.total as f64 / f64::from(self.documents)) as f32
+    }
+
+    /// Which segment a hit came from, and what that segment calls the document.
+    ///
+    /// This is what a caller needs to go and fetch the document, because stored
+    /// fields live in the segment and are addressed the way the segment
+    /// addresses them. Returns nothing for an identifier past the end of the
+    /// last segment, which is an identifier from some other searcher.
+    #[must_use]
+    pub fn locate(&self, doc: DocId) -> Option<(usize, DocId)> {
+        let mut base: DocId = 0;
+        for (at, index) in self.segments.iter().enumerate() {
+            let end = base.saturating_add(index.documents());
+            if doc < end {
+                return Some((at, doc - base));
+            }
+            base = end;
+        }
+        None
     }
 
     /// Analyses `query` and returns the best `k` documents for it.
@@ -135,40 +279,15 @@ impl<'a, 'b> Searcher<'a, 'b> {
     }
 
     fn count_with<T: Tally>(&self, terms: &[&[u8]], tally: &mut T) -> Result<u64> {
-        let mut lists = self.open(terms, tally)?;
-        // One term is the common case and its answer is already in the header
-        // of its posting list, so nothing needs decoding at all.
-        if lists.len() <= 1 {
-            lists.report(tally);
-            return Ok(lists.counts.first().map_or(0, |&count| u64::from(count)));
-        }
+        let mut shards = self.open(terms, tally)?;
         let mut total = 0;
-        loop {
-            let (which, doc, second) = lists.front_two();
-            if doc == DocId::MAX {
-                lists.report(tally);
-                return Ok(total);
-            }
-
-            // Where the block this list is in ends before any other list starts,
-            // every document left in it belongs to the union and belongs to
-            // nobody else, so the whole block is one step rather than a hundred
-            // and twenty eight. On the query shape that costs the most, one
-            // common term and one rare one, this is nearly all of the walk.
-            if let Some(last) = lists.cursors[which].block_last()
-                && last < second
-            {
-                total += lists.take_block(which, last, tally)?;
-                continue;
-            }
-
-            total += 1;
-            for at in 0..lists.len() {
-                if lists.heads[at].doc == doc {
-                    lists.advance(at, tally)?;
-                }
-            }
+        // Summed rather than merged, because two segments never hold the same
+        // document and so the unions they count are disjoint.
+        for shard in &mut shards {
+            total += count_lists(&mut shard.lists, tally)?;
+            shard.lists.report(tally);
         }
+        Ok(total)
     }
 
     /// The best `k` documents and how many there are in all, in one pass.
@@ -232,28 +351,41 @@ impl<'a, 'b> Searcher<'a, 'b> {
         if k == 0 {
             return Ok((Vec::new(), self.count_terms(terms)?));
         }
-        let mut lists = self.open(terms, tally)?;
-        if lists.is_empty() {
-            return Ok((Vec::new(), 0));
-        }
-        if lists.len() == 1 {
-            // One term, and its total is in the header of its own list. Nothing
-            // has to be walked to know it, so the search can prune the way it
-            // does when no total was asked for.
-            let total = u64::from(lists.counts[0]);
-            let hits = self.search_one(&mut lists, k, tally)?;
-            lists.report(tally);
-            return Ok((hits, total));
-        }
-
-        let norm = Norm::new(self.k1, self.b, self.index.average_length());
-        let floor = self.k1 * (1.0 - self.b);
+        let mut shards = self.open(terms, tally)?;
+        let norm = Norm::new(self.k1, self.b, self.average_length());
         let mut top = TopK::new(k);
+        let mut total = 0u64;
+        for shard in &mut shards {
+            total += if shard.lists.len() == 1 {
+                // One term, and its total is in the header of its own list.
+                // Nothing has to be walked to know it, so the search can prune
+                // the way it does when no total was asked for.
+                let total = u64::from(shard.lists.counts[0]);
+                self.page_of_one(shard, norm, &mut top, tally)?;
+                total
+            } else {
+                self.page_and_total_of(shard, norm, &mut top, tally)?
+            };
+            shard.lists.report(tally);
+        }
+        Ok((top.into_sorted(), total))
+    }
+
+    /// The page and the total for one segment, in one walk over its lists.
+    fn page_and_total_of<T: Tally>(
+        &self,
+        shard: &mut Shard<'a, 'b>,
+        norm: Norm,
+        top: &mut TopK,
+        tally: &mut T,
+    ) -> Result<u64> {
+        let lists = &mut shard.lists;
+        let floor = self.k1 * (1.0 - self.b);
         let mut total = 0u64;
         loop {
             let (which, doc, second) = lists.front_two();
             if doc == DocId::MAX {
-                break;
+                return Ok(total);
             }
 
             // A block of one list that no other list reaches into, whose best
@@ -280,7 +412,7 @@ impl<'a, 'b> Searcher<'a, 'b> {
                 .map(|head| head.bound)
                 .sum();
             if ceiling > top.threshold() {
-                let norm = norm.of(self.index, doc);
+                let norm = norm.of(shard.index, doc);
                 let mut score = 0.0;
                 for at in 0..lists.len() {
                     if lists.heads[at].doc == doc {
@@ -288,7 +420,10 @@ impl<'a, 'b> Searcher<'a, 'b> {
                     }
                 }
                 tally.scored();
-                top.push(Hit { doc, score });
+                top.push(Hit {
+                    doc: shard.base.saturating_add(doc),
+                    score,
+                });
             }
 
             for at in 0..lists.len() {
@@ -297,8 +432,6 @@ impl<'a, 'b> Searcher<'a, 'b> {
                 }
             }
         }
-        lists.report(tally);
-        Ok((top.into_sorted(), total))
     }
 
     /// Returns the best `k` documents for a set of terms that are already
@@ -346,25 +479,40 @@ impl<'a, 'b> Searcher<'a, 'b> {
     }
 
     fn search_with<T: Tally>(&self, terms: &[&[u8]], k: usize, tally: &mut T) -> Result<Vec<Hit>> {
-        if k == 0 || self.index.is_empty() {
+        if k == 0 || self.documents == 0 {
             return Ok(Vec::new());
         }
-        let mut lists = self.open(terms, tally)?;
-        if lists.is_empty() {
-            return Ok(Vec::new());
+        let mut shards = self.open(terms, tally)?;
+        let norm = Norm::new(self.k1, self.b, self.average_length());
+        let mut top = TopK::new(k);
+        // In order, into the one heap. What the segments before this one found
+        // is what this one has to beat, so the pruning gets stronger as the
+        // query goes along rather than starting again at each segment.
+        for shard in &mut shards {
+            if shard.lists.len() == 1 {
+                self.page_of_one(shard, norm, &mut top, tally)?;
+            } else {
+                self.page_of(shard, norm, &mut top, tally)?;
+            }
+            shard.lists.report(tally);
         }
-        if lists.len() == 1 {
-            let hits = self.search_one(&mut lists, k, tally)?;
-            lists.report(tally);
-            return Ok(hits);
-        }
+        Ok(top.into_sorted())
+    }
 
-        let norm = Norm::new(self.k1, self.b, self.index.average_length());
+    /// The best documents in one segment, into a heap that may already hold
+    /// better ones from another.
+    fn page_of<T: Tally>(
+        &self,
+        shard: &mut Shard<'a, 'b>,
+        norm: Norm,
+        top: &mut TopK,
+        tally: &mut T,
+    ) -> Result<()> {
+        let lists = &mut shard.lists;
         // The smallest the denominator of the tf factor can get, which is what
         // turns a frequency into an upper bound on a score.
         let floor = self.k1 * (1.0 - self.b);
-        let mut top = TopK::new(k);
-        let mut threshold = 0.0;
+        let mut threshold = top.threshold();
         // The lists in order of where their cursors are. This is a list of
         // subscripts rather than the lists themselves because it is sorted on
         // every iteration and a cursor is a kilobyte, so sorting the lists would
@@ -376,7 +524,7 @@ impl<'a, 'b> Searcher<'a, 'b> {
             // A spent list carries the largest identifier there is, so the sort
             // leaves the live ones in front and this is where they stop.
             let live = order.partition_point(|&at| lists.heads[at].doc != DocId::MAX);
-            let Some(pivot) = pivot(&lists, &order[..live], threshold) else {
+            let Some(pivot) = pivot(lists, &order[..live], threshold) else {
                 break;
             };
             let candidate = lists.heads[order[pivot]].doc;
@@ -391,21 +539,41 @@ impl<'a, 'b> Searcher<'a, 'b> {
                 continue;
             }
 
-            // Everything up to the pivot is on the candidate. Before paying for
-            // the frequencies, ask what the blocks these cursors are sitting in
-            // could possibly add up to.
-            let ceiling: f32 = order[..=pivot]
+            // Every list on the candidate, which is not the same thing as every
+            // list up to the pivot. The pivot is where the running total of the
+            // terms' own bounds first passes the threshold, and lists after it
+            // can be sitting on the candidate too, because the sort puts equal
+            // documents next to each other and the pivot lands wherever the
+            // arithmetic lands. Those lists score the candidate, so leaving them
+            // out of the bound below is a bound that is too low, and a bound
+            // that is too low skips a document that belonged on the page.
+            let mut moved = pivot;
+            while moved + 1 < live && lists.heads[order[moved + 1]].doc == candidate {
+                moved += 1;
+            }
+
+            // Before paying for the frequencies, ask what the blocks these
+            // cursors are sitting in could possibly add up to.
+            let ceiling: f32 = order[..=moved]
                 .iter()
                 .map(|&at| lists.block_bound(at, self.k1, floor))
                 .sum();
             if ceiling <= threshold {
-                let next = order[..=pivot]
+                // As far as the shortest of those blocks reaches, and no
+                // further than the next list along. The bound just computed
+                // covers the lists on the candidate and nothing else, so it says
+                // nothing about a document that a list further back would also
+                // score, and that list starts at the document its cursor is on.
+                let mut next = order[..=moved]
                     .iter()
                     .filter_map(|&at| lists.cursors[at].block_last())
                     .min()
                     .unwrap_or(candidate)
                     .saturating_add(1)
                     .max(candidate.saturating_add(1));
+                if moved + 1 < live {
+                    next = next.min(lists.heads[order[moved + 1]].doc);
+                }
                 for at in 0..lists.len() {
                     if lists.heads[at].doc < next {
                         lists.seek(at, next, tally)?;
@@ -414,16 +582,23 @@ impl<'a, 'b> Searcher<'a, 'b> {
                 continue;
             }
 
-            let norm = norm.of(self.index, candidate);
+            let moved = moved + 1;
+            // Summed in the order the terms were given rather than in the order
+            // the cursors happen to be sitting in. Addition of floats is not
+            // associative, so the second order would give a score that depends
+            // on where the cursors are, and two documents a hundredth of a
+            // millionth apart would swap places according to which segment they
+            // were in. Which they do: this is not theoretical.
+            let norm = norm.of(shard.index, candidate);
             let mut score = 0.0;
-            let mut moved = 0;
-            while moved < live && lists.heads[order[moved]].doc == candidate {
-                score += lists.score(order[moved], self.k1, norm);
-                moved += 1;
+            for at in 0..lists.len() {
+                if lists.heads[at].doc == candidate {
+                    score += lists.score(at, self.k1, norm);
+                }
             }
             tally.scored();
             top.push(Hit {
-                doc: candidate,
+                doc: shard.base.saturating_add(candidate),
                 score,
             });
             threshold = top.threshold();
@@ -432,26 +607,25 @@ impl<'a, 'b> Searcher<'a, 'b> {
             }
         }
 
-        lists.report(tally);
-        Ok(top.into_sorted())
+        Ok(())
     }
 
-    /// Returns the best `k` documents for a query that came down to one list.
+    /// The best documents in one segment for a query that came down to one list.
     ///
     /// One term is the commonest query there is and it has no pivot to find:
     /// every document in the list is a candidate and the only question is which
     /// of them score. What is left of the pruning is the block bound, which
     /// still steps over a whole block whose best posting cannot displace the
     /// worst hit in hand.
-    fn search_one<T: Tally>(
+    fn page_of_one<T: Tally>(
         &self,
-        lists: &mut Lists<'b>,
-        k: usize,
+        shard: &mut Shard<'a, 'b>,
+        norm: Norm,
+        top: &mut TopK,
         tally: &mut T,
-    ) -> Result<Vec<Hit>> {
-        let norm = Norm::new(self.k1, self.b, self.index.average_length());
+    ) -> Result<()> {
+        let lists = &mut shard.lists;
         let floor = self.k1 * (1.0 - self.b);
-        let mut top = TopK::new(k);
         // The block bound only changes when the block does, and this is the one
         // walk that asks for it on every document, so it is worked out once per
         // block rather than once per posting.
@@ -474,60 +648,147 @@ impl<'a, 'b> Searcher<'a, 'b> {
             }
             tally.scored();
             top.push(Hit {
-                doc,
-                score: lists.score(0, self.k1, norm.of(self.index, doc)),
+                doc: shard.base.saturating_add(doc),
+                score: lists.score(0, self.k1, norm.of(shard.index, doc)),
             });
             lists.advance(0, tally)?;
         }
 
-        Ok(top.into_sorted())
+        Ok(())
     }
 
-    /// Opens a cursor for each term that is in the index.
-    fn open<T: Tally>(&self, terms: &[&[u8]], tally: &mut T) -> Result<Lists<'b>> {
-        let documents = self.index.documents();
-        let mut lists = Lists {
-            heads: Vec::with_capacity(terms.len()),
-            cursors: Vec::with_capacity(terms.len()),
-            counts: Vec::with_capacity(terms.len()),
-        };
+    /// Opens a cursor in every segment for every term that is in one.
+    ///
+    /// Two passes over the segments, because how surprising a term is depends on
+    /// how many documents in the store hold it and that is not known until the
+    /// last segment has been asked. The lists found on the way are kept rather
+    /// than looked up again: a posting list here is a borrowed view of bytes
+    /// that are already mapped, so holding one costs a pointer and a length,
+    /// where finding it again costs a walk through a dictionary.
+    fn open<T: Tally>(&self, terms: &[&[u8]], tally: &mut T) -> Result<Vec<Shard<'a, 'b>>> {
+        let mut found: Vec<Vec<Option<posting::Reader<'b>>>> =
+            Vec::with_capacity(self.segments.len());
+        let mut holding = vec![0u32; terms.len()];
+        for index in self.segments {
+            let mut row = Vec::with_capacity(terms.len());
+            for (at, term) in terms.iter().enumerate() {
+                let list = index.postings(term)?.filter(|list| !list.is_empty());
+                if let Some(list) = &list {
+                    // A term cannot be in more documents than the store holds,
+                    // and that count is a `u32`, so this cannot really
+                    // saturate.
+                    holding[at] = holding[at].saturating_add(list.len());
+                }
+                row.push(list);
+            }
+            found.push(row);
+        }
+        // The two numbers a term contributes with, worked out once for the whole
+        // query rather than once per segment. This is what makes a document's
+        // score independent of the segment it landed in.
+        let weights: Vec<(f32, f32)> = holding
+            .iter()
+            .map(|&holding| {
+                let idf = idf(self.documents, holding);
+                (idf, idf * (self.k1 + 1.0))
+            })
+            .collect();
+
+        let mut shards = Vec::with_capacity(self.segments.len());
+        let mut base: DocId = 0;
+        let mut opened = 0u32;
         let mut postings = 0u64;
         let mut blocks = 0u64;
-        for term in terms {
-            let Some(list) = self.index.postings(term)? else {
-                continue;
+        for (index, row) in self.segments.iter().zip(found) {
+            let mut lists = Lists {
+                heads: Vec::with_capacity(terms.len()),
+                cursors: Vec::with_capacity(terms.len()),
+                counts: Vec::with_capacity(terms.len()),
             };
-            if list.is_empty() {
-                continue;
+            for (at, list) in row.into_iter().enumerate() {
+                let Some(list) = list else {
+                    continue;
+                };
+                let mut cursor = list.cursor();
+                let Some(doc) = cursor.advance()? else {
+                    continue;
+                };
+                postings += u64::from(list.len());
+                // The leftovers at the end of a list are a block as far as a
+                // walk is concerned, so they count as one here.
+                blocks += list.blocks() as u64;
+                if list.len() as usize > list.blocks() * BLOCK_SIZE {
+                    blocks += 1;
+                }
+                let (idf, bound) = weights[at];
+                lists.heads.push(Head { doc, idf, bound });
+                lists.cursors.push(cursor);
+                lists.counts.push(list.len());
             }
-            let idf = idf(documents, list.len());
-            let mut cursor = list.cursor();
-            let Some(doc) = cursor.advance()? else {
-                continue;
-            };
-            postings += u64::from(list.len());
-            // The leftovers at the end of a list are a block as far as a walk is
-            // concerned, so they count as one here.
-            blocks += list.blocks() as u64;
-            if list.len() as usize > list.blocks() * BLOCK_SIZE {
-                blocks += 1;
+            if !lists.is_empty() {
+                shards.push(Shard { index, base, lists });
             }
-            lists.heads.push(Head {
-                doc,
-                idf,
-                bound: idf * (self.k1 + 1.0),
-            });
-            lists.cursors.push(cursor);
-            lists.counts.push(list.len());
+            base = base.saturating_add(index.documents());
         }
-        // A query with four billion terms in it is not a query, so the saturation
-        // here is a formality rather than a case.
-        tally.opened(
-            u32::try_from(lists.len()).unwrap_or(u32::MAX),
-            postings,
-            blocks,
-        );
-        Ok(lists)
+        // How many of the query's terms were found somewhere, which is a
+        // question about the store rather than about a segment, so a term in
+        // eight segments is one term and not eight. A query with four billion
+        // terms in it is not a query, so the saturation is a formality rather
+        // than a case.
+        for held in &holding {
+            if *held > 0 {
+                opened = opened.saturating_add(1);
+            }
+        }
+        tally.opened(opened, postings, blocks);
+        Ok(shards)
+    }
+}
+
+/// One segment's share of a query.
+///
+/// The lists it opened, the reader they came out of, because scoring needs
+/// document lengths and those live in the segment, and where this segment's
+/// documents start in the numbering the hits come back with.
+#[derive(Debug)]
+struct Shard<'a, 'b> {
+    index: &'a Reader<'b>,
+    base: DocId,
+    lists: Lists<'b>,
+}
+
+/// How many documents in one segment hold at least one of the query's terms.
+fn count_lists<T: Tally>(lists: &mut Lists<'_>, tally: &mut T) -> Result<u64> {
+    // One term is the common case and its answer is already in the header of its
+    // posting list, so nothing needs decoding at all.
+    if lists.len() <= 1 {
+        return Ok(lists.counts.first().map_or(0, |&count| u64::from(count)));
+    }
+    let mut total = 0;
+    loop {
+        let (which, doc, second) = lists.front_two();
+        if doc == DocId::MAX {
+            return Ok(total);
+        }
+
+        // Where the block this list is in ends before any other list starts,
+        // every document left in it belongs to the union and belongs to nobody
+        // else, so the whole block is one step rather than a hundred and twenty
+        // eight. On the query shape that costs the most, one common term and one
+        // rare one, this is nearly all of the walk.
+        if let Some(last) = lists.cursors[which].block_last()
+            && last < second
+        {
+            total += lists.take_block(which, last, tally)?;
+            continue;
+        }
+
+        total += 1;
+        for at in 0..lists.len() {
+            if lists.heads[at].doc == doc {
+                lists.advance(at, tally)?;
+            }
+        }
     }
 }
 
@@ -862,27 +1123,35 @@ mod tests {
 
     /// Scores every document the slow, obvious way, which is what the fast way
     /// has to agree with.
+    ///
+    /// A term at a time into an array of scores rather than a document at a
+    /// time, so that a corpus large enough to make the pruning fire is still
+    /// cheap enough to check exhaustively. The terms are added in the order they
+    /// were given, which is the order the walk adds them in, so two scores that
+    /// agree here agree to the last bit rather than to a tolerance.
     fn by_hand(index: &Reader<'_>, terms: &[&[u8]], k1: f32, b: f32) -> Vec<Hit> {
         let average = index.average_length().max(1.0);
-        let mut hits = Vec::new();
-        for doc in 0..index.documents() {
-            let mut score = 0.0;
-            for term in terms {
-                let Some(list) = index.postings(term).expect("decodes") else {
-                    continue;
-                };
-                let postings = list.to_postings().expect("decodes");
-                let Some((_, frequency)) = postings.iter().find(|(id, _)| *id == doc) else {
-                    continue;
-                };
-                let f = *frequency as f32;
+        let mut scores = vec![0.0f32; index.documents() as usize];
+        for term in terms {
+            let Some(list) = index.postings(term).expect("decodes") else {
+                continue;
+            };
+            let idf = idf(index.documents(), list.len());
+            for (doc, frequency) in list.to_postings().expect("decodes") {
+                let f = frequency as f32;
                 let norm = k1 * (1.0 - b + b * index.length(doc) as f32 / average);
-                score += idf(index.documents(), list.len()) * (f * (k1 + 1.0)) / (f + norm);
-            }
-            if score > 0.0 {
-                hits.push(Hit { doc, score });
+                scores[doc as usize] += idf * (f * (k1 + 1.0)) / (f + norm);
             }
         }
+        let mut hits: Vec<Hit> = scores
+            .iter()
+            .enumerate()
+            .filter(|(_, score)| **score > 0.0)
+            .map(|(doc, &score)| Hit {
+                doc: u32::try_from(doc).expect("a test corpus is not four billion documents"),
+                score,
+            })
+            .collect();
         hits.sort_unstable_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
@@ -1338,6 +1607,294 @@ mod tests {
         let once = searcher.search("fox", 10).expect("searches");
         let thrice = searcher.search("fox fox fox", 10).expect("searches");
         same(&thrice, &once);
+    }
+
+    /// A corpus with the shape real prose has: a handful of words in nearly
+    /// every document and most words in almost none.
+    ///
+    /// The regular corpora above are too kind to the pruning. Every document is
+    /// about the same length and every term is either everywhere or nowhere, so
+    /// the walk meets the same decision over and over. Drawing the rank of each
+    /// word log uniformly gets the long tail instead, and with it the case where
+    /// several lists sit on the same document at once, which is where the walk
+    /// has to be careful.
+    fn heavy_tailed(documents: usize) -> Vec<String> {
+        use core::fmt::Write as _;
+
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let vocabulary = 3_000.0_f64;
+        let mut out = Vec::with_capacity(documents);
+        for _ in 0..documents {
+            let mut text = String::with_capacity(256);
+            let length = 20 + (next() % 60) as usize;
+            for _ in 0..length {
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "a fraction of the way through a 64 bit range, which \
+                              only has to be spread out rather than exact"
+                )]
+                let unit = (next() >> 11) as f64 / (1_u64 << 53) as f64;
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "the exponential is bounded by the vocabulary size, \
+                              which is three thousand"
+                )]
+                let rank = vocabulary.powf(unit) as usize;
+                let _ = write!(text, "word{rank} ");
+            }
+            out.push(text);
+        }
+        out
+    }
+
+    #[test]
+    fn pruning_keeps_every_document_that_belongs_on_the_page() {
+        // A corpus shaped like prose, where several of a query's terms land on
+        // the same document often enough to matter. The walk decides whether a
+        // document is worth scoring from what the terms on it could add up to,
+        // and a walk that leaves one of those terms out of the sum can talk
+        // itself out of a document that belonged at the top of the page.
+        let docs = heavy_tailed(20_000);
+        let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+        let bytes = build(&refs);
+        let segment = Segment::open(&bytes).expect("opens");
+        let index = Reader::open(&segment).expect("opens");
+        let searcher = Searcher::new(&index);
+
+        for query in [
+            "word1 word7 word2",
+            "word3 word40 word1",
+            "word2 word5 word900",
+            "word1 word2 word3",
+            "word11 word12 word13",
+            "word1 word2",
+        ] {
+            let mut analyzer = Analyzer::new();
+            let mut words: Vec<Vec<u8>> = Vec::new();
+            analyzer.analyze(query, |term, _| words.push(term.to_vec()));
+            words.sort_unstable();
+            words.dedup();
+            let terms: Vec<&[u8]> = words.iter().map(Vec::as_slice).collect();
+            let slow = by_hand(&index, &terms, K1, B);
+            for k in [1, 10, 100] {
+                let want = k.min(slow.len());
+                let fast = searcher.search_terms(&terms, k).expect("searches");
+                assert_eq!(fast.len(), want, "{query} at k {k}");
+                same(&fast, &slow[..want]);
+                // The other walk over the same lists, which prunes by a
+                // different argument and has to reach the same page.
+                let (page, _) = searcher
+                    .search_and_count_terms(&terms, k)
+                    .expect("searches");
+                same(&page, &slow[..want]);
+            }
+        }
+    }
+
+    /// Splits a corpus into `parts` segments, in order, so that a document's
+    /// place in the searcher's numbering is the place it had in the corpus.
+    fn split(docs: &[&str], parts: usize) -> Vec<Vec<u8>> {
+        let per = docs.len().div_ceil(parts);
+        docs.chunks(per).map(build).collect()
+    }
+
+    #[test]
+    fn eight_segments_rank_the_same_as_one() {
+        // The one that matters. A store writes a new segment every time it
+        // flushes, so the same corpus is one segment on Monday and eight on
+        // Friday, and a page of results that changed on the way would mean the
+        // engine cannot be trusted to have said anything.
+        let docs = skewed(6_000);
+        let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+
+        let whole = build(&refs);
+        let one = Segment::open(&whole).expect("opens");
+        let one = Reader::open(&one).expect("opens");
+        let one = Searcher::new(&one);
+
+        let parts = split(&refs, 8);
+        let segments: Vec<Segment<'_>> = parts
+            .iter()
+            .map(|bytes| Segment::open(bytes).expect("opens"))
+            .collect();
+        let readers: Vec<Reader<'_>> = segments
+            .iter()
+            .map(|segment| Reader::open(segment).expect("opens"))
+            .collect();
+        let many = Searcher::over(&readers).expect("six thousand documents are numberable");
+
+        assert_eq!(many.segments().len(), 8);
+        assert_eq!(many.documents(), one.documents());
+        assert!((many.average_length() - one.average_length()).abs() < 1e-3);
+
+        for query in [
+            "common",
+            "rare",
+            "rare common",
+            "word7",
+            "word7 common rare",
+            "aardvark",
+            "aardvark common",
+        ] {
+            for k in [1, 10, 200] {
+                same(
+                    &many.search(query, k).expect("searches"),
+                    &one.search(query, k).expect("searches"),
+                );
+                assert_eq!(
+                    many.count(query).expect("counts"),
+                    one.count(query).expect("counts"),
+                    "{query}"
+                );
+                let (hits, total) = many.search_and_count(query, k).expect("searches");
+                same(&hits, &one.search(query, k).expect("searches"));
+                assert_eq!(total, one.count(query).expect("counts"), "{query} at k {k}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_term_weighs_the_same_wherever_the_document_holding_it_sits() {
+        // Two identical documents, one in each segment, with a term that is
+        // common in the first segment and absent from the second. Weighed per
+        // segment they would score differently, and the copy in the segment that
+        // had not seen the word before would win a page it has no business
+        // winning.
+        let first = build(&["alpha beta", "alpha", "alpha", "alpha"]);
+        let second = build(&["alpha beta", "gamma", "gamma", "gamma"]);
+        let segments = [
+            Segment::open(&first).expect("opens"),
+            Segment::open(&second).expect("opens"),
+        ];
+        let readers: Vec<Reader<'_>> = segments
+            .iter()
+            .map(|segment| Reader::open(segment).expect("opens"))
+            .collect();
+        let searcher = Searcher::over(&readers).expect("eight documents are numberable");
+
+        let hits = searcher.search("alpha beta", 10).expect("searches");
+        let twins: Vec<&Hit> = hits
+            .iter()
+            .filter(|hit| hit.doc == 0 || hit.doc == 4)
+            .collect();
+        assert_eq!(twins.len(), 2, "both copies are hits");
+        assert!(
+            (twins[0].score - twins[1].score).abs() < 1e-6,
+            "the same document scored {} in one segment and {} in the other",
+            twins[0].score,
+            twins[1].score
+        );
+    }
+
+    #[test]
+    fn a_hit_says_which_segment_it_came_from() {
+        let parts = split(&DOCS, 3);
+        let segments: Vec<Segment<'_>> = parts
+            .iter()
+            .map(|bytes| Segment::open(bytes).expect("opens"))
+            .collect();
+        let readers: Vec<Reader<'_>> = segments
+            .iter()
+            .map(|segment| Reader::open(segment).expect("opens"))
+            .collect();
+        let searcher = Searcher::over(&readers).expect("six documents are numberable");
+
+        // Two documents per segment, so the numbering runs 0 and 1 in the first,
+        // 2 and 3 in the second, and 4 and 5 in the third.
+        assert_eq!(searcher.locate(0), Some((0, 0)));
+        assert_eq!(searcher.locate(3), Some((1, 1)));
+        assert_eq!(searcher.locate(5), Some((2, 1)));
+        assert_eq!(searcher.locate(6), None);
+
+        let hits = searcher.search("fox", 10).expect("searches");
+        assert_eq!(
+            hits.iter().map(|hit| hit.doc).collect::<Vec<_>>(),
+            [5, 1, 0]
+        );
+        let (segment, doc) = searcher.locate(hits[0].doc).expect("a hit is somewhere");
+        assert_eq!((segment, doc), (2, 1));
+        assert_eq!(
+            readers[segment].length(doc),
+            1,
+            "the document that is one word"
+        );
+    }
+
+    #[test]
+    fn a_segment_holding_none_of_the_query_does_not_stop_the_others() {
+        let parts = [
+            build(&["nothing to do with any of it", "or with this"]),
+            build(&["the quick brown fox", "nor this"]),
+        ];
+        let segments: Vec<Segment<'_>> = parts
+            .iter()
+            .map(|bytes| Segment::open(bytes).expect("opens"))
+            .collect();
+        let readers: Vec<Reader<'_>> = segments
+            .iter()
+            .map(|segment| Reader::open(segment).expect("opens"))
+            .collect();
+        let searcher = Searcher::over(&readers).expect("four documents are numberable");
+        let hits = searcher.search("fox", 10).expect("searches");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].doc, 2);
+    }
+
+    #[test]
+    fn a_term_in_every_segment_is_still_one_term() {
+        // The counters describe the query rather than the walk's internal
+        // arrangements, so a word held by eight segments is one term that was
+        // opened, and the postings are all of them wherever they live.
+        let docs = skewed(6_000);
+        let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+        let parts = split(&refs, 8);
+        let segments: Vec<Segment<'_>> = parts
+            .iter()
+            .map(|bytes| Segment::open(bytes).expect("opens"))
+            .collect();
+        let readers: Vec<Reader<'_>> = segments
+            .iter()
+            .map(|segment| Reader::open(segment).expect("opens"))
+            .collect();
+        let searcher = Searcher::over(&readers).expect("six thousand documents are numberable");
+
+        let (_, counters) = searcher.search_explained("common", 10).expect("searches");
+        assert_eq!(counters.terms, 1);
+        assert_eq!(counters.postings, 6_000);
+        // Eight segments of seven hundred and fifty, which is five whole blocks
+        // and a remainder each.
+        assert_eq!(counters.blocks, 8 * (750 / BLOCK_SIZE as u64 + 1));
+        assert_eq!(
+            counters.blocks_decoded + counters.blocks_skipped,
+            counters.blocks
+        );
+
+        let (_, counters) = searcher
+            .search_explained("rare common aardvark", 10)
+            .expect("searches");
+        assert_eq!(counters.terms, 2, "aardvark is in none of them");
+    }
+
+    #[test]
+    fn searching_no_segments_at_all_returns_nothing() {
+        let searcher = Searcher::over(&[]).expect("nothing is numberable");
+        assert_eq!(searcher.documents(), 0);
+        assert!(searcher.average_length().abs() < 1e-6);
+        assert!(
+            searcher
+                .search("anything", 10)
+                .expect("searches")
+                .is_empty()
+        );
+        assert_eq!(searcher.count("anything").expect("counts"), 0);
+        assert_eq!(searcher.locate(0), None);
     }
 
     #[test]
