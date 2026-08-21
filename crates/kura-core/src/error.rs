@@ -174,6 +174,39 @@ pub enum Error {
         length: u64,
     },
 
+    /// A segment does not end in a footer.
+    ///
+    /// Either the file is not a segment or the bytes that say how to check the
+    /// rest of it are gone, and there is no way to tell those apart from here.
+    BadFooter,
+
+    /// The two ends of a segment disagree about how long its body is.
+    ///
+    /// The length is written twice because damage to one copy is invisible to a
+    /// reader that only looks at the other, and a body that is longer or shorter
+    /// than it should be is the one kind of damage that moves everything after
+    /// it rather than changing it.
+    BodyLengthMismatch {
+        /// The length the header claims.
+        header: u64,
+        /// The length the footer claims.
+        footer: u64,
+    },
+
+    /// A section's bytes are not the bytes its table entry was written for.
+    ///
+    /// Named rather than anonymous, because a digest per section exists to say
+    /// which part of a file is damaged. Every other section of the same segment
+    /// is still known good.
+    SectionChecksumMismatch {
+        /// The kind of the section the damage is in.
+        kind: u16,
+        /// The digest the section table holds.
+        stored: u128,
+        /// The digest of the bytes that are there.
+        computed: u128,
+    },
+
     /// A compressed block did not decode to what its container said it holds,
     /// which means the bytes are not the bytes that were written however well
     /// formed the sequences in them look.
@@ -189,6 +222,11 @@ pub enum Error {
 }
 
 impl fmt::Display for Error {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one arm per variant, and splitting the match would hide which \
+                  variants have a message from anyone adding one"
+    )]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Truncated { needed, available } => {
@@ -271,6 +309,24 @@ impl fmt::Display for Error {
                     f,
                     "section kind {kind} claims bytes {offset}..{} which are not in the segment",
                     offset.saturating_add(*length)
+                )
+            }
+            Self::BadFooter => f.write_str("this segment does not end in a footer"),
+            Self::BodyLengthMismatch { header, footer } => {
+                write!(
+                    f,
+                    "the header says the body is {header} bytes and the footer says {footer}"
+                )
+            }
+            Self::SectionChecksumMismatch {
+                kind,
+                stored,
+                computed,
+            } => {
+                write!(
+                    f,
+                    "section kind {kind} does not match its checksum: stored {stored:#034x}, \
+                     computed {computed:#034x}"
                 )
             }
             Self::BadBlock => f.write_str("a compressed block does not decode to what it should"),

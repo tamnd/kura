@@ -8,11 +8,11 @@
 //!
 //! # What it checks, in the order it checks it
 //!
-//! The header, then the section table, then the checksum of the body, then the
-//! contents of every section an index needs, then every posting list, then every
-//! stored document. The order matters because each stage depends on the one
-//! before it: there is no point decoding a posting list out of a section table
-//! that points outside the file.
+//! The header, then the section table, then the checksum of the table and of
+//! every section in it, then the contents of every section an index needs, then
+//! every posting list, then every stored document. The order matters because
+//! each stage depends on the one before it: there is no point decoding a posting
+//! list out of a section table that points outside the file.
 //!
 //! # Why it keeps going after the first failure
 //!
@@ -31,13 +31,13 @@
 //!
 //! # What it cannot tell you
 //!
-//! Which block of a posting list is damaged. The format checksums the body as a
-//! whole and nothing smaller, so a mismatch says a byte somewhere in the file is
-//! wrong and cannot say where. Decoding narrows that down to the term whose list
-//! stops decoding, which is as far as this goes today, and a byte flipped inside
-//! a block of document identifiers usually decodes to different identifiers
-//! rather than to an error at all. Catching that needs a checksum per section
-//! and then per block, which the format does not have yet.
+//! Which block of a posting list is damaged. The format checksums each section
+//! and nothing smaller, so a mismatch says which section a wrong byte is in, and
+//! on a real index the postings are most of the file. Decoding narrows that down
+//! to the term whose list stops decoding, which is as far as this goes today,
+//! and a byte flipped inside a block of document identifiers usually decodes to
+//! different identifiers rather than to an error at all. Catching that needs a
+//! checksum per block, which the format does not have yet.
 //!
 //! It also cannot tell you that an index is the index you meant. Every check
 //! here is internal consistency, so an index built from the wrong directory
@@ -105,17 +105,11 @@ pub fn check(path: &Path, out: &mut impl Write) -> io::Result<Outcome> {
 
     table(&segment, as_u64(bytes.len()), out)?;
 
-    // The checksum is not fatal, which is the whole reason the two open paths
-    // are separate. A body that does not match its checksum still decodes often
+    // The checksums are not fatal, which is the whole reason the two open paths
+    // are separate. A body that does not match its checksums still decodes often
     // enough to say which term the damage landed in, and that is worth more than
     // refusing to look.
-    match Segment::open(&bytes) {
-        Ok(_) => passed(out, "checksum")?,
-        Err(error) => {
-            failed(out, "checksum", &error)?;
-            outcome.failures += 1;
-        }
-    }
+    outcome.failures += checksums(&segment, out)?;
 
     match index::Reader::open(&segment) {
         Ok(reader) => {
@@ -152,21 +146,66 @@ fn table(segment: &Segment<'_>, total: u64, out: &mut impl Write) -> io::Result<
     writeln!(out)?;
     writeln!(out, "  sections")?;
     for section in segment.sections() {
-        // A kind this build has never heard of is not a failure. A reader skips
-        // an unknown section and carries on, which is what makes it possible to
-        // add one without breaking every older binary, so the honest thing to
-        // print is the number rather than a complaint.
-        let name = segment::name(section.kind)
-            .map_or_else(|| format!("kind {}", section.kind), ToString::to_string);
         writeln!(
             out,
-            "    {name:<12} {:>12}  {:>6}  at {}",
+            "    {:<12} {:>12}  {:>6}  at {}",
+            label(section.kind),
             bytes(section.length),
             share(section.length, total),
             section.offset,
         )?;
     }
     writeln!(out)
+}
+
+/// What to call a section in the report.
+///
+/// A kind this build has never heard of is not a failure. A reader skips an
+/// unknown section and carries on, which is what makes it possible to add one
+/// without breaking every older binary, so the honest thing to print is the
+/// number rather than a complaint.
+fn label(kind: u16) -> String {
+    segment::name(kind).map_or_else(|| format!("kind {kind}"), ToString::to_string)
+}
+
+/// Checks the section table and then every section against its own digest.
+///
+/// One line per section rather than one for the file. That is the whole point
+/// of a digest per section: a report that says the postings are damaged and the
+/// dictionary is intact tells somebody what to do next, and a report that says
+/// a byte somewhere is wrong does not.
+///
+/// The table is checked first and separately. Every digest below it came out of
+/// the table, so if the table has been changed then none of the comparisons
+/// under it mean anything, and a report that did not say so would be listing
+/// sections as good on the word of bytes it had just found to be bad.
+fn checksums(segment: &Segment<'_>, out: &mut impl Write) -> io::Result<usize> {
+    let mut failures = 0;
+
+    match segment.verify_table() {
+        Ok(()) => passed(out, "checksum table")?,
+        Err(error) => {
+            failed(out, "checksum table", &error)?;
+            writeln!(
+                out,
+                "      the checksums below come out of this table, so treat them as unanswered"
+            )?;
+            failures += 1;
+        }
+    }
+
+    for section in segment.sections() {
+        let what = format!("checksum {}", label(section.kind));
+        match segment.verify_section(section.kind) {
+            Ok(()) => passed(out, &what)?,
+            Err(error) => {
+                failed(out, &what, &error)?;
+                failures += 1;
+            }
+        }
+    }
+
+    Ok(failures)
 }
 
 /// Prints what the index says about itself, which is cheap and often enough.
@@ -482,6 +521,32 @@ mod tests {
         assert!(outcome.failures >= 1, "{report}");
         assert!(report.contains("FAILED   checksum"), "{report}");
         assert!(report.contains("sections"), "{report}");
+    }
+
+    #[test]
+    fn the_report_names_the_section_the_damage_is_in() {
+        // What a digest per section buys over one digest for the file. The
+        // postings fail and everything else is reported as good, so the person
+        // reading this knows the dictionary and the stored fields are intact.
+        let index = an_index();
+        let at = {
+            let segment = Segment::open_without_checksum(&index).expect("the index opens");
+            let postings = segment
+                .sections()
+                .find(|section| section.kind == segment::kind::POSTINGS)
+                .expect("an index has postings");
+            segment::HEADER_LEN + usize::try_from(postings.offset).expect("an offset fits")
+        };
+
+        let mut damaged = index.clone();
+        damaged[at] ^= 0x01;
+
+        let (report, outcome) = check_bytes("named", &damaged);
+        assert!(outcome.failures >= 1, "{report}");
+        assert!(report.contains("FAILED   checksum postings"), "{report}");
+        assert!(report.contains("ok       checksum table"), "{report}");
+        assert!(report.contains("ok       checksum terms"), "{report}");
+        assert!(report.contains("ok       checksum fields"), "{report}");
     }
 
     #[test]
