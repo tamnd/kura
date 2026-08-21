@@ -378,8 +378,11 @@ mod tests {
         let path = written("debug", b"0123456789");
         let map = Map::open(&path).expect("maps");
         let text = format!("{map:?}");
-        assert!(text.contains("10"), "{text}");
-        assert!(!text.contains("48"), "{text}");
+        assert!(text.contains("len: 10"), "{text}");
+        // A bracket rather than a byte value. Looking for the decimal of one of
+        // the bytes finds it in the address about one run in twenty, because an
+        // address is printed in hexadecimal and hexadecimal is mostly digits.
+        assert!(!text.contains('['), "{text}");
         drop(map);
         std::fs::remove_file(&path).expect("the file is still there");
     }
