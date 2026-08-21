@@ -193,43 +193,44 @@ Querying is not slower either, and on this corpus the fourteen segment version w
 Every index run also says how much the writer held and what it was holding.
 
 ```
-indexed 10888 documents, 106.4 MB of text into /tmp/docs.kura, 14.3 MB in 1.9s
-held at most 63.7 MB at once, 46.3 MB postings, 17.0 MB vocabulary, 397.3 KB stored fields, 64.0 KB lengths
+indexed 10888 documents, 106.4 MB of text into /tmp/docs.kura, 14.3 MB in 1.0s
+held at most 60.5 MB at once, 43.0 MB postings, 17.0 MB vocabulary, 397.3 KB stored fields, 64.0 KB lengths
 ```
 
 That is the largest a single writer got, so on a run with `--flush-every` it is the peak of one segment rather than of the corpus.
-The same tree at four budgets, three runs each, and the numbers were identical on every run because they depend on what was indexed and not on the machine:
+The same tree at four budgets, three runs each, and the held numbers were identical on every run because they depend on what was indexed and not on the machine:
 
 | budget | segments | held | postings | vocabulary | stored fields | peak RSS |
 | --- | --- | --- | --- | --- | --- | --- |
-| none | 1 | 63.7 MB | 46.3 MB | 17.0 MB | 397.3 KB | 109 to 130 MB |
-| 32m | 4 | 30.9 MB | 23.3 MB | 7.5 MB | 159.1 KB | 73 to 86 MB |
-| 8m | 14 | 15.6 MB | 11.8 MB | 3.8 MB | 114.3 KB | 60 to 67 MB |
-| 2m | 49 | 9.1 MB | 6.0 MB | 3.0 MB | 97.1 KB | 43 to 45 MB |
+| none | 1 | 60.5 MB | 43.0 MB | 17.0 MB | 397.3 KB | 120 to 130 MB |
+| 32m | 4 | 27.1 MB | 19.4 MB | 7.5 MB | 159.1 KB | 60 to 82 MB |
+| 8m | 14 | 12.4 MB | 8.6 MB | 3.8 MB | 114.3 KB | 53 to 65 MB |
+| 2m | 49 | 8.7 MB | 5.6 MB | 3.0 MB | 97.1 KB | 47 to 52 MB |
 
-Two things fall out of that table.
 The postings are about three quarters of what a writer holds and the vocabulary is most of the rest, so a change that made the stored fields cheaper would be a change nobody could measure.
-And what the writer holds is only about half of what the process holds, at every budget, so the other half is somewhere else entirely and `--flush-every` does not bound it.
 
-A third line says where that other half is.
+What the writer holds is also well under what the process holds, and a third line says where the difference is.
 
 ```
-peak resident 93.4 MB by the last document, 111.7 MB once the segment was built, 111.7 MB once it was written
+peak resident 76.1 MB by the last document, 118.6 MB once the segment was built, 118.6 MB once it was written
 ```
 
 That is the high water mark of the whole process, the same number `/usr/bin/time` reports, read at three points.
 A high water mark never falls, so each reading says how much further the work since the one before it pushed the worst the process had been.
-Three runs of the tree above with no budget, so one segment:
+Five runs of the tree above with no budget, so one segment:
 
 | | by the last document | once the segment was built | once it was written |
 | --- | --- | --- | --- |
-| run 1 | 96.6 MB | 108.4 MB | 108.4 MB |
-| run 2 | 93.4 MB | 111.7 MB | 111.7 MB |
-| run 3 | 109.2 MB | 118.1 MB | 118.1 MB |
+| run 1 | 80.2 MB | 111.3 MB | 111.3 MB |
+| run 2 | 69.6 MB | 113.4 MB | 113.5 MB |
+| run 3 | 84.2 MB | 127.9 MB | 127.9 MB |
+| run 4 | 79.1 MB | 123.0 MB | 123.0 MB |
+| run 5 | 76.1 MB | 118.6 MB | 118.6 MB |
 
 Writing the file costs nothing, on every run.
-Turning the writer into a segment costs 9 to 18 MB, which is about the size of the segment, and it is a real cost that no budget bounds because it happens once per segment however many there are.
-Everything else, and it is the largest part, is already there by the last document: the writer says it is holding 63.7 MB and the process has 93 to 109 MB, so 30 to 45 MB of it is the allocator rather than anything the engine knows about.
+Reading the corpus costs 9 to 24 MB over what the writer says it holds, which is the allocator and the buffer each file is read into.
+Turning the writer into a segment costs 31 to 44 MB, which is more than twice the 14.3 MB the segment comes to, and it is the largest single part of an index run.
+It is also the part no budget bounds, because it happens once per segment however many segments there are.
 
 Unlike the held numbers these move from run to run, because they are the whole process and the whole process is at the mercy of what else the machine is doing.
 Read them as a shape and not as a measurement.
