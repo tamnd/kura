@@ -23,7 +23,6 @@
 //! engine. Argument parsing is forty lines and a crate is forever.
 
 mod eval;
-mod map;
 mod report;
 mod verify;
 
@@ -36,12 +35,11 @@ use std::time::Instant;
 
 use kura_core::analysis::Analyzer;
 use kura_core::index::{Reader, Writer};
+use kura_core::mapping::Map;
 use kura_core::residency;
 use kura_core::search::Searcher;
 use kura_core::segment::Segment;
 use kura_core::store::Scratch;
-
-use crate::map::Map;
 
 /// How many results a command prints when nobody says otherwise.
 const DEFAULT_HITS: usize = 10;

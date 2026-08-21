@@ -29,6 +29,8 @@ pub mod file;
 pub mod index;
 pub mod lz;
 pub mod manifest;
+#[cfg(feature = "fs")]
+pub mod mapping;
 pub mod posting;
 pub mod residency;
 pub mod search;
