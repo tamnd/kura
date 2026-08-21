@@ -662,18 +662,7 @@ fn blocks() {
         previous = *id;
     }
 
-    let mut packed = Vec::new();
-    let mut widths = Vec::new();
-    let mut base = 0u32;
-    for chunk in ids.chunks(bitpack::BLOCK) {
-        let mut block = [0u32; bitpack::BLOCK];
-        block[..chunk.len()].copy_from_slice(chunk);
-        for slot in &mut block[chunk.len()..] {
-            *slot = chunk[chunk.len() - 1];
-        }
-        widths.push(bitpack::pack(&block, base, &mut packed));
-        base = block[bitpack::BLOCK - 1];
-    }
+    let (packed, widths) = pack_run(&ids);
     fact(
         "block_codecs",
         &format!(
@@ -723,6 +712,143 @@ fn blocks() {
         }
         black_box(out.len());
     });
+
+    // The two rows above are the codecs against each other, so both of them
+    // write their ids out where a caller could use them. This row is the block
+    // decoder on its own, and it does two things differently on purpose.
+    //
+    // The gaps vary, because a run of one width throughout is the flattering
+    // case for a decoder with a kernel per width: one kernel stays hot and the
+    // match in front of it always goes the same way.
+    //
+    // The block is decoded into the same buffer every time and left there,
+    // because copying a decoded block into a growing vector costs more than
+    // decoding it does, and a row where two thirds of the time is a memcpy
+    // cannot show a change to the third that is not.
+    let varied = random_gaps(1_000_000);
+    let (varied_packed, varied_widths) = pack_run(&varied);
+    bench("decode a million ids, varied widths", varied.len(), || {
+        let mut block = [0u32; bitpack::BLOCK];
+        let mut rest = black_box(varied_packed.as_slice());
+        let mut base = 0u32;
+        for width in &varied_widths {
+            let read = bitpack::unpack(rest, *width, base, &mut block).expect("unpack");
+            base = block[bitpack::BLOCK - 1];
+            black_box(&block);
+            rest = &rest[read..];
+        }
+    });
+
+    // The write side of the same thing. An index is written once and read for
+    // as long as it lives, so this matters less than the row above it, but a
+    // packer that got slower to make a decoder faster would be a trade worth
+    // knowing about rather than one to find out about later.
+    bench("pack a million ids, varied widths", varied.len(), || {
+        let mut out = Vec::with_capacity(varied_packed.len());
+        let mut block = [0u32; bitpack::BLOCK];
+        let mut base = 0u32;
+        for chunk in black_box(&varied).chunks(bitpack::BLOCK) {
+            block[..chunk.len()].copy_from_slice(chunk);
+            for slot in &mut block[chunk.len()..] {
+                *slot = chunk[chunk.len() - 1];
+            }
+            black_box(bitpack::pack(&block, base, &mut out));
+            base = block[bitpack::BLOCK - 1];
+        }
+        black_box(out.len());
+    });
+
+    // What packing against a wider register would cost. FastLanes packs against
+    // 1024 bits, which for 32 bit values is thirty two lanes rather than four,
+    // and here a lane count is also the distance the differencing counts back
+    // over. Eight times the distance is about eight times the gap, which is
+    // three more bits an id. The block has to grow to 1024 values as well, for a
+    // lane to hold the thirty two values that make its words come out whole.
+    let narrow = lane_cost(&varied, 4, bitpack::BLOCK);
+    let wide = lane_cost(&varied, 32, 1024);
+    fact(
+        "lane_count",
+        &format!(
+            "lane count: {narrow:.2} bytes per id at four lanes, {wide:.2} at thirty two, {:.2}x",
+            wide / narrow
+        ),
+        vec![
+            ("four_lanes_bytes_per_id", narrow),
+            ("thirty_two_lanes_bytes_per_id", wide),
+        ],
+    );
+}
+
+/// A run of ascending ids whose gaps vary, which is the shape a real list has.
+///
+/// The spread of the gaps is redrawn every block, so the width the packer
+/// chooses moves from block to block the way it does over a real posting list,
+/// where a term is common through one stretch of a corpus and rare through the
+/// next. Gaps drawn from one distribution throughout would give almost every
+/// block the same width, which is a different measurement wearing this one's
+/// name.
+fn random_gaps(count: usize) -> Vec<DocId> {
+    let mut state = 0x2545_f491_4f6c_dd1d_u64;
+    let mut current = 0u32;
+    let mut span = 1u64;
+    let mut out = Vec::with_capacity(count);
+    for at in 0..count {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        if at % bitpack::BLOCK == 0 {
+            // Up to a gap of four thousand, which over a million ids stays
+            // inside the identifier space with room to spare.
+            span = 1 << (state % 13);
+        }
+        current += 1 + (state % span) as u32;
+        out.push(current);
+    }
+    out
+}
+
+/// One run packed into blocks, with the width each block came out at.
+fn pack_run(ids: &[DocId]) -> (Vec<u8>, Vec<u32>) {
+    let mut packed = Vec::new();
+    let mut widths = Vec::new();
+    let mut base = 0u32;
+    for chunk in ids.chunks(bitpack::BLOCK) {
+        let mut block = [0u32; bitpack::BLOCK];
+        block[..chunk.len()].copy_from_slice(chunk);
+        for slot in &mut block[chunk.len()..] {
+            *slot = chunk[chunk.len() - 1];
+        }
+        widths.push(bitpack::pack(&block, base, &mut packed));
+        base = block[bitpack::BLOCK - 1];
+    }
+    (packed, widths)
+}
+
+/// Bytes an id a run would pack into at `lanes` lanes and `block` values a
+/// block.
+///
+/// Worked out rather than packed, because the point is the width each block
+/// would be chosen at and nothing else. The value at position `n` counts from
+/// the one `lanes` back, which for the first few of a block is the tail of the
+/// block before it, exactly as the packer does it.
+fn lane_cost(ids: &[DocId], lanes: usize, block: usize) -> f64 {
+    let mut bits = 0u64;
+    let mut start = 0;
+    while start < ids.len() {
+        let end = (start + block).min(ids.len());
+        let mut all = 0u32;
+        for (index, id) in ids.iter().enumerate().take(end).skip(start) {
+            let previous = if index >= lanes {
+                ids[index - lanes]
+            } else {
+                0
+            };
+            all |= id.wrapping_sub(previous);
+        }
+        bits += u64::from((32 - all.leading_zeros()).max(1)) * (end - start) as u64;
+        start = end;
+    }
+    bits as f64 / 8.0 / ids.len() as f64
 }
 
 /// The codec everything else is built out of.
