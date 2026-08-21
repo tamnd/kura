@@ -1129,7 +1129,11 @@ mod tests {
             }
         }
         let full = writer.held();
-        assert!(full.total() > empty, "{} is not more than {empty}", full.total());
+        assert!(
+            full.total() > empty,
+            "{} is not more than {empty}",
+            full.total()
+        );
         assert!(full.postings > 0, "the postings are somewhere");
         assert!(full.vocabulary > 0, "so is the vocabulary");
         assert!(full.lengths > 0, "and a length a document");
