@@ -66,6 +66,48 @@ pub struct Writer {
     stored: bool,
 }
 
+/// How much memory a writer is holding, and where it is.
+///
+/// A writer that has not finished is holding the whole of what it has been
+/// given, in a shape that is nothing like what the segment will be, and a caller
+/// deciding when to stop feeding it has no other way to know how much that is.
+/// Feeding it until the machine complains is not a plan, and the size of the
+/// text that went in is a poor proxy, since the ratio between the two is neither
+/// one nor constant.
+///
+/// Every number is capacity rather than length, because capacity is what the
+/// allocator is actually holding on the caller's behalf and length is what would
+/// be held by a program that had planned perfectly.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Held {
+    /// The chains of postings, and the per term bookkeeping beside them.
+    pub postings: u64,
+    /// The terms themselves, and the table that finds them.
+    pub vocabulary: u64,
+    /// The values that will be handed back with a hit, already compressed.
+    pub stored: u64,
+    /// Per document numbers that are neither of the above, which is the length
+    /// of each document.
+    pub lengths: u64,
+}
+
+impl Held {
+    /// Everything, which is the number a budget is usually compared against.
+    #[must_use]
+    pub const fn total(&self) -> u64 {
+        self.postings
+            .saturating_add(self.vocabulary)
+            .saturating_add(self.stored)
+            .saturating_add(self.lengths)
+    }
+}
+
+/// What a capacity of `T` costs in bytes.
+fn holding<T>(capacity: usize) -> u64 {
+    let bytes = capacity.saturating_mul(core::mem::size_of::<T>());
+    u64::try_from(bytes).unwrap_or(u64::MAX)
+}
+
 impl Writer {
     /// Creates an empty index.
     #[must_use]
@@ -133,6 +175,24 @@ impl Writer {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.lengths.is_empty()
+    }
+
+    /// How much memory this writer is holding, and where.
+    ///
+    /// This is the number to write a flushing rule against. A rule written
+    /// against the size of the text that has gone in is measuring the wrong
+    /// thing, because the ratio between the two depends on the vocabulary, on
+    /// how repetitive the corpus is and on how much of each document is kept to
+    /// hand back, and none of those is known before the corpus is read.
+    ///
+    /// It walks nothing and allocates nothing, so it is cheap enough to ask
+    /// after every document.
+    #[must_use]
+    pub fn held(&self) -> Held {
+        let mut held = self.postings.held();
+        held.stored = self.store.held();
+        held.lengths = holding::<u32>(self.lengths.capacity());
+        held
     }
 
     /// Writes the segment.
@@ -366,6 +426,30 @@ impl Accumulator {
         self.used[at] += u32::try_from(self.scratch.len()).expect("a pair is at most ten bytes");
     }
 
+    /// What this is holding, split into the chains and the vocabulary.
+    ///
+    /// The seven vectors indexed by term identifier are counted with the arena
+    /// rather than with the vocabulary, because they are per term bookkeeping
+    /// for the postings and they grow with the postings. The vocabulary is the
+    /// terms and the table that finds them, and nothing else.
+    fn held(&self) -> Held {
+        let per_term = holding::<u32>(self.head.capacity())
+            + holding::<u32>(self.tail.capacity())
+            + holding::<u32>(self.used.capacity())
+            + holding::<u32>(self.documents.capacity())
+            + holding::<DocId>(self.last.capacity())
+            + holding::<u32>(self.stamp.capacity())
+            + holding::<u32>(self.frequency.capacity());
+        Held {
+            postings: holding::<u8>(self.arena.capacity())
+                + per_term
+                + holding::<u32>(self.touched.capacity())
+                + holding::<u8>(self.scratch.capacity()),
+            vocabulary: self.vocabulary.held(),
+            ..Held::default()
+        }
+    }
+
     /// Adds an empty chunk and returns where it starts.
     fn chunk(&mut self) -> u32 {
         let at = u32::try_from(self.arena.len()).expect("the arena is under four gigabytes");
@@ -492,6 +576,13 @@ impl Vocabulary {
     /// How many distinct terms there are.
     fn count(&self) -> u32 {
         u32::try_from(self.spans.len()).expect("under four billion distinct terms")
+    }
+
+    /// What the terms and the table that finds them are costing.
+    fn held(&self) -> u64 {
+        holding::<u8>(self.arena.capacity())
+            + holding::<(u32, u32)>(self.spans.capacity())
+            + holding::<u32>(self.table.capacity())
     }
 }
 
@@ -1017,5 +1108,89 @@ mod tests {
             let _ = index.postings(b"the");
             let _ = index.length(0);
         }
+    }
+
+    #[test]
+    fn a_writer_that_has_been_given_nothing_is_not_free() {
+        // The compressor's match table is made when the writer is and is the
+        // same size forever after, so a caller that budgeted from zero would be
+        // budgeting from a number that was never true.
+        let writer = Writer::new();
+        assert!(writer.held().stored > 0, "the match table is already there");
+    }
+
+    #[test]
+    fn what_a_writer_holds_grows_with_what_goes_into_it() {
+        let mut writer = Writer::new();
+        let empty = writer.held().total();
+        for _ in 0..64 {
+            for doc in DOCS {
+                writer.add(doc).expect("adds");
+            }
+        }
+        let full = writer.held();
+        assert!(
+            full.total() > empty,
+            "{} is not more than {empty}",
+            full.total()
+        );
+        assert!(full.postings > 0, "the postings are somewhere");
+        assert!(full.vocabulary > 0, "so is the vocabulary");
+        assert!(full.lengths > 0, "and a length a document");
+    }
+
+    #[test]
+    fn the_parts_of_what_a_writer_holds_add_up_to_the_total() {
+        // The point of the split is that it accounts for the whole of what is
+        // held, so a part that went missing would be a part nobody knew to look
+        // for.
+        let mut writer = Writer::new();
+        for doc in DOCS {
+            writer
+                .add_with_fields(doc, [("path", &b"a/b/c"[..])])
+                .expect("adds");
+        }
+        let held = writer.held();
+        assert_eq!(
+            held.total(),
+            held.postings + held.vocabulary + held.stored + held.lengths
+        );
+    }
+
+    #[test]
+    fn storing_fields_shows_up_against_the_fields_and_not_the_postings() {
+        let mut bare = Writer::new();
+        let mut stored = Writer::new();
+        for doc in DOCS {
+            bare.add(doc).expect("adds");
+            stored
+                .add_with_fields(doc, [("path", doc.as_bytes())])
+                .expect("adds");
+        }
+        let bare = bare.held();
+        let stored = stored.held();
+        assert_eq!(bare.postings, stored.postings, "the same text was indexed");
+        assert_eq!(bare.vocabulary, stored.vocabulary);
+        assert!(stored.stored > bare.stored, "the fields are held somewhere");
+    }
+
+    #[test]
+    fn a_fresh_writer_holds_what_the_one_it_replaced_let_go_of() {
+        // Which is what makes a flush a way of bounding memory rather than a way
+        // of cutting a file up. If the writer that is thrown away did not take
+        // its postings with it there would be nothing to flush for.
+        let mut writer = Writer::new();
+        for _ in 0..64 {
+            for doc in DOCS {
+                writer.add(doc).expect("adds");
+            }
+        }
+        let before = writer.held().total();
+        let after = core::mem::replace(&mut writer, Writer::new()).finish();
+        after.expect("finishes");
+        assert!(
+            writer.held().total() < before,
+            "a writer that has been replaced still holds what the old one did"
+        );
     }
 }

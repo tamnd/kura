@@ -219,6 +219,30 @@ impl Writer {
         self.offsets.is_empty()
     }
 
+    /// How many bytes this writer is holding on the caller's behalf.
+    ///
+    /// Capacity rather than length, because capacity is what the allocator is
+    /// actually holding. The compressor's match table is in here too: it is a
+    /// fixed sixty four kilobytes that exists whether anything has been stored
+    /// or not, and leaving it out would make an empty writer look free when it
+    /// is not.
+    #[must_use]
+    pub fn held(&self) -> u64 {
+        let names: usize = self
+            .names
+            .iter()
+            .map(|name| name.capacity() + core::mem::size_of::<String>())
+            .sum();
+        let bytes = names
+            + self.offsets.capacity() * 4
+            + self.blocks.capacity() * 4
+            + self.payload.capacity()
+            + self.block.capacity()
+            + self.spill.capacity()
+            + self.compressor.held();
+        u64::try_from(bytes).unwrap_or(u64::MAX)
+    }
+
     /// The number of a field name, adding it if it is new.
     fn name(&mut self, name: &str) -> u64 {
         if let Some(at) = self.names.iter().position(|known| known == name) {

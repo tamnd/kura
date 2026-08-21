@@ -46,7 +46,7 @@ use std::time::Instant;
 
 use kura_core::analysis::Analyzer;
 use kura_core::file::{Store, Trouble};
-use kura_core::index::{Reader, Writer};
+use kura_core::index::{Held, Reader, Writer};
 use kura_core::manifest;
 use kura_core::mapping::Map;
 use kura_core::residency;
@@ -536,43 +536,69 @@ fn label(
     }
 }
 
+/// What an index run was asked to do, once its arguments have been read.
+struct Plan {
+    inputs: Vec<PathBuf>,
+    out: PathBuf,
+    into_store: bool,
+    flush_every: Option<u64>,
+}
+
+impl Plan {
+    /// Reads the arguments, or says which one does not make sense.
+    fn read(args: &[String]) -> Result<Self, Failure> {
+        let mut inputs: Vec<PathBuf> = Vec::new();
+        let mut out: Option<PathBuf> = None;
+        let mut into_store = false;
+        let mut flush_every: Option<u64> = None;
+        let mut at = 0;
+        while at < args.len() {
+            match args[at].as_str() {
+                "--store" => into_store = true,
+                "--flush-every" => {
+                    at += 1;
+                    let value = args
+                        .get(at)
+                        .ok_or_else(|| Failure::usage("--flush-every wants a size"))?;
+                    flush_every = Some(size(value)?);
+                }
+                "-o" => {
+                    at += 1;
+                    let path = args
+                        .get(at)
+                        .ok_or_else(|| Failure::usage("-o wants a file"))?;
+                    out = Some(PathBuf::from(path));
+                }
+                other => inputs.push(PathBuf::from(other)),
+            }
+            at += 1;
+        }
+        if inputs.is_empty() {
+            return Err(Failure::usage("nothing to index"));
+        }
+        let out = out.ok_or_else(|| Failure::usage("no -o, so nowhere to write"))?;
+        if flush_every.is_some() && !into_store {
+            // A file that is one segment can hold one segment, and the whole of
+            // what this option does is write more than one.
+            return Err(Failure::usage("--flush-every needs --store to flush into"));
+        }
+        Ok(Self {
+            inputs,
+            out,
+            into_store,
+            flush_every,
+        })
+    }
+}
+
 /// Builds an index out of whatever the paths point at.
 fn index(args: &[String]) -> Result<(), Failure> {
-    let mut inputs: Vec<PathBuf> = Vec::new();
-    let mut out: Option<PathBuf> = None;
-    let mut into_store = false;
-    let mut flush_every: Option<u64> = None;
-    let mut at = 0;
-    while at < args.len() {
-        match args[at].as_str() {
-            "--store" => into_store = true,
-            "--flush-every" => {
-                at += 1;
-                let value = args
-                    .get(at)
-                    .ok_or_else(|| Failure::usage("--flush-every wants a size"))?;
-                flush_every = Some(size(value)?);
-            }
-            "-o" => {
-                at += 1;
-                let path = args
-                    .get(at)
-                    .ok_or_else(|| Failure::usage("-o wants a file"))?;
-                out = Some(PathBuf::from(path));
-            }
-            other => inputs.push(PathBuf::from(other)),
-        }
-        at += 1;
-    }
-    if inputs.is_empty() {
-        return Err(Failure::usage("nothing to index"));
-    }
-    let out = out.ok_or_else(|| Failure::usage("no -o, so nowhere to write"))?;
-    if flush_every.is_some() && !into_store {
-        // A file that is one segment can hold one segment, and the whole of
-        // what this option does is write more than one.
-        return Err(Failure::usage("--flush-every needs --store to flush into"));
-    }
+    let Plan {
+        inputs,
+        out,
+        into_store,
+        flush_every,
+    } = Plan::read(args)?;
 
     let mut files = Vec::new();
     for input in &inputs {
@@ -587,7 +613,8 @@ fn index(args: &[String]) -> Result<(), Failure> {
     let mut pending = 0u64;
     let mut documents = 0usize;
     let mut skipped = 0usize;
-    let mut held = 0usize;
+    let mut segments = 0usize;
+    let mut peak = Held::default();
     for file in &files {
         let Ok(content) = fs::read(file) else {
             skipped += 1;
@@ -606,6 +633,13 @@ fn index(args: &[String]) -> Result<(), Failure> {
         pending += content.len() as u64;
         let path = file.to_string_lossy().into_owned();
         writer.add_with_fields(&text, [(PATH_FIELD, path.as_bytes())])?;
+        // Asked after every document, because the largest a writer gets is the
+        // document before the flush that empties it, and a reading taken once at
+        // the end would be a reading of whatever the last part happened to be.
+        let now = writer.held();
+        if now.total() > peak.total() {
+            peak = now;
+        }
 
         // The budget is checked after the document rather than before it,
         // because a budget that stopped short of a document would be a budget
@@ -615,7 +649,7 @@ fn index(args: &[String]) -> Result<(), Failure> {
             let segment = std::mem::replace(&mut writer, Writer::new()).finish()?;
             written += segment.len() as u64;
             documents += count;
-            held = add_to_store(&out, &segment, count)?;
+            segments = add_to_store(&out, &segment, count)?;
             pending = 0;
         }
     }
@@ -629,7 +663,7 @@ fn index(args: &[String]) -> Result<(), Failure> {
         let segment = writer.finish()?;
         written += segment.len() as u64;
         documents += count;
-        held = if into_store {
+        segments = if into_store {
             add_to_store(&out, &segment, count)?
         } else {
             fs::write(&out, &segment).map_err(|error| Failure::Io(out.clone(), error))?;
@@ -645,8 +679,21 @@ fn index(args: &[String]) -> Result<(), Failure> {
         report::bytes(written),
         took
     );
+    // Split rather than totalled, because the total on its own says a run needs
+    // three times the memory the text takes and stops there, and the three parts
+    // are what say which of them to go after. The number is the largest a single
+    // writer got, so on a run with --flush-every it is the peak of one segment
+    // and not of the corpus.
+    println!(
+        "held at most {} at once, {} postings, {} vocabulary, {} stored fields, {} lengths",
+        report::bytes(peak.total()),
+        report::bytes(peak.postings),
+        report::bytes(peak.vocabulary),
+        report::bytes(peak.stored),
+        report::bytes(peak.lengths)
+    );
     if into_store {
-        println!("{} now holds {held} segments", out.display());
+        println!("{} now holds {segments} segments", out.display());
     }
     if skipped > 0 {
         println!("skipped {skipped} files that were not text");

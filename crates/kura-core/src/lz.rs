@@ -195,6 +195,17 @@ impl Compressor {
         literals(out, &input[anchor..]);
     }
 
+    /// How many bytes this compressor is holding.
+    ///
+    /// The table, which is the same size from the moment it is made and never
+    /// grows. It is here because a caller adding up what it holds would
+    /// otherwise have to know that number, and a constant somebody else has to
+    /// know is a constant that goes stale.
+    #[must_use]
+    pub fn held(&self) -> usize {
+        self.table.capacity() * core::mem::size_of::<u32>()
+    }
+
     /// Moves the table's window forward by one block.
     fn stamp(&mut self, len: usize) {
         let next = self
