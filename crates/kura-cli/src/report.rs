@@ -21,10 +21,19 @@ use crate::analyse;
 /// same shape, a block-max WAND over one list per term, so what varies between a
 /// fast query and a slow one is entirely in this table.
 ///
+/// A term gets one row however many segments there are, with its documents and
+/// its blocks summed over the lot, because that is the work the query does and
+/// because a table that grew a column per segment would be unreadable by the
+/// tenth one. What the row cannot show, and what the line under it says instead,
+/// is that the weight each term is scored with is worked out over every segment
+/// together rather than segment by segment. That is the reason the same document
+/// gets the same score wherever it happens to sit, and it is worth being able to
+/// see, because it is the thing that would break first if the merge were wrong.
+///
 /// # Errors
 ///
 /// Returns an error if the output cannot be written, which is a closed pipe.
-pub fn plan(query: &str, index: &Reader<'_>, out: &mut impl Write) -> io::Result<()> {
+pub fn plan(query: &str, segments: &[Reader<'_>], out: &mut impl Write) -> io::Result<()> {
     let words = analyse(query);
     writeln!(out, "query    {query}")?;
 
@@ -32,27 +41,40 @@ pub fn plan(query: &str, index: &Reader<'_>, out: &mut impl Write) -> io::Result
     let mut rows = Vec::with_capacity(words.len());
     for word in &words {
         let name = String::from_utf8_lossy(word).into_owned();
-        match index.postings(word) {
-            Ok(Some(list)) => {
-                found += 1;
-                let full = list.blocks();
-                let leftovers =
-                    usize::try_from(list.len()).unwrap_or(usize::MAX) > full * BLOCK_SIZE;
-                rows.push((name, Term::Open(list.len(), full + usize::from(leftovers))));
+        let mut term = Term::Absent;
+        for index in segments {
+            match index.postings(word) {
+                Ok(Some(list)) => {
+                    let full = list.blocks();
+                    let leftovers =
+                        usize::try_from(list.len()).unwrap_or(usize::MAX) > full * BLOCK_SIZE;
+                    term = term.and(list.len(), full + usize::from(leftovers));
+                }
+                // A term that is not in this segment says nothing about the
+                // others, so it leaves the row where it is. A term absent from
+                // every one of them ends up absent, which is the single most
+                // useful thing this report can say, because it explains a thin
+                // result page in one line rather than in an afternoon.
+                Ok(None) => {}
+                // Unreachable in practice, because the search opened the same
+                // lists a moment ago and would have failed then. Saying so beats
+                // saying the term was absent, which is a different problem with
+                // a different fix.
+                Err(_) => term = Term::Unreadable,
             }
-            // A term that is not in the index is the single most useful thing
-            // this report can say, because it explains a thin result page in one
-            // line rather than in an afternoon.
-            Ok(None) => rows.push((name, Term::Absent)),
-            // Unreachable in practice, because the search opened the same lists
-            // a moment ago and would have failed then. Saying so beats saying
-            // the term was absent, which is a different problem with a different
-            // fix.
-            Err(_) => rows.push((name, Term::Unreadable)),
         }
+        if matches!(term, Term::Open(..)) {
+            found += 1;
+        }
+        rows.push((name, term));
     }
 
     writeln!(out, "terms    {found} of {} in the index", words.len())?;
+    writeln!(
+        out,
+        "segments {} searched together, weighted over all of them",
+        segments.len()
+    )?;
     writeln!(out)?;
     writeln!(out, "  {:<24} {:>12} {:>10}", "term", "documents", "blocks")?;
     for (name, term) in &rows {
@@ -68,14 +90,31 @@ pub fn plan(query: &str, index: &Reader<'_>, out: &mut impl Write) -> io::Result
     Ok(())
 }
 
-/// What opening one of the query's terms found.
+/// What opening one of the query's terms found, across every segment.
 enum Term {
     /// The list is there, with this many documents in this many blocks.
-    Open(u32, usize),
-    /// The term is not in the index.
+    Open(u64, usize),
+    /// The term is not in any of the segments.
     Absent,
-    /// The term is in the dictionary but its list did not decode.
+    /// The term is in a dictionary somewhere but its list did not decode.
     Unreadable,
+}
+
+impl Term {
+    /// The row with one more segment's list added to it.
+    ///
+    /// A list that did not decode stays the answer whatever the segments after
+    /// it hold, because a number summed over some of the segments and not the
+    /// rest is worse than no number: it looks like an answer.
+    fn and(self, documents: u32, blocks: usize) -> Self {
+        match self {
+            Self::Open(had, blocks_had) => {
+                Self::Open(had + u64::from(documents), blocks_had + blocks)
+            }
+            Self::Absent => Self::Open(u64::from(documents), blocks),
+            Self::Unreadable => Self::Unreadable,
+        }
+    }
 }
 
 /// Which walk answered the query.
