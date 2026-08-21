@@ -124,6 +124,15 @@ pub enum Error {
         count: u64,
     },
 
+    /// A set of deletions names a document the segment it belongs to does not
+    /// have, so the two came from different builds of the same store.
+    NoSuchDocument {
+        /// The largest document the deletions name.
+        doc: u32,
+        /// How many documents the segment holds.
+        documents: u32,
+    },
+
     /// Two vectors of different lengths were compared, which is a caller bug
     /// rather than a data problem.
     DimensionMismatch {
@@ -297,6 +306,12 @@ impl fmt::Display for Error {
                     f,
                     "these segments hold {count} documents between them, which is more than one \
                      search can number"
+                )
+            }
+            Self::NoSuchDocument { doc, documents } => {
+                write!(
+                    f,
+                    "a deletion names document {doc} in a segment of {documents} documents"
                 )
             }
             Self::DimensionMismatch { left, right } => {

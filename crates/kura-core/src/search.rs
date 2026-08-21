@@ -44,9 +44,39 @@
 //! going to get. Filling a heap per segment and merging at the end gives the
 //! same page for more work, because every segment would start again from a
 //! threshold of zero.
+//!
+//! # Deleted documents
+//!
+//! A segment is written once and never edited, so deleting a document cannot
+//! take it out of the lists it was written into. What happens instead is that
+//! the reader is handed the set of documents that are gone, and every walk here
+//! passes over one when it reaches it, exactly where it would have scored it or
+//! counted it.
+//!
+//! That leaves three numbers stale and it is worth being precise about which.
+//! How many documents there are follows the deletions, because a store that has
+//! had half of it deleted is a store of half the size. How many documents hold a
+//! term does not, because it is written into the segment and correcting it would
+//! cost a walk of the whole index every time anything was deleted. Neither does
+//! the mean document length. So a term looks slightly commoner than it is and
+//! documents look slightly longer than they are, both of which move scores
+//! within a query rather than between queries, and both of which go away when
+//! the segment is compacted.
+//!
+//! The bounds the pruning rests on survive untouched, because deleting only ever
+//! removes candidates. A block whose best possible score is under the threshold
+//! is still under it with some of its documents gone, and a block chosen for
+//! its ceiling is still worth taking whole, because the rest of what is in it
+//! is still an answer. What does not survive is
+//! the shortcuts that count documents without looking at them: the length of a
+//! posting list, and the number of postings in a block, are counts of what was
+//! written rather than of what is still an answer. Those are given up in a
+//! segment that has deletions and kept in one that does not, so the ordinary
+//! case pays nothing for the feature.
 
 use crate::DocId;
 use crate::analysis::Analyzer;
+use crate::bitmap::Bitmap;
 use crate::bound;
 use crate::error::{Error, Result};
 use crate::explain::{Counters, Off, Tally};
@@ -88,9 +118,21 @@ pub struct Hit {
 #[derive(Debug)]
 pub struct Searcher<'a, 'b> {
     segments: &'a [Reader<'b>],
-    /// How many documents the segments hold between them, which is the `N` of
-    /// the inverse document frequency.
+    /// How many documents the segments hold between them, deleted ones
+    /// included, which is what the numbering of a hit is built out of.
     documents: u32,
+    /// How many of those are still answers, which is the `N` of the inverse
+    /// document frequency.
+    ///
+    /// The count of live documents rather than of all of them, because a store
+    /// that has had half of it deleted is a store of half the size and a term in
+    /// every remaining document is not a rare term. What does not follow the
+    /// deletions is the count per term, which is written into the segment and
+    /// would cost a walk of the whole index to correct at open. So a term looks
+    /// commoner than it is until the segment is compacted, and the bound that
+    /// error moves is a bound on scores within one query rather than anything a
+    /// caller sees.
+    live: u32,
     /// How many terms they hold between them, which over that count is the mean
     /// length BM25 normalises by.
     total: u64,
@@ -101,7 +143,7 @@ pub struct Searcher<'a, 'b> {
 impl<'a, 'b> Searcher<'a, 'b> {
     /// A searcher over one segment, with the usual BM25 parameters.
     #[must_use]
-    pub const fn new(index: &'a Reader<'b>) -> Self {
+    pub fn new(index: &'a Reader<'b>) -> Self {
         Self::one(index, K1, B)
     }
 
@@ -110,7 +152,7 @@ impl<'a, 'b> Searcher<'a, 'b> {
     /// Worth tuning per corpus and not worth guessing at. Code is short and
     /// title fields want a different `b` from long prose.
     #[must_use]
-    pub const fn with_parameters(index: &'a Reader<'b>, k1: f32, b: f32) -> Self {
+    pub fn with_parameters(index: &'a Reader<'b>, k1: f32, b: f32) -> Self {
         Self::one(index, k1, b)
     }
 
@@ -139,9 +181,11 @@ impl<'a, 'b> Searcher<'a, 'b> {
     /// [`over`](Self::over) does.
     pub fn over_with_parameters(segments: &'a [Reader<'b>], k1: f32, b: f32) -> Result<Self> {
         let mut documents = 0u64;
+        let mut live = 0u64;
         let mut total = 0u64;
         for index in segments {
             documents = documents.saturating_add(u64::from(index.documents()));
+            live = live.saturating_add(u64::from(index.live()));
             total = total.saturating_add(index.total_length());
         }
         // Strictly under the largest identifier there is, rather than up to it,
@@ -158,6 +202,7 @@ impl<'a, 'b> Searcher<'a, 'b> {
         Ok(Self {
             segments,
             documents,
+            live: u32::try_from(live).unwrap_or(u32::MAX),
             total,
             k1,
             b,
@@ -167,10 +212,11 @@ impl<'a, 'b> Searcher<'a, 'b> {
     /// The shared part of the single segment constructors, which cannot fail and
     /// so does not say that it might.
     #[must_use]
-    const fn one(index: &'a Reader<'b>, k1: f32, b: f32) -> Self {
+    fn one(index: &'a Reader<'b>, k1: f32, b: f32) -> Self {
         Self {
             segments: core::slice::from_ref(index),
             documents: index.documents(),
+            live: index.live(),
             total: index.total_length(),
             k1,
             b,
@@ -183,10 +229,20 @@ impl<'a, 'b> Searcher<'a, 'b> {
         self.segments
     }
 
-    /// How many documents those segments hold between them.
+    /// How many documents those segments hold between them, deleted ones
+    /// included.
+    ///
+    /// The width of the numbering rather than a count of answers.
+    /// [`live`](Self::live) is the other number.
     #[must_use]
     pub const fn documents(&self) -> u32 {
         self.documents
+    }
+
+    /// How many of those documents are still answers.
+    #[must_use]
+    pub const fn live(&self) -> u32 {
+        self.live
     }
 
     /// The mean document length across every segment.
@@ -285,7 +341,7 @@ impl<'a, 'b> Searcher<'a, 'b> {
         // Summed rather than merged, because two segments never hold the same
         // document and so the unions they count are disjoint.
         for shard in &mut shards {
-            total += count_lists(&mut shard.lists, tally)?;
+            total += count_lists(&mut shard.lists, shard.index.deleted(), tally)?;
             shard.lists.report(tally);
         }
         Ok(total)
@@ -357,10 +413,12 @@ impl<'a, 'b> Searcher<'a, 'b> {
         let mut top = TopK::new(k);
         let mut total = 0u64;
         for shard in &mut shards {
-            total += if shard.lists.len() == 1 {
+            total += if shard.lists.len() == 1 && !shard.index.any_deleted() {
                 // One term, and its total is in the header of its own list.
                 // Nothing has to be walked to know it, so the search can prune
-                // the way it does when no total was asked for.
+                // the way it does when no total was asked for. A segment with
+                // deletions in it does not get that, because the header counts
+                // what was written and the question is about what is left.
                 let total = u64::from(shard.lists.counts[0]);
                 self.page_of_one(shard, norm, &mut top, tally)?;
                 total
@@ -380,6 +438,7 @@ impl<'a, 'b> Searcher<'a, 'b> {
         top: &mut TopK,
         tally: &mut T,
     ) -> Result<u64> {
+        let deleted = shard.index.deleted();
         let lists = &mut shard.lists;
         let floor = self.k1 * (1.0 - self.b);
         let mut total = 0u64;
@@ -392,12 +451,25 @@ impl<'a, 'b> Searcher<'a, 'b> {
             // A block of one list that no other list reaches into, whose best
             // posting cannot beat the worst hit in hand, contributes documents
             // to the total and nothing to the page. Those are counted in one
-            // step instead of being walked and rejected one at a time.
-            if let Some(last) = lists.cursors[which].block_last()
+            // step instead of being walked and rejected one at a time. Not in a
+            // segment with deletions in it, where what the block holds and what
+            // it still answers with are two different numbers.
+            if deleted.is_none()
+                && let Some(last) = lists.cursors[which].block_last()
                 && last < second
                 && lists.block_bound(which, self.k1, floor) <= top.threshold()
             {
                 total += lists.take_block(which, last, tally)?;
+                continue;
+            }
+
+            if deleted.is_some_and(|gone| gone.contains(doc)) {
+                tally.hidden();
+                for at in 0..lists.len() {
+                    if lists.heads[at].doc == doc {
+                        lists.advance(at, tally)?;
+                    }
+                }
                 continue;
             }
 
@@ -480,7 +552,7 @@ impl<'a, 'b> Searcher<'a, 'b> {
     }
 
     fn search_with<T: Tally>(&self, terms: &[&[u8]], k: usize, tally: &mut T) -> Result<Vec<Hit>> {
-        if k == 0 || self.documents == 0 {
+        if k == 0 || self.live == 0 {
             return Ok(Vec::new());
         }
         let mut shards = self.open(terms, tally)?;
@@ -536,6 +608,20 @@ impl<'a, 'b> Searcher<'a, 'b> {
                 // is no reason to decode any of it.
                 for &at in &order[..pivot] {
                     lists.seek(at, candidate, tally)?;
+                }
+                continue;
+            }
+
+            if !shard.index.is_live(candidate) {
+                // Before the block bounds rather than after, because a document
+                // that cannot be an answer is not worth asking what it could
+                // have scored. Every list sitting on it moves on, which is what
+                // the bottom of this loop does for a document that was scored.
+                tally.hidden();
+                for at in 0..lists.len() {
+                    if lists.heads[at].doc == candidate {
+                        lists.advance(at, tally)?;
+                    }
                 }
                 continue;
             }
@@ -700,6 +786,15 @@ impl<'a, 'b> Searcher<'a, 'b> {
             lists.cursors[0].jump(step as usize)?;
             let (docs, freqs) = lists.cursors[0].block_postings();
             for (&doc, &frequency) in docs.iter().zip(freqs) {
+                // This walk takes a whole block at a time and scores everything
+                // in it, so the deleted documents are met here rather than at a
+                // cursor. Skipping the block for holding one is not on: the
+                // ceiling it was chosen by is the best any of its documents can
+                // score, and the rest of them are still answers.
+                if !index.is_live(doc) {
+                    tally.hidden();
+                    continue;
+                }
                 let frequency = frequency as f32;
                 let score = idf * (frequency * (k1 + 1.0)) / (frequency + norm.of(index, doc));
                 tally.scored();
@@ -737,6 +832,11 @@ impl<'a, 'b> Searcher<'a, 'b> {
 
         while lists.heads[0].doc != DocId::MAX {
             let doc = lists.heads[0].doc;
+            if !shard.index.is_live(doc) {
+                tally.hidden();
+                lists.advance(0, tally)?;
+                continue;
+            }
             let block = lists.cursors[0].block();
             if cached.0 != block {
                 cached = (block, lists.block_bound(0, self.k1, floor));
@@ -800,7 +900,7 @@ impl<'a, 'b> Searcher<'a, 'b> {
         let weights: Vec<(f32, f32)> = holding
             .iter()
             .map(|&holding| {
-                let idf = idf(self.documents, holding);
+                let idf = idf(self.live, holding);
                 (idf, idf * (self.k1 + 1.0))
             })
             .collect();
@@ -890,10 +990,20 @@ struct Shard<'a, 'b> {
 }
 
 /// How many documents in one segment hold at least one of the query's terms.
-fn count_lists<T: Tally>(lists: &mut Lists<'_>, tally: &mut T) -> Result<u64> {
+///
+/// Both of the shortcuts here count documents without looking at them, and a
+/// segment carrying deletions cannot have either: what is in the header of a
+/// list and what is in a block are both counts of what was written. So a segment
+/// with nothing deleted is walked exactly as it was before deletions existed,
+/// and one with a deletion in it pays a step per document.
+fn count_lists<T: Tally>(
+    lists: &mut Lists<'_>,
+    deleted: Option<&Bitmap>,
+    tally: &mut T,
+) -> Result<u64> {
     // One term is the common case and its answer is already in the header of its
     // posting list, so nothing needs decoding at all.
-    if lists.len() <= 1 {
+    if lists.len() <= 1 && deleted.is_none() {
         return Ok(lists.counts.first().map_or(0, |&count| u64::from(count)));
     }
     let mut total = 0;
@@ -908,14 +1018,19 @@ fn count_lists<T: Tally>(lists: &mut Lists<'_>, tally: &mut T) -> Result<u64> {
         // else, so the whole block is one step rather than a hundred and twenty
         // eight. On the query shape that costs the most, one common term and one
         // rare one, this is nearly all of the walk.
-        if let Some(last) = lists.cursors[which].block_last()
+        if deleted.is_none()
+            && let Some(last) = lists.cursors[which].block_last()
             && last < second
         {
             total += lists.take_block(which, last, tally)?;
             continue;
         }
 
-        total += 1;
+        if deleted.is_none_or(|gone| !gone.contains(doc)) {
+            total += 1;
+        } else {
+            tally.hidden();
+        }
         for at in 0..lists.len() {
             if lists.heads[at].doc == doc {
                 lists.advance(at, tally)?;
@@ -1159,7 +1274,16 @@ fn pivot(lists: &Lists<'_>, order: &[usize], threshold: f32) -> Option<usize> {
 )]
 fn idf(documents: u32, holding: u32) -> f32 {
     let n = documents as f32;
-    let f = holding as f32;
+    // A deleted document is still in the list it was written into, so the number
+    // of documents holding a term can be larger than the number of documents
+    // left, and the smoothing only stays positive while it is not. Reading the
+    // term as being in every document that is left keeps the weight at nearly
+    // nothing, which is what a term in everything is worth, instead of turning
+    // it into a penalty for holding the word. A negative weight would also cost
+    // more than a strange ranking: the bound on a block is worked out from the
+    // best frequency in it, and that stops being the best score in it the moment
+    // more of a term is worth less.
+    let f = holding.min(documents) as f32;
     (1.0 + (n - f + 0.5) / (f + 0.5)).ln()
 }
 
@@ -1332,8 +1456,15 @@ mod tests {
             let Some(list) = index.postings(term).expect("decodes") else {
                 continue;
             };
-            let idf = idf(index.documents(), list.len());
+            // Deleted documents come out of the answer and out of the document
+            // count that the weight is drawn from, and the number of documents
+            // holding the term is left as it was written, which is what the
+            // walk does.
+            let idf = idf(index.live(), list.len());
             for (doc, frequency) in list.to_postings().expect("decodes") {
+                if !index.is_live(doc) {
+                    continue;
+                }
                 let f = frequency as f32;
                 let norm = k1 * (1.0 - b + b * index.length(doc) as f32 / average);
                 scores[doc as usize] += idf * (f * (k1 + 1.0)) / (f + norm);
@@ -2345,5 +2476,366 @@ mod tests {
         let first = searcher.search("the dog fox", 3).expect("searches");
         let second = searcher.search("the dog fox", 3).expect("searches");
         assert_eq!(first, second);
+    }
+
+    /// How many live documents hold at least one of the terms.
+    ///
+    /// Not the same number as the length of the page above, because a term
+    /// common enough to be worth less than nothing still puts the documents
+    /// holding it into the total.
+    fn union_by_hand(index: &Reader<'_>, terms: &[&[u8]]) -> u64 {
+        let mut seen = vec![false; index.documents() as usize];
+        for term in terms {
+            let Some(list) = index.postings(term).expect("decodes") else {
+                continue;
+            };
+            for (doc, _) in list.to_postings().expect("decodes") {
+                if index.is_live(doc) {
+                    seen[doc as usize] = true;
+                }
+            }
+        }
+        seen.iter().filter(|held| **held).count() as u64
+    }
+
+    /// Builds an index over the documents and hides the ones named.
+    ///
+    /// Taking the ordinals rather than a bitmap keeps the tests below saying
+    /// which documents are gone instead of how a set of them is spelled.
+    fn hiding<'a>(segment: &'a Segment<'a>, gone: &[DocId]) -> Reader<'a> {
+        Reader::open(segment)
+            .expect("opens")
+            .hiding(Bitmap::from_sorted(gone))
+            .expect("the documents are in the segment")
+    }
+
+    #[test]
+    fn a_deleted_document_is_not_on_the_page() {
+        let bytes = build(&DOCS);
+        let segment = Segment::open(&bytes).expect("opens");
+        // Document five is nothing but the word and wins the query outright,
+        // which makes it the one worth deleting: a walk that only drops the
+        // documents it was going to prune anyway proves nothing.
+        let index = hiding(&segment, &[5]);
+        let hits = Searcher::new(&index).search("fox", 10).expect("searches");
+        assert_eq!(hits.iter().map(|hit| hit.doc).collect::<Vec<_>>(), [1, 0]);
+    }
+
+    #[test]
+    fn a_deleted_document_is_not_counted() {
+        let bytes = build(&["alpha", "beta", "alpha beta", "gamma"]);
+        let segment = Segment::open(&bytes).expect("opens");
+        let index = hiding(&segment, &[2]);
+        let searcher = Searcher::new(&index);
+        // One term, which is the count that comes out of the list header when
+        // nothing is deleted, so this is the shortcut being given up.
+        assert_eq!(searcher.count("alpha").expect("counts"), 1);
+        assert_eq!(searcher.count("alpha beta").expect("counts"), 2);
+        assert_eq!(searcher.count("alpha beta gamma").expect("counts"), 3);
+    }
+
+    #[test]
+    fn a_counted_search_leaves_a_deleted_document_out_of_both_halves() {
+        let bytes = build(&DOCS);
+        let segment = Segment::open(&bytes).expect("opens");
+        let index = hiding(&segment, &[1, 5]);
+        let searcher = Searcher::new(&index);
+        let (hits, total) = searcher.search_and_count("fox", 10).expect("searches");
+        assert_eq!(hits.iter().map(|hit| hit.doc).collect::<Vec<_>>(), [0]);
+        assert_eq!(total, 1);
+        // And the same query asked for one hit, where the page fills up and the
+        // total keeps walking on its own.
+        let (hits, total) = searcher.search_and_count("the fox", 1).expect("searches");
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].doc != 1 && hits[0].doc != 5);
+        assert_eq!(total, searcher.count("the fox").expect("counts"));
+    }
+
+    #[test]
+    fn the_explained_search_says_how_many_it_passed_over() {
+        let bytes = build(&DOCS);
+        let segment = Segment::open(&bytes).expect("opens");
+        let index = hiding(&segment, &[0, 5]);
+        let searcher = Searcher::new(&index);
+
+        let (hits, counters) = searcher.search_explained("fox", 10).expect("searches");
+        assert_eq!(hits.iter().map(|hit| hit.doc).collect::<Vec<_>>(), [1]);
+        assert_eq!(counters.documents_hidden, 2);
+
+        let (total, counters) = searcher.count_explained("fox").expect("counts");
+        assert_eq!(total, 1);
+        assert_eq!(counters.documents_hidden, 2);
+
+        let (hits, total, counters) = searcher
+            .search_and_count_explained("fox", 10)
+            .expect("searches");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(total, 1);
+        assert_eq!(counters.documents_hidden, 2);
+    }
+
+    #[test]
+    fn nothing_is_reported_as_hidden_when_nothing_is_deleted() {
+        // The counter is worth reading only if it stays at nothing on the
+        // ordinary path, which is also the check that the walks did not start
+        // counting live documents as passed over.
+        let bytes = build(&DOCS);
+        let segment = Segment::open(&bytes).expect("opens");
+        let index = Reader::open(&segment).expect("opens");
+        let searcher = Searcher::new(&index);
+        for query in ["fox", "the dog fox", "quick brown"] {
+            let (_, counters) = searcher.search_explained(query, 10).expect("searches");
+            assert_eq!(counters.documents_hidden, 0, "{query}");
+            let (_, counters) = searcher.count_explained(query).expect("counts");
+            assert_eq!(counters.documents_hidden, 0, "{query}");
+        }
+    }
+
+    #[test]
+    fn a_deletion_in_one_segment_does_not_move_the_numbering_of_the_others() {
+        // Hit numbers are handed out by adding the size of every earlier
+        // segment, so if a deletion took a document out of that arithmetic then
+        // deleting anything would rename everything after it. It must not.
+        let refs: Vec<&str> = DOCS.to_vec();
+        let parts = split(&refs, 3);
+        let segments: Vec<Segment<'_>> = parts
+            .iter()
+            .map(|bytes| Segment::open(bytes).expect("opens"))
+            .collect();
+
+        let plain: Vec<Reader<'_>> = segments
+            .iter()
+            .map(|segment| Reader::open(segment).expect("opens"))
+            .collect();
+        let before = Searcher::over(&plain).expect("six documents are numberable");
+        let page = before.search("fox", 10).expect("searches");
+
+        // Document zero is in the first segment, so everything after it in the
+        // numbering is a document in a later segment.
+        let readers: Vec<Reader<'_>> = segments
+            .iter()
+            .enumerate()
+            .map(|(at, segment)| {
+                if at == 0 {
+                    hiding(segment, &[0])
+                } else {
+                    Reader::open(segment).expect("opens")
+                }
+            })
+            .collect();
+        let after = Searcher::over(&readers).expect("six documents are numberable");
+        assert_eq!(after.documents(), 6);
+        assert_eq!(after.live(), 5);
+
+        let kept: Vec<DocId> = page
+            .iter()
+            .map(|hit| hit.doc)
+            .filter(|&doc| doc != 0)
+            .collect();
+        assert_eq!(
+            after
+                .search("fox", 10)
+                .expect("searches")
+                .iter()
+                .map(|hit| hit.doc)
+                .collect::<Vec<_>>(),
+            kept
+        );
+        // And the numbers themselves still mean the same thing, which is the
+        // half a page of hits cannot show on its own because the deleted
+        // document is not on it.
+        for doc in 0..6 {
+            assert_eq!(after.locate(doc), before.locate(doc), "document {doc}");
+        }
+    }
+
+    #[test]
+    fn a_segment_with_everything_deleted_answers_with_nothing() {
+        let bytes = build(&DOCS);
+        let segment = Segment::open(&bytes).expect("opens");
+        let all = DocId::try_from(DOCS.len()).expect("six documents");
+        let gone: Vec<DocId> = (0..all).collect();
+        let index = hiding(&segment, &gone);
+        let searcher = Searcher::new(&index);
+        assert_eq!(searcher.documents(), 6);
+        assert_eq!(searcher.live(), 0);
+        // Nothing rather than an error, and nothing rather than a division by a
+        // document count of zero somewhere in the weight.
+        assert!(searcher.search("fox", 10).expect("searches").is_empty());
+        assert_eq!(searcher.count("fox").expect("counts"), 0);
+        let (hits, total) = searcher.search_and_count("the fox", 10).expect("searches");
+        assert!(hits.is_empty());
+        assert_eq!(total, 0);
+        let (total, counters) = searcher.count_explained("fox").expect("counts");
+        assert_eq!(total, 0);
+        assert_eq!(counters.documents_hidden, 3);
+    }
+
+    #[test]
+    fn a_store_of_segments_that_are_all_empty_of_live_documents_is_still_answerable() {
+        let refs: Vec<&str> = DOCS.to_vec();
+        let parts = split(&refs, 3);
+        let segments: Vec<Segment<'_>> = parts
+            .iter()
+            .map(|bytes| Segment::open(bytes).expect("opens"))
+            .collect();
+        let readers: Vec<Reader<'_>> = segments
+            .iter()
+            .map(|segment| hiding(segment, &[0, 1]))
+            .collect();
+        let searcher = Searcher::over(&readers).expect("six documents are numberable");
+        assert_eq!(searcher.live(), 0);
+        assert!(searcher.search("fox", 10).expect("searches").is_empty());
+        assert_eq!(searcher.count("fox").expect("counts"), 0);
+    }
+
+    #[test]
+    fn a_deletion_naming_a_document_the_segment_does_not_have_is_refused() {
+        // The set and the segment come from the same build of the store or the
+        // set is about somebody else's documents, and answering from it would be
+        // hiding whichever documents happened to share the numbers.
+        let bytes = build(&DOCS);
+        let segment = Segment::open(&bytes).expect("opens");
+        let error = Reader::open(&segment)
+            .expect("opens")
+            .hiding(Bitmap::from_sorted(&[0, 6]))
+            .expect_err("six documents are numbered zero to five");
+        assert!(matches!(
+            error,
+            Error::NoSuchDocument {
+                doc: 6,
+                documents: 6
+            }
+        ));
+    }
+
+    #[test]
+    fn deleting_the_documents_is_the_same_as_never_asking_about_them() {
+        // The one that matters, on a corpus large enough that both walks take
+        // every shortcut they have. The slow scorer and the walks are told the
+        // same thing about what is gone, and the pages have to agree, which is
+        // the pruning proving it did not talk itself out of a live document
+        // because a deleted one was in the way.
+        let docs = heavy_tailed(20_000);
+        let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+        let bytes = build(&refs);
+        let segment = Segment::open(&bytes).expect("opens");
+        // Every seventh document, so deletions land inside blocks rather than
+        // at their edges, and one long stretch, which is the shape a bulk
+        // delete leaves behind.
+        let mut gone: Vec<DocId> = (0..20_000).step_by(7).collect();
+        gone.extend(9_000..9_500);
+        gone.sort_unstable();
+        gone.dedup();
+        let index = hiding(&segment, &gone);
+        let searcher = Searcher::new(&index);
+        let hidden = DocId::try_from(gone.len()).expect("a few thousand documents");
+        assert_eq!(searcher.live(), 20_000 - hidden);
+
+        for query in [
+            "word1",
+            "word1 word7 word2",
+            "word3 word40 word1",
+            "word2 word5 word900",
+            "word11 word12 word13",
+        ] {
+            let mut analyzer = Analyzer::new();
+            let mut words: Vec<Vec<u8>> = Vec::new();
+            analyzer.analyze(query, |term, _| words.push(term.to_vec()));
+            words.sort_unstable();
+            words.dedup();
+            let terms: Vec<&[u8]> = words.iter().map(Vec::as_slice).collect();
+            let slow = by_hand(&index, &terms, K1, B);
+            let union = union_by_hand(&index, &terms);
+            for k in [1, 10, 100] {
+                let want = k.min(slow.len());
+                let fast = searcher.search_terms(&terms, k).expect("searches");
+                assert_eq!(fast.len(), want, "{query} at k {k}");
+                same(&fast, &slow[..want]);
+                let (page, total) = searcher
+                    .search_and_count_terms(&terms, k)
+                    .expect("searches");
+                same(&page, &slow[..want]);
+                assert_eq!(total, union, "{query} at k {k}");
+            }
+            assert_eq!(
+                searcher.count_terms(&terms).expect("counts"),
+                union,
+                "{query}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_term_in_more_documents_than_are_left_is_worth_nothing_rather_than_less() {
+        // Deleting most of a corpus leaves terms whose lists are longer than the
+        // number of documents that are still there, and the weight has to hold
+        // up under that. A weight below zero would rank a document above another
+        // for holding less of the query, and worse, it would break the bound the
+        // walk prunes with.
+        let docs = skewed(2_000);
+        let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+        let bytes = build(&refs);
+        let segment = Segment::open(&bytes).expect("opens");
+        let gone: Vec<DocId> = (0..1_900).collect();
+        let index = hiding(&segment, &gone);
+        let searcher = Searcher::new(&index);
+
+        let hits = searcher.search("common", 200).expect("searches");
+        assert_eq!(hits.len(), 100);
+        for hit in &hits {
+            assert!(hit.score > 0.0, "document {} scored {}", hit.doc, hit.score);
+            assert!(hit.doc >= 1_900, "document {} was deleted", hit.doc);
+        }
+        // Still ranked, and ranked the way the slow scorer ranks it.
+        same(&hits, &by_hand(&index, &[b"common"], K1, B));
+    }
+
+    #[test]
+    fn deleting_across_several_segments_counts_the_same_as_deleting_in_one() {
+        let docs = skewed(6_000);
+        let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+        // Every eleventh document of the whole corpus, which falls in a
+        // different place in each of the eight segments.
+        let gone: Vec<DocId> = (0..6_000).step_by(11).collect();
+
+        let whole = build(&refs);
+        let one = Segment::open(&whole).expect("opens");
+        let one = hiding(&one, &gone);
+        let one = Searcher::new(&one);
+
+        let parts = split(&refs, 8);
+        let segments: Vec<Segment<'_>> = parts
+            .iter()
+            .map(|bytes| Segment::open(bytes).expect("opens"))
+            .collect();
+        let per = DocId::try_from(refs.len().div_ceil(8)).expect("a segment of the corpus");
+        let readers: Vec<Reader<'_>> = segments
+            .iter()
+            .enumerate()
+            .map(|(at, segment)| {
+                let base = DocId::try_from(at).expect("eight segments") * per;
+                let mine: Vec<DocId> = gone
+                    .iter()
+                    .filter(|&&doc| doc >= base && doc < base + per)
+                    .map(|&doc| doc - base)
+                    .collect();
+                hiding(segment, &mine)
+            })
+            .collect();
+        let many = Searcher::over(&readers).expect("six thousand documents are numberable");
+
+        assert_eq!(many.live(), one.live());
+        for query in ["common", "rare", "rare common", "word7", "aardvark"] {
+            assert_eq!(
+                many.count(query).expect("counts"),
+                one.count(query).expect("counts"),
+                "{query}"
+            );
+            same(
+                &many.search(query, 10).expect("searches"),
+                &one.search(query, 10).expect("searches"),
+            );
+        }
     }
 }
