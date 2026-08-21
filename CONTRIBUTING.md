@@ -47,6 +47,25 @@ Run it on an idle machine and say which machine it was.
 A laptop under load reports numbers three to four times worse across every row at once, which is easy to mistake for a regression in whichever row you happened to be looking at.
 If the whole table moved by the same factor, the machine moved, not the code.
 
+The query rows carry what the query did as well as what it cost.
+
+```
+query three terms, top ten                      3428.9 us    3468.2 us 63498.44 ns
+                                             skipped 45.1% of the postings, scored 2960 documents per query
+```
+
+Read those two lines together.
+A row that got slower with its counters unchanged is a scoring or a memory problem.
+A row that got slower because it decoded twice as many postings is a pruning problem.
+They look like the same regression until the counters are beside the time.
+
+```sh
+cargo run --release --example bench -- --json
+```
+
+That prints the same run as a JSON document instead of a table, so a runner can diff two commits without parsing columns.
+Every timing carries its best and median in nanoseconds, and the query timings carry their counters.
+
 ## Relevance
 
 A change to the scorer needs a number, not a story about what ought to rank higher.

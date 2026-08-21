@@ -10,6 +10,19 @@
 //! The results are not a promise. They are a way to notice when a change makes
 //! something ten times slower, which is the only kind of regression a benchmark
 //! of this shape can honestly catch.
+//!
+//! # Machine readable results
+//!
+//! `cargo run --release --example bench -- --json` prints a JSON document
+//! instead of the table, so a runner can diff two commits without parsing
+//! columns. Every timing row carries the same numbers the table shows, and the
+//! query rows carry what the query did as well, from [`kura_core::explain`].
+//!
+//! A time on its own cannot tell a slower query from a query that did more
+//! work, and those are opposite problems. A row that got slower while its
+//! postings decoded stayed flat is a scoring or a memory problem. A row that got
+//! slower because it decoded twice as many postings is a pruning problem. Both
+//! of those look like one number going up until the counters are beside it.
 
 // Every cast here feeds a printed number that is already approximate, so losing
 // a digit of precision on the way to a rate costs nothing.
@@ -20,12 +33,16 @@
 )]
 
 use std::hint::black_box;
+use std::io::{self, Write};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use kura_core::DocId;
 use kura_core::bitmap::Bitmap;
 use kura_core::bitpack;
 use kura_core::codec::{get_uvarint, put_uvarint};
+use kura_core::explain::Counters;
 use kura_core::index;
 use kura_core::lz;
 use kura_core::posting::{Reader, Writer};
@@ -42,11 +59,26 @@ use kura_core::vector::{Quantised, cosine, dot, normalise};
 /// comparable between two runs on a laptop that is doing other things.
 const ROUNDS: usize = 25;
 
+/// Everything measured so far, in the order it was measured.
+///
+/// A global rather than a value threaded through every measurement, because the
+/// alternative is an extra parameter on forty call sites that exists only to
+/// carry a result nobody reads until the end.
+static REPORT: Mutex<Report> = Mutex::new(Report::new());
+
+/// Whether the table is being printed, which it is not when JSON was asked for.
+static TABLE: AtomicBool = AtomicBool::new(true);
+
 fn main() {
-    println!(
-        "{:<44} {:>12} {:>12} {:>10}",
-        "case", "best", "median", "per item"
-    );
+    let json = std::env::args().any(|arg| arg == "--json");
+    TABLE.store(!json, Ordering::Relaxed);
+
+    if !json {
+        println!(
+            "{:<44} {:>12} {:>12} {:>10}",
+            "case", "best", "median", "per item"
+        );
+    }
 
     let encoded = postings();
     engine();
@@ -58,6 +90,230 @@ fn main() {
     varints();
     segments(&encoded);
     vectors();
+
+    if json {
+        let report = REPORT.lock().expect("nothing panicked holding the report");
+        let mut out = io::stdout().lock();
+        report
+            .write(&mut out)
+            .expect("stdout takes a few kilobytes");
+    }
+}
+
+/// Whether measurements are being printed as they are taken.
+fn printing() -> bool {
+    TABLE.load(Ordering::Relaxed)
+}
+
+/// Everything one run of this benchmark produced.
+struct Report {
+    /// One entry per timing, in the order they were taken.
+    cases: Vec<Case>,
+    /// The sizes and ratios that are facts about the data rather than timings.
+    facts: Vec<Fact>,
+}
+
+impl Report {
+    const fn new() -> Self {
+        Self {
+            cases: Vec::new(),
+            facts: Vec::new(),
+        }
+    }
+
+    /// Writes the whole run as JSON.
+    ///
+    /// Hand written, because a serialiser would be the crate's first dependency
+    /// and this document is numbers and names from string literals.
+    fn write(&self, out: &mut impl Write) -> io::Result<()> {
+        writeln!(out, "{{")?;
+        writeln!(out, "  \"rounds\": {ROUNDS},")?;
+        writeln!(out, "  \"cases\": [")?;
+        for (at, case) in self.cases.iter().enumerate() {
+            let comma = if at + 1 == self.cases.len() { "" } else { "," };
+            write!(out, "    ")?;
+            case.write(out)?;
+            writeln!(out, "{comma}")?;
+        }
+        writeln!(out, "  ],")?;
+        writeln!(out, "  \"facts\": {{")?;
+        for (at, fact) in self.facts.iter().enumerate() {
+            let comma = if at + 1 == self.facts.len() { "" } else { "," };
+            write!(out, "    \"{}\": {{", escape(&fact.name))?;
+            for (field, (name, value)) in fact.fields.iter().enumerate() {
+                let between = if field == 0 { "" } else { ", " };
+                write!(out, "{between}\"{}\": {}", escape(name), number(*value))?;
+            }
+            writeln!(out, "}}{comma}")?;
+        }
+        writeln!(out, "  }}")?;
+        writeln!(out, "}}")
+    }
+}
+
+/// One timing, and what the work it timed did.
+struct Case {
+    name: String,
+    rounds: usize,
+    items: usize,
+    best: Duration,
+    median: Duration,
+    /// What the queries in this case did, for the cases that run queries.
+    counted: Option<Counted>,
+}
+
+impl Case {
+    fn write(&self, out: &mut impl Write) -> io::Result<()> {
+        write!(
+            out,
+            "{{\"name\": \"{}\", \"rounds\": {}, \"items\": {}, \"best_ns\": {}, \"median_ns\": {}",
+            escape(&self.name),
+            self.rounds,
+            self.items,
+            self.best.as_nanos(),
+            self.median.as_nanos()
+        )?;
+        if self.items > 1 {
+            let per = self.best.as_nanos() as f64 / self.items as f64;
+            write!(out, ", \"ns_per_item\": {}", number(per))?;
+        }
+        if let Some(counted) = &self.counted {
+            write!(out, ", \"counters\": ")?;
+            counted.write(out)?;
+        }
+        write!(out, "}}")
+    }
+}
+
+/// What a set of queries did, summed over the set.
+///
+/// Summed rather than averaged because the sums are what the ratios are made
+/// of. Postings decoded against postings is the skip fraction of the whole set,
+/// and an average of per query fractions would weight a query over one short
+/// list the same as a query over four long ones.
+struct Counted {
+    counters: Counters,
+    queries: usize,
+}
+
+impl Counted {
+    fn write(&self, out: &mut impl Write) -> io::Result<()> {
+        let c = &self.counters;
+        write!(
+            out,
+            "{{\"queries\": {}, \"terms\": {}, \"postings\": {}, \"postings_decoded\": {}, \
+             \"blocks\": {}, \"blocks_decoded\": {}, \"blocks_skipped\": {}, \
+             \"documents_scored\": {}, \"seeks\": {}, \"advances\": {}, \"skipped\": {}}}",
+            self.queries,
+            c.terms,
+            c.postings,
+            c.postings_decoded,
+            c.blocks,
+            c.blocks_decoded,
+            c.blocks_skipped,
+            c.documents_scored,
+            c.seeks,
+            c.advances,
+            number(f64::from(c.skipped()))
+        )
+    }
+}
+
+/// A size or a ratio that describes the data rather than how long it took.
+struct Fact {
+    name: String,
+    fields: Vec<(&'static str, f64)>,
+}
+
+/// Records a fact, and prints the sentence version of it unless JSON was asked
+/// for.
+fn fact(name: &str, line: &str, fields: Vec<(&'static str, f64)>) {
+    if printing() {
+        println!("{line}");
+    }
+    REPORT
+        .lock()
+        .expect("nothing panicked holding the report")
+        .facts
+        .push(Fact {
+            name: name.to_string(),
+            fields,
+        });
+}
+
+/// Attaches to the measurement just taken what its queries did.
+///
+/// Called straight after the [`bench`] whose queries these are, which is what
+/// makes attaching to the last case rather than by name correct.
+fn counted(queries: usize, counters: Counters) {
+    if printing() {
+        let scored = counters.documents_scored / queries.max(1) as u64;
+        println!(
+            "{:<44} skipped {:.1}% of the postings, scored {scored} documents per query",
+            "",
+            f64::from(counters.skipped()) * 100.0
+        );
+    }
+    let mut report = REPORT.lock().expect("nothing panicked holding the report");
+    if let Some(case) = report.cases.last_mut() {
+        case.counted = Some(Counted { counters, queries });
+    }
+}
+
+/// Runs every query with counting on and adds up what they all did.
+///
+/// A second pass rather than counting during the timed one, so that the timing
+/// measures the search the engine actually ships.
+fn tally<S: AsRef<str>>(queries: &[S], mut run: impl FnMut(&str) -> Counters) -> Counters {
+    let mut total = Counters::default();
+    for query in queries {
+        let one = run(query.as_ref());
+        total.terms += one.terms;
+        total.postings += one.postings;
+        total.blocks += one.blocks;
+        total.blocks_decoded += one.blocks_decoded;
+        total.blocks_skipped += one.blocks_skipped;
+        total.postings_decoded += one.postings_decoded;
+        total.documents_scored += one.documents_scored;
+        total.seeks += one.seeks;
+        total.advances += one.advances;
+    }
+    total
+}
+
+/// A number that is always valid JSON.
+///
+/// A ratio over an empty input would be a division by zero, and `NaN` is not a
+/// JSON value. Nothing here divides by zero today, and a document that silently
+/// stopped parsing later would be a bad way to find out that changed.
+fn number(value: f64) -> String {
+    if value.is_finite() {
+        format!("{value}")
+    } else {
+        "0".to_string()
+    }
+}
+
+/// A JSON string body.
+///
+/// Every name here is an ASCII literal, so this exists to keep that true rather
+/// than because anything currently needs it.
+fn escape(text: &str) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// The stored fields, which are most of what a segment weighs.
@@ -94,12 +350,21 @@ fn stores() {
     }
     let bytes = writer.finish().expect("fits");
     let reader = store::Reader::new(&bytes).expect("what was written reads");
-    println!(
-        "store: {:.1} MB of text in {:.1} MB, {:.2} of the input, {} blocks",
-        raw as f64 / 1e6,
-        size as f64 / 1e6,
-        size as f64 / raw as f64,
-        reader.blocks()
+    fact(
+        "store",
+        &format!(
+            "store: {:.1} MB of text in {:.1} MB, {:.2} of the input, {} blocks",
+            raw as f64 / 1e6,
+            size as f64 / 1e6,
+            size as f64 / raw as f64,
+            reader.blocks()
+        ),
+        vec![
+            ("text_bytes", raw as f64),
+            ("store_bytes", size as f64),
+            ("ratio", size as f64 / raw as f64),
+            ("blocks", reader.blocks() as f64),
+        ],
     );
 
     // The order is the one a hit list arrives in, which is scattered, so every
@@ -131,11 +396,19 @@ fn stores() {
         lz::decompress(&compressed, text.len(), &mut back).expect("what was written decodes");
         black_box(&back);
     });
-    println!(
-        "compress: {:.1} MB into {:.1} MB, {:.2} of the input",
-        text.len() as f64 / 1e6,
-        compressed.len() as f64 / 1e6,
-        compressed.len() as f64 / text.len() as f64,
+    fact(
+        "compress",
+        &format!(
+            "compress: {:.1} MB into {:.1} MB, {:.2} of the input",
+            text.len() as f64 / 1e6,
+            compressed.len() as f64 / 1e6,
+            compressed.len() as f64 / text.len() as f64,
+        ),
+        vec![
+            ("input_bytes", text.len() as f64),
+            ("output_bytes", compressed.len() as f64),
+            ("ratio", compressed.len() as f64 / text.len() as f64),
+        ],
     );
 }
 
@@ -167,12 +440,21 @@ fn dictionary() {
     }
     let encoded = writer.finish();
     let raw: usize = words.iter().map(String::len).sum();
-    println!(
-        "term dictionary: {} terms in {} bytes, {:.2} bytes per term, {:.2} raw",
-        words.len(),
-        encoded.len(),
-        encoded.len() as f64 / words.len() as f64,
-        raw as f64 / words.len() as f64
+    fact(
+        "term_dictionary",
+        &format!(
+            "term dictionary: {} terms in {} bytes, {:.2} bytes per term, {:.2} raw",
+            words.len(),
+            encoded.len(),
+            encoded.len() as f64 / words.len() as f64,
+            raw as f64 / words.len() as f64
+        ),
+        vec![
+            ("terms", words.len() as f64),
+            ("bytes", encoded.len() as f64),
+            ("bytes_per_term", encoded.len() as f64 / words.len() as f64),
+            ("raw_bytes_per_term", raw as f64 / words.len() as f64),
+        ],
     );
 
     // Every sixteenth term, so the walk lands in a different block each time and
@@ -254,11 +536,19 @@ fn vocabulary(count: usize) -> Vec<String> {
 fn postings() -> Vec<u8> {
     let ids: Vec<DocId> = (0..1_000_000u32).map(|i| i * 3).collect();
     let encoded = encode(&ids);
-    println!(
-        "posting list: {} ids in {} bytes, {:.2} bytes per id",
-        ids.len(),
-        encoded.len(),
-        encoded.len() as f64 / ids.len() as f64
+    fact(
+        "posting_list",
+        &format!(
+            "posting list: {} ids in {} bytes, {:.2} bytes per id",
+            ids.len(),
+            encoded.len(),
+            encoded.len() as f64 / ids.len() as f64
+        ),
+        vec![
+            ("ids", ids.len() as f64),
+            ("bytes", encoded.len() as f64),
+            ("bytes_per_id", encoded.len() as f64 / ids.len() as f64),
+        ],
     );
 
     bench("encode a million ids", ids.len(), || {
@@ -380,12 +670,27 @@ fn blocks() {
         widths.push(bitpack::pack(&block, base, &mut packed));
         base = block[bitpack::BLOCK - 1];
     }
-    println!(
-        "block codecs: varint {} bytes, packed {} bytes, {:.2} against {:.2} bytes per id",
-        varint.len(),
-        packed.len(),
-        varint.len() as f64 / ids.len() as f64,
-        packed.len() as f64 / ids.len() as f64
+    fact(
+        "block_codecs",
+        &format!(
+            "block codecs: varint {} bytes, packed {} bytes, {:.2} against {:.2} bytes per id",
+            varint.len(),
+            packed.len(),
+            varint.len() as f64 / ids.len() as f64,
+            packed.len() as f64 / ids.len() as f64
+        ),
+        vec![
+            ("varint_bytes", varint.len() as f64),
+            ("packed_bytes", packed.len() as f64),
+            (
+                "varint_bytes_per_id",
+                varint.len() as f64 / ids.len() as f64,
+            ),
+            (
+                "packed_bytes_per_id",
+                packed.len() as f64 / ids.len() as f64,
+            ),
+        ],
     );
 
     bench("decode a million gaps, varints", ids.len(), || {
@@ -448,7 +753,11 @@ fn segments(postings: &[u8]) {
         .add(segment::kind::TERMS, vec![0x5a; 1 << 20])
         .expect("one of a kind");
     let bytes = writer.finish();
-    println!("segment: {} bytes over 2 sections", bytes.len());
+    fact(
+        "segment",
+        &format!("segment: {} bytes over 2 sections", bytes.len()),
+        vec![("bytes", bytes.len() as f64), ("sections", 2.0)],
+    );
 
     bench("open a segment, checksum verified", bytes.len(), || {
         let opened = Segment::open(black_box(&bytes)).expect("open");
@@ -564,16 +873,31 @@ fn bench_rounds(name: &str, rounds: usize, items: usize, mut f: impl FnMut()) {
     let best = timings[0];
     let median = timings[rounds / 2];
 
-    let per_item = if items > 1 {
-        format!("{:.2} ns", best.as_nanos() as f64 / items as f64)
-    } else {
-        String::new()
-    };
-    println!(
-        "{name:<44} {:>12} {:>12} {per_item:>10}",
-        format_duration(best),
-        format_duration(median)
-    );
+    if printing() {
+        let per_item = if items > 1 {
+            format!("{:.2} ns", best.as_nanos() as f64 / items as f64)
+        } else {
+            String::new()
+        };
+        println!(
+            "{name:<44} {:>12} {:>12} {per_item:>10}",
+            format_duration(best),
+            format_duration(median)
+        );
+    }
+
+    REPORT
+        .lock()
+        .expect("nothing panicked holding the report")
+        .cases
+        .push(Case {
+            name: name.to_string(),
+            rounds,
+            items,
+            best,
+            median,
+            counted: None,
+        });
 }
 
 fn format_duration(d: Duration) -> String {
@@ -623,16 +947,34 @@ fn engine() {
     let bytes = writer.finish().expect("what was written decodes");
     let segment = Segment::open(&bytes).expect("a segment this writer wrote opens");
     let reader = index::Reader::open(&segment).expect("the sections are all there");
-    println!(
-        "index: {} documents, {:.1} MB of text in {:.1} MB, {:.2} of the input, {} terms",
-        corpus.len(),
-        raw as f64 / 1e6,
-        size as f64 / 1e6,
-        size as f64 / raw as f64,
-        reader.terms()
+    fact(
+        "index",
+        &format!(
+            "index: {} documents, {:.1} MB of text in {:.1} MB, {:.2} of the input, {} terms",
+            corpus.len(),
+            raw as f64 / 1e6,
+            size as f64 / 1e6,
+            size as f64 / raw as f64,
+            reader.terms()
+        ),
+        vec![
+            ("documents", corpus.len() as f64),
+            ("text_bytes", raw as f64),
+            ("index_bytes", size as f64),
+            ("ratio", size as f64 / raw as f64),
+            ("terms", f64::from(reader.terms())),
+        ],
     );
 
-    let searcher = Searcher::new(&reader);
+    queries(&Searcher::new(&reader));
+}
+
+/// The query side of [`engine`], which is where the pruning either works or does
+/// not.
+///
+/// Separate from the indexing side because they are read separately: a change to
+/// the writer moves the rows above and a change to the walk moves the rows here.
+fn queries(searcher: &Searcher<'_, '_>) {
     // A query is only interesting if it has to choose. One term is a walk down
     // one list, and three terms with one of them common is where the pruning
     // either works or does not.
@@ -649,26 +991,57 @@ fn engine() {
         .map(|pair| format!("{} {} {}", pair[0], pair[1], words[0]))
         .collect();
 
+    // Every query row is timed and then run once more with counting on, so the
+    // row carries what the work was as well as what it cost. A row that gets
+    // slower with its counters unchanged and a row that gets slower because it
+    // decoded twice as much are different bugs.
     bench("query one term, top ten", one.len(), || {
         for query in &one {
             black_box(searcher.search(query, 10).expect("searches"));
         }
     });
+    counted(
+        one.len(),
+        tally(&one, |query| {
+            searcher.search_explained(query, 10).expect("searches").1
+        }),
+    );
+
     bench("query two terms, top ten", two.len(), || {
         for query in &two {
             black_box(searcher.search(query, 10).expect("searches"));
         }
     });
+    counted(
+        two.len(),
+        tally(&two, |query| {
+            searcher.search_explained(query, 10).expect("searches").1
+        }),
+    );
+
     bench("query three terms, top ten", three.len(), || {
         for query in &three {
             black_box(searcher.search(query, 10).expect("searches"));
         }
     });
+    counted(
+        three.len(),
+        tally(&three, |query| {
+            searcher.search_explained(query, 10).expect("searches").1
+        }),
+    );
+
     bench("query three terms, top hundred", three.len(), || {
         for query in &three {
             black_box(searcher.search(query, 100).expect("searches"));
         }
     });
+    counted(
+        three.len(),
+        tally(&three, |query| {
+            searcher.search_explained(query, 100).expect("searches").1
+        }),
+    );
 
     // What a search box actually asks for, which is a page and a count of what
     // it is a page of. The two calls are what the one replaces, so they are
@@ -678,12 +1051,42 @@ fn engine() {
             black_box(searcher.search_and_count(query, 10).expect("searches"));
         }
     });
+    counted(
+        three.len(),
+        tally(&three, |query| {
+            searcher
+                .search_and_count_explained(query, 10)
+                .expect("searches")
+                .2
+        }),
+    );
+
     bench("page and total, two walks", three.len(), || {
         for query in &three {
             black_box(searcher.count(query).expect("counts"));
             black_box(searcher.search(query, 10).expect("searches"));
         }
     });
+    counted(
+        three.len(),
+        tally(&three, |query| {
+            let counting = searcher.count_explained(query).expect("counts").1;
+            let searching = searcher.search_explained(query, 10).expect("searches").1;
+            // Two walks over the same lists, so the denominators add up the
+            // same way the work does.
+            Counters {
+                terms: counting.terms + searching.terms,
+                postings: counting.postings + searching.postings,
+                blocks: counting.blocks + searching.blocks,
+                blocks_decoded: counting.blocks_decoded + searching.blocks_decoded,
+                blocks_skipped: counting.blocks_skipped + searching.blocks_skipped,
+                postings_decoded: counting.postings_decoded + searching.postings_decoded,
+                documents_scored: counting.documents_scored + searching.documents_scored,
+                seeks: counting.seeks + searching.seeks,
+                advances: counting.advances + searching.advances,
+            }
+        }),
+    );
 }
 
 /// What the fold buys, which is the whole reason it exists.
@@ -711,10 +1114,17 @@ fn parallel() {
         one = writer.finish().expect("what was written decodes");
         serial = serial.min(start.elapsed());
     }
-    println!(
-        "index on one thread: {} in {}",
-        corpus.len(),
-        format_duration(serial)
+    fact(
+        "index_on_one_thread",
+        &format!(
+            "index on one thread: {} in {}",
+            corpus.len(),
+            format_duration(serial)
+        ),
+        vec![
+            ("documents", corpus.len() as f64),
+            ("nanos", serial.as_nanos() as f64),
+        ],
     );
 
     let mut widths = vec![2, 4, threads];
@@ -751,11 +1161,19 @@ fn parallel() {
             best = best.min(start.elapsed());
         }
         assert_eq!(one, many, "a segment folded on {width} threads differs");
-        println!(
-            "index on {width} threads: {} in {}, {:.2}x",
-            corpus.len(),
-            format_duration(best),
-            serial.as_secs_f64() / best.as_secs_f64()
+        fact(
+            &format!("index_on_{width}_threads"),
+            &format!(
+                "index on {width} threads: {} in {}, {:.2}x",
+                corpus.len(),
+                format_duration(best),
+                serial.as_secs_f64() / best.as_secs_f64()
+            ),
+            vec![
+                ("documents", corpus.len() as f64),
+                ("nanos", best.as_nanos() as f64),
+                ("speedup", serial.as_secs_f64() / best.as_secs_f64()),
+            ],
         );
     }
 }
