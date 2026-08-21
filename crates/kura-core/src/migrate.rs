@@ -8,7 +8,7 @@
 //!
 //! # What a step is
 //!
-//! One version to the next, and no further. [`segment`] walks from whatever
+//! One version to the next, and no further. [`segment()`] walks from whatever
 //! version a file says it is up to [`FORMAT_VERSION`] one step at a time, so the
 //! step from 3 to 4 is written once and every older file reaches it by going
 //! through the steps before it. The alternative, a function per pair of
