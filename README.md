@@ -31,7 +31,9 @@ The crate holds the pieces the rest is built out of, and each one is tested and 
   That makes reading them six times faster than reading the same ids as varints, at half the size.
   Term frequencies ride alongside the ids in a second packed stream that a caller only pays for when it reads it, and each block carries the largest frequency in it so a scorer can skip a block whose best possible contribution cannot reach the current cutoff.
 - **Term dictionary.** Terms in order, in blocks of sixteen, with the shared prefix folded out and one index entry per block.
-  A lookup binary searches the index and then walks a block, so it touches two cache lines rather than the whole vocabulary, and the folding makes the dictionary smaller than the terms it holds even though it also stores three numbers for each of them.
+  A lookup binary searches the index and then walks a block, so it touches a handful of cache lines rather than the whole vocabulary, and the folding makes the dictionary smaller than the terms it holds even though it also stores three numbers for each of them.
+  The binary search compares the first four bytes of each block's first term out of an array of its own, and only reads a term when it finds them equal, and the walk of the block never rebuilds a term at all: it carries how much of the term it is looking for it has matched, and every term in the block settles against that number or is skipped without being looked at.
+  Together those are half of what a lookup used to cost, which is a measurement that came out of weighing the whole thing against a general finite state transducer and deciding to keep the shape.
 - **Text analysis.** One tokeniser, used for documents and for queries, because two that differ by anything at all produce an index that cannot find the words in it.
   It folds case, keeps an apostrophe that has a word on both sides of it, and splits Han and kana per character so that text without spaces is findable at all.
 - **An index writer.** Text in, a segment out, in one pass.
