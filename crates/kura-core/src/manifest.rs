@@ -60,9 +60,9 @@
 //! a torn write is a slice with a byte changed in it, and there is no way to
 //! arrange one of those reliably through a filesystem.
 //!
-//! The log is not here either. The manifest records where its head and tail are,
-//! because those are part of the committed state, and the records themselves are
-//! somebody else's format.
+//! The log is not here either. The manifest records where its head and tail are
+//! and what the next record will be numbered, because those are part of the
+//! committed state, and the records themselves are somebody else's format.
 
 use crate::codec::{
     get_u16, get_u32, get_u64, get_u128, put_u16, put_u32, put_u64, put_u128, split_at,
@@ -120,7 +120,7 @@ pub const MINOR: u16 = 0;
 const SUM_LEN: usize = 16;
 
 /// The fixed part of a manifest, before the segment table.
-const MANIFEST_HEADER_LEN: usize = 64;
+const MANIFEST_HEADER_LEN: usize = 72;
 
 /// The size of one entry in the segment table.
 const SEGMENT_LEN: usize = 64;
@@ -206,13 +206,33 @@ impl Superblock {
     /// cannot be tested.
     #[must_use]
     pub const fn new(store: u128, created: u64) -> Self {
+        Self::with_log(store, created, DEFAULT_WAL_LEN)
+    }
+
+    /// A superblock for a new store whose log is a size of the caller's
+    /// choosing.
+    ///
+    /// The size is rounded up to a whole number of pages, and to at least one,
+    /// because the segment region starts where the log ends and everything
+    /// structural in a store is page aligned. An embedded store that will never
+    /// hold much wants a smaller ring than a server that takes a thousand writes
+    /// a second, and the ring cannot be resized afterwards without moving every
+    /// segment in the file, so this is the moment to say.
+    #[must_use]
+    pub const fn with_log(store: u128, created: u64, wal_len: u64) -> Self {
+        let pages = wal_len.div_ceil(PAGE as u64);
+        let wal_len = if pages == 0 {
+            PAGE as u64
+        } else {
+            pages * PAGE as u64
+        };
         Self {
             major: MAJOR,
             minor: MINOR,
             page: PAGE,
             wal_offset: WAL_OFFSET,
-            wal_len: DEFAULT_WAL_LEN,
-            segments_offset: WAL_OFFSET + DEFAULT_WAL_LEN,
+            wal_len,
+            segments_offset: WAL_OFFSET + wal_len,
             store,
             created,
             flags: 0,
@@ -363,17 +383,28 @@ pub struct Manifest {
     pub wal_head: u64,
     /// How far the write ahead log has been written.
     pub wal_tail: u64,
+    /// The sequence number the next log record gets.
+    ///
+    /// Here rather than worked out from the log, because a log with nothing in
+    /// it has nothing to work it out from, and numbering that restarted at one
+    /// every time a store opened would put records in the ring that a later lap
+    /// could not tell from the ones it wrote itself.
+    pub wal_sequence: u64,
     /// Every segment in the store, in the order they were added.
     pub segments: Vec<Segment>,
 }
 
 impl Manifest {
     /// The manifest a newly created store commits, describing nothing.
+    ///
+    /// Numbering starts at one rather than zero so that a sequence of zero can
+    /// go on meaning that nothing has been written yet.
     #[must_use]
     pub fn empty(written: u64) -> Self {
         Self {
             epoch: 1,
             written,
+            wal_sequence: 1,
             ..Self::default()
         }
     }
@@ -407,6 +438,7 @@ impl Manifest {
         put_u32(&mut out, self.flags);
         put_u64(&mut out, self.wal_head);
         put_u64(&mut out, self.wal_tail);
+        put_u64(&mut out, self.wal_sequence);
         debug_assert_eq!(out.len(), MANIFEST_HEADER_LEN);
         for segment in &self.segments {
             put_u64(&mut out, segment.offset);
@@ -457,7 +489,8 @@ impl Manifest {
         let (count, rest) = get_u32(rest)?;
         let (flags, rest) = get_u32(rest)?;
         let (wal_head, rest) = get_u64(rest)?;
-        let (wal_tail, mut rest) = get_u64(rest)?;
+        let (wal_tail, rest) = get_u64(rest)?;
+        let (wal_sequence, mut rest) = get_u64(rest)?;
         let count = count as usize;
         if count > MAX_SEGMENTS {
             return Err(Error::TooManySegments { count });
@@ -487,6 +520,7 @@ impl Manifest {
             flags,
             wal_head,
             wal_tail,
+            wal_sequence,
             segments,
         })
     }
@@ -591,6 +625,7 @@ mod tests {
             flags: 0,
             wal_head: 4096,
             wal_tail: 8192,
+            wal_sequence: 71,
             segments: (0..segments).map(segment).collect(),
         }
     }
