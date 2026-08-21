@@ -1,8 +1,8 @@
-//! Reading an index without copying it.
+//! Reading a file without copying it.
 //!
-//! An index is a single file and the engine reads it as one byte slice, which
-//! leaves whoever opens it free to decide where the bytes come from. Until this
-//! module existed, the answer here was `fs::read`, and the answer in the
+//! Everything in this crate that reads takes a byte slice, which leaves whoever
+//! opens the file free to decide where the bytes come from. For a while the
+//! answer in the command line tool was `fs::read` and the answer in the
 //! benchmark runner was a mapping. Those are not the same program. A 700 MB
 //! index costs 700 MB of resident memory and a full read one way, and a few
 //! pages and no read the other, and the results table said kura for both.
@@ -12,22 +12,29 @@
 //! fraction of the file. Reading all of it to look at some of it is work that
 //! nothing asked for.
 //!
+//! # Why it is in the engine
+//!
+//! It started in the tool, which was the wrong place as soon as [`file`] needed
+//! it too. Two implementations of two platforms in two crates is the drift this
+//! crate already had once over fault counters, and the fix was the same then:
+//! one of them, here, used by everything.
+//!
 //! # Why it is written out by hand
 //!
-//! Three declarations and a destructor, against a dependency in the tool we
-//! ship beside a dependency free engine. The engine has no dependencies because
-//! it gets linked into other people's binaries, and while that argument is
-//! weaker for a command line tool it is not absent, and this is small enough
-//! not to test it.
+//! Three declarations and a destructor, against a dependency in a crate that
+//! has none. The engine has no dependencies because it gets linked into other
+//! people's binaries, and this is small enough not to be the exception.
 //!
 //! # What can still go wrong
 //!
 //! A mapping is a window onto a file rather than a copy of it, so a file that
 //! is truncated while it is open takes the process down with a bus error on the
 //! next touch past the new end. That is the price of not copying and every
-//! engine that maps pays it. Indexes are written whole and replaced rather than
-//! edited underneath a reader, so this is a note rather than a hazard, and it is
-//! why the mapping is read only.
+//! engine that maps pays it. A store grows at the end and is never shortened
+//! underneath a reader, so this is a note rather than a hazard, and it is why
+//! the mapping is read only.
+//!
+//! [`file`]: crate::file
 
 use std::fs::File;
 use std::io;
@@ -48,14 +55,31 @@ pub struct Map {
 }
 
 impl Map {
-    /// Maps the whole of a file.
+    /// Maps the whole of a file, given where it is.
     ///
     /// # Errors
     ///
     /// Returns an error if the file cannot be opened, cannot be measured, or
     /// cannot be mapped.
     pub fn open(path: &Path) -> io::Result<Self> {
-        let file = File::open(path)?;
+        Self::of(&File::open(path)?)
+    }
+
+    /// Maps the whole of a file that is already open.
+    ///
+    /// The mapping does not keep the descriptor and does not need to. A mapping
+    /// holds a reference of its own to the file on both platforms here, so the
+    /// caller is free to close the one it passed in, and a store that has its
+    /// file open for writing can hand it over without opening the path a second
+    /// time and racing whatever is at that path by then.
+    ///
+    /// The mapping is read only regardless of what the descriptor was opened
+    /// for, which is why a store can do this to the file it is also writing to.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be measured or cannot be mapped.
+    pub fn of(file: &File) -> io::Result<Self> {
         let len = file.metadata()?.len();
         let len = usize::try_from(len).map_err(|_| {
             io::Error::new(
@@ -76,7 +100,7 @@ impl Map {
             });
         }
 
-        platform::map(&file, len)
+        platform::map(file, len)
     }
 }
 
@@ -85,7 +109,7 @@ impl Deref for Map {
 
     fn deref(&self) -> &[u8] {
         // SAFETY: `address` and `len` came from a successful mapping of that
-        // length and are only ever written by `open`, the region is mapped for
+        // length and are only ever written by `of`, the region is mapped for
         // as long as `self` lives because `drop` is the only thing that unmaps
         // it, and the borrow returned cannot outlive `self`. When `len` is zero
         // the pointer is dangling but aligned, which is what an empty slice
@@ -321,7 +345,7 @@ mod tests {
 
     /// A file with `content` in it, under a name nothing else in this run uses.
     fn written(name: &str, content: &[u8]) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!("kura-cli-map-{name}"));
+        let path = std::env::temp_dir().join(format!("kura-map-{}-{name}", std::process::id()));
         let mut file = std::fs::File::create(&path).expect("the temporary directory is writable");
         file.write_all(content).expect("a few bytes fit");
         file.sync_all().expect("the bytes reach the file");
@@ -353,7 +377,7 @@ mod tests {
 
     #[test]
     fn a_file_that_is_not_there_is_an_error_and_not_a_panic() {
-        let path = std::env::temp_dir().join("kura-cli-map-absent-on-purpose");
+        let path = std::env::temp_dir().join("kura-map-absent-on-purpose");
         let _ = std::fs::remove_file(&path);
         assert!(Map::open(&path).is_err());
     }

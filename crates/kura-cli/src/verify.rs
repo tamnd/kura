@@ -48,11 +48,11 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use kura_core::index;
+use kura_core::mapping::Map;
 use kura_core::segment::{self, Segment};
 use kura_core::store::Scratch;
 use kura_core::{DocId, Error};
 
-use crate::map::Map;
 use crate::report::bytes;
 
 /// What a run of the checks found.

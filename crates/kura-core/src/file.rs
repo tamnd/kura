@@ -43,13 +43,28 @@
 //! which is the kind of thing that works until the day something else opens the
 //! same store.
 //!
-//! # Not mapped
+//! # Written through a descriptor, read through a mapping
 //!
-//! The regions this module touches are a page and two 64 KiB slots, which is not
-//! enough to be worth a mapping, and a mapping would take the choice of when
-//! bytes reach the platter away from the code that has to be sure they have. The
-//! segment region is a different question with a different answer, and reading it
-//! is not what this module is for.
+//! The superblock and the two manifest slots are a page and 128 KiB between
+//! them, which is not enough to be worth a mapping, and a mapping would take the
+//! choice of when bytes reach the platter away from the code that has to be sure
+//! they have. So everything written here is written positioned and synced.
+//!
+//! The segment region is the other way round. It is the whole of the store by
+//! size, it is only ever appended to and never edited, and a query touches a
+//! small fraction of it, so reading it means [`Store::view`] and a mapping. See
+//! [`crate::mapping`] for why reading it any other way put a number in the
+//! results table that described a different program.
+//!
+//! # Segments arrive before the manifest that names them
+//!
+//! [`Store::append_segment`] writes a segment into the region and does not
+//! commit anything, and it is durable when it returns. [`Store::commit`] then
+//! writes a manifest that names it. That order is not an accident and it is not
+//! reversible: a manifest naming a segment that is not on the platter yet is a
+//! store that comes back pointing at a hole, where segment bytes that no
+//! manifest names are bytes nothing will ever read. One of those is a lost
+//! store and the other is wasted space.
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -57,8 +72,10 @@ use std::path::Path;
 
 use crate::error::Error;
 use crate::manifest::{
-    Committed, Manifest, SLOT_A_OFFSET, SLOT_B_OFFSET, SLOT_LEN, SUPERBLOCK_LEN, Slot, Superblock,
+    Committed, Manifest, PAGE, SLOT_A_OFFSET, SLOT_B_OFFSET, SLOT_LEN, SUPERBLOCK_LEN, Segment,
+    Slot, Superblock,
 };
+use crate::mapping::Map;
 use crate::wal::{self, MIN_RECORD, Record, Ring};
 
 #[cfg(not(any(unix, windows)))]
@@ -134,6 +151,28 @@ pub struct Store {
     /// Where the log is up to, which runs ahead of the committed manifest
     /// between commits and is written into the next one.
     log: Ring,
+    /// Where the next segment goes, which like the log runs ahead of the
+    /// committed manifest between commits.
+    segments: u64,
+}
+
+/// Where the segment region ends, according to a manifest.
+///
+/// Past the furthest segment it names rather than past the last one, because
+/// segments are listed in the order they were added and a compaction takes
+/// entries out of the middle, so the end of the list is not the end of the
+/// region.
+///
+/// Rounded up to a page, and the gap that leaves is not reclaimed. It is at most
+/// a page against a segment measured in megabytes, and every structural offset
+/// in this format is page aligned so that a mapping of one does not begin in the
+/// middle of a page it shares with something else.
+fn end_of(superblock: &Superblock, manifest: &Manifest) -> u64 {
+    let mut end = superblock.segments_offset;
+    for segment in &manifest.segments {
+        end = end.max(segment.offset.saturating_add(segment.len));
+    }
+    end.next_multiple_of(u64::from(PAGE))
 }
 
 impl Store {
@@ -190,12 +229,14 @@ impl Store {
             manifest.wal_tail,
             manifest.wal_sequence,
         )?;
+        let segments = end_of(&superblock, &manifest);
         Ok(Self {
             file,
             superblock,
             manifest,
             slot: Slot::A,
             log,
+            segments,
         })
     }
 
@@ -230,12 +271,14 @@ impl Store {
             manifest.wal_tail,
             manifest.wal_sequence,
         )?;
+        let segments = end_of(&superblock, &manifest);
         Ok(Self {
             file,
             superblock,
             manifest,
             slot,
             log,
+            segments,
         })
     }
 
@@ -368,6 +411,107 @@ impl Store {
         Ok(self.manifest.epoch)
     }
 
+    /// Where a segment appended now would start.
+    ///
+    /// Kept here rather than worked out from the manifest each time, and that is
+    /// the whole point of it. A store with several segments to write appends
+    /// them all and commits once, so between the first append and the commit the
+    /// manifest names none of them, and a placement read out of the manifest
+    /// would put every one of them at the same offset on top of the last. Which
+    /// it did, until a test asked where three segments had gone.
+    ///
+    /// It only ever moves forward while a store is open. Reopening puts it back
+    /// to the end of what the committed manifest names, so the space under
+    /// segments that were appended and never committed, or that a compaction has
+    /// since dropped, comes back the next time the store is opened rather than
+    /// during.
+    #[must_use]
+    pub const fn segments_end(&self) -> u64 {
+        self.segments
+    }
+
+    /// Writes a segment into the segment region and says where it went.
+    ///
+    /// The bytes are on the platter when this returns, and nothing points at
+    /// them yet. Naming them is [`Store::commit`], and doing it in that order is
+    /// what makes a store that stops in the middle of a write recoverable: the
+    /// worst this can leave behind is a stretch of bytes no manifest mentions,
+    /// which the next append writes over.
+    ///
+    /// The count and the timestamp are the caller's because this crate has no
+    /// clock, and because a segment's own header already holds both and having
+    /// this read them back out would mean opening a segment to find out what the
+    /// thing that just built it already knew.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Trouble::Io`] if the write or the sync fails. Nothing has been
+    /// committed either way, so a failure here leaves the store at the state it
+    /// was at.
+    pub fn append_segment(&mut self, bytes: &[u8], docs: u32, created: u64) -> Result<Segment> {
+        let offset = self.segments;
+        let len = bytes.len() as u64;
+        write_at(&self.file, bytes, offset)?;
+        // Everything and not just the data, because the file has grown and the
+        // length is as much a part of what has to survive as the bytes are. A
+        // sync that left the size behind would give back a store whose segment
+        // is inside a file that ends before it.
+        self.file.sync_all()?;
+        // Only after the bytes are down. A cursor that moved first and then
+        // failed to write would leave a gap that reads as a segment nobody
+        // wrote, and the next append would put a real one after it.
+        self.segments = offset.saturating_add(len).next_multiple_of(u64::from(PAGE));
+        Ok(Segment {
+            offset,
+            len,
+            docs,
+            created,
+            ..Segment::default()
+        })
+    }
+
+    /// Maps the store and hands back the bytes of every segment in it.
+    ///
+    /// This is how a query gets at a store. The mapping is of the whole file,
+    /// which costs nothing it does not use, because a mapping is a promise
+    /// rather than a read and the log region is a quarter of a gigabyte of
+    /// mostly untouched sparse file.
+    ///
+    /// The segments are checked against the file here rather than as each one is
+    /// handed out, so a view that exists is a view where every slice is inside
+    /// the mapping and inside the segment region. That is worth the loop: a
+    /// descriptor pointing into the manifest slots would otherwise be a query
+    /// quietly reading a manifest as though it were postings.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Trouble::Io`] if the file cannot be mapped, and
+    /// [`Trouble::Format`] with [`Error::Truncated`] if a segment the manifest
+    /// names is not entirely inside the file, or [`Error::SectionOutOfRange`] if
+    /// one starts before the segment region does.
+    pub fn view(&self) -> Result<View> {
+        let map = Map::of(&self.file)?;
+        let segments = self.manifest.segments.clone();
+        let start = self.superblock.segments_offset;
+        for segment in &segments {
+            let end = segment.offset.saturating_add(segment.len);
+            if end > map.len() as u64 {
+                return Err(Trouble::Format(Error::Truncated {
+                    needed: as_usize(end),
+                    available: map.len(),
+                }));
+            }
+            if segment.offset < start {
+                return Err(Trouble::Format(Error::SectionOutOfRange {
+                    kind: 0,
+                    offset: segment.offset,
+                    length: segment.len,
+                }));
+            }
+        }
+        Ok(View { map, segments })
+    }
+
     /// Walks the records the log holds and hands each one to `each`.
     ///
     /// This is what a store does after opening one that was not closed: the
@@ -462,6 +606,67 @@ impl Store {
             .max(self.manifest.wal_sequence);
         self.log = Ring::new(ring, head, position, sequence)?;
         Ok(count)
+    }
+}
+
+/// The segments of a store, mapped, ready to be read.
+///
+/// Made by [`Store::view`]. It holds the mapping, so the slices it hands out
+/// live exactly as long as it does, which is the chain a query is built on: the
+/// view owns the bytes, a [`Segment`](crate::segment::Segment) borrows a slice
+/// of them, a [`Reader`](crate::index::Reader) borrows the segment, and a
+/// [`Searcher`](crate::search::Searcher) borrows the readers. None of it is
+/// copied and none of it can outlive the mapping underneath.
+///
+/// It is a snapshot rather than a live handle. The segments are the ones the
+/// manifest named when the view was taken, and a commit after that does not
+/// reach it. That is the behaviour a query wants: a page of results computed
+/// halfway across a set of segments that changed underneath it is a page that
+/// never described anything.
+#[derive(Debug)]
+pub struct View {
+    /// The whole store file.
+    map: Map,
+    /// The segments the manifest named when this was taken, checked against the
+    /// mapping so that every slice below is inside it.
+    segments: Vec<Segment>,
+}
+
+impl View {
+    /// How many segments there are.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.segments.len()
+    }
+
+    /// Whether there are none, which is a store nothing has been written to.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.segments.is_empty()
+    }
+
+    /// What the manifest said about the segments.
+    #[must_use]
+    pub fn described(&self) -> &[Segment] {
+        &self.segments
+    }
+
+    /// The bytes of one segment, or `None` when there is no such segment.
+    ///
+    /// Infallible for an index that is in range, because [`Store::view`] already
+    /// checked every descriptor against the mapping. There is nothing left here
+    /// that can fail on bytes.
+    #[must_use]
+    pub fn bytes(&self, at: usize) -> Option<&[u8]> {
+        let segment = self.segments.get(at)?;
+        let start = as_usize(segment.offset);
+        let end = as_usize(segment.offset.saturating_add(segment.len));
+        self.map.get(start..end)
+    }
+
+    /// Every segment's bytes, oldest first.
+    pub fn all(&self) -> impl Iterator<Item = &[u8]> {
+        (0..self.len()).filter_map(|at| self.bytes(at))
     }
 }
 
@@ -945,6 +1150,252 @@ mod tests {
         assert_eq!(store.manifest().wal_sequence, 2);
         let mut store = Store::open(&path).expect("a store");
         assert_eq!(replayed(&mut store).len(), 1);
+    }
+
+    /// Words a document is built from, chosen so that every query below hits
+    /// some documents and misses others.
+    const WORDS: [&str; 6] = ["ledger", "invoice", "quarter", "ledger", "audit", "ledger"];
+
+    /// A document that holds a predictable handful of the words above.
+    fn text(n: usize) -> String {
+        let mut out = String::new();
+        for at in 0..=(n % 5) {
+            out.push_str(WORDS[(n + at) % WORDS.len()]);
+            out.push(' ');
+        }
+        out.push_str(WORDS[n % WORDS.len()]);
+        out
+    }
+
+    /// A segment holding the `count` documents starting at `from`.
+    fn built(from: usize, count: usize) -> (Vec<u8>, u32) {
+        let mut writer = crate::index::Writer::new();
+        for n in from..from + count {
+            writer.add(&text(n)).expect("a document");
+        }
+        let docs = u32::try_from(writer.len()).expect("a test corpus fits in a segment");
+        (writer.finish().expect("a segment"), docs)
+    }
+
+    /// Writes a store holding one segment per entry of `parts`, each entry
+    /// saying how many documents that segment gets.
+    ///
+    /// Every segment is appended before anything is committed, which is what a
+    /// store flushing a batch does and is the case that used to put them all at
+    /// the same offset.
+    fn stored(path: &Path, parts: &[usize]) -> Store {
+        let mut store = Store::create(path, STORE, 1_700_000_000).expect("a store");
+        let mut manifest = store.manifest().clone();
+        let mut from = 0;
+        for (n, &count) in parts.iter().enumerate() {
+            let (bytes, docs) = built(from, count);
+            let described = store
+                .append_segment(&bytes, docs, 1_700_000_000 + n as u64)
+                .expect("appended");
+            manifest.segments.push(described);
+            from += count;
+        }
+        store.commit(manifest, 1_700_000_001).expect("committed");
+        store
+    }
+
+    /// The page a query gets out of a store, with the documents named by the
+    /// segment they are in rather than by the searcher wide number, so that a
+    /// store split three ways and a store split one way are comparable.
+    fn page(store: &Store, query: &str, k: usize) -> Vec<(usize, u32, f32)> {
+        let view = store.view().expect("a view");
+        let segments: Vec<_> = view
+            .all()
+            .map(|bytes| crate::segment::Segment::open(bytes).expect("a segment"))
+            .collect();
+        let readers: Vec<_> = segments
+            .iter()
+            .map(|segment| crate::index::Reader::open(segment).expect("a reader"))
+            .collect();
+        let searcher = crate::search::Searcher::over(&readers).expect("a searcher");
+        searcher
+            .search(query, k)
+            .expect("searched")
+            .into_iter()
+            .map(|hit| {
+                let (at, doc) = searcher.locate(hit.doc).expect("a segment");
+                (at, doc, hit.score)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_segment_written_into_a_store_comes_back_out_of_it() {
+        let path = path("onesegment");
+        let store = stored(&path, &[40]);
+        drop(store);
+
+        let store = Store::open(&path).expect("a store");
+        let view = store.view().expect("a view");
+        assert_eq!(view.len(), 1);
+        let bytes = view.bytes(0).expect("the segment");
+        let segment = crate::segment::Segment::open(bytes).expect("a segment");
+        let reader = crate::index::Reader::open(&segment).expect("a reader");
+        assert_eq!(reader.documents(), 40);
+        assert_eq!(view.described()[0].docs, 40);
+    }
+
+    #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "the same documents scored by the same code over the same terms \
+                  in the same order, so the two sums agree bit for bit or the \
+                  change this tests for has not been made"
+    )]
+    fn a_store_of_several_segments_ranks_the_same_as_a_store_of_one() {
+        // The point of the whole exercise, on a real file rather than on
+        // buffers. The same hundred and twenty documents, written as one
+        // segment and as four, have to give the same page, because a document's
+        // score is a fact about the corpus and not about which batch it arrived
+        // in.
+        let one = stored(&path("wholecorpus"), &[120]);
+        let four = stored(&path("splitcorpus"), &[30, 30, 30, 30]);
+        assert_eq!(one.view().expect("a view").len(), 1);
+        assert_eq!(four.view().expect("a view").len(), 4);
+
+        for query in ["ledger", "invoice quarter", "ledger audit invoice"] {
+            let whole = page(&one, query, 20);
+            let split = page(&four, query, 20);
+            assert!(!whole.is_empty(), "{query} found nothing to compare");
+            assert_eq!(whole.len(), split.len(), "{query}");
+            for (at, (left, right)) in whole.iter().zip(split.iter()).enumerate() {
+                // A document is named by the segment it is in and its ordinal
+                // there, so the four segment store's thirtieth document of
+                // segment two is the ninetieth of the one segment store. Put
+                // back together rather than compared as pairs, because the pairs
+                // are different by construction and the documents are not.
+                let (whole_at, whole_doc, whole_score) = *left;
+                let (split_at, split_doc, split_score) = *right;
+                assert_eq!(whole_at, 0);
+                assert_eq!(
+                    whole_doc,
+                    u32::try_from(split_at).expect("four segments") * 30 + split_doc,
+                    "{query} put a different document at {at}"
+                );
+                // To the last bit, not to a tolerance. The terms are summed in
+                // the order they were given on both sides, so there is nothing
+                // for the two to disagree about.
+                assert_eq!(whole_score, split_score, "{query} at {at}");
+            }
+        }
+    }
+
+    #[test]
+    fn segments_appended_before_a_commit_do_not_land_on_top_of_each_other() {
+        // All three go in before anything is committed, which is what a store
+        // with a batch to flush does. While the placement was worked out from
+        // the committed manifest, that manifest named none of them and all three
+        // went to the same offset, so the first two were bytes under the third.
+        let path = path("layout");
+        let store = stored(&path, &[20, 20, 20]);
+        let described = store.manifest().segments.clone();
+        assert_eq!(described.len(), 3);
+
+        let page = u64::from(PAGE);
+        let mut previous = store.superblock().segments_offset;
+        for segment in &described {
+            assert!(segment.len > 0, "{described:?}");
+            assert!(segment.offset >= previous, "{described:?}");
+            assert_eq!(segment.offset % page, 0, "{described:?}");
+            previous = segment.offset + segment.len;
+        }
+        assert!(store.segments_end() >= previous);
+
+        // And the three are still three different segments when read back,
+        // which is the check that a layout assertion on its own would miss if
+        // the offsets were right and the bytes were not.
+        let view = store.view().expect("a view");
+        assert_eq!(view.len(), 3);
+        for bytes in view.all() {
+            let segment = crate::segment::Segment::open(bytes).expect("a segment");
+            let reader = crate::index::Reader::open(&segment).expect("a reader");
+            assert_eq!(reader.documents(), 20);
+        }
+
+        // Reopening puts the cursor back where the committed manifest leaves it,
+        // which for a store whose appends were all committed is where it already
+        // was.
+        drop(store);
+        let store = Store::open(&path).expect("a store");
+        assert_eq!(store.manifest().segments, described);
+        assert_eq!(store.segments_end(), previous.next_multiple_of(page));
+    }
+
+    #[test]
+    fn a_view_is_the_store_it_was_taken_from_and_not_the_one_after() {
+        let path = path("snapshot");
+        let mut store = stored(&path, &[20]);
+        let view = store.view().expect("a view");
+        assert_eq!(view.len(), 1);
+
+        let (bytes, docs) = built(20, 20);
+        let described = store.append_segment(&bytes, docs, 2).expect("appended");
+        let mut manifest = store.manifest().clone();
+        manifest.segments.push(described);
+        store.commit(manifest, 3).expect("committed");
+
+        assert_eq!(view.len(), 1, "a commit reached a view taken before it");
+        assert_eq!(store.view().expect("a view").len(), 2);
+    }
+
+    #[test]
+    fn an_empty_store_has_a_view_with_nothing_in_it() {
+        let path = path("emptyview");
+        let store = Store::create(&path, STORE, 1).expect("a store");
+        let view = store.view().expect("a view");
+        assert!(view.is_empty());
+        assert_eq!(view.len(), 0);
+        assert!(view.bytes(0).is_none());
+        assert_eq!(view.all().count(), 0);
+    }
+
+    #[test]
+    fn a_manifest_naming_a_segment_that_is_not_in_the_file_is_refused() {
+        let path = path("dangling");
+        let mut store = stored(&path, &[20]);
+        let mut manifest = store.manifest().clone();
+        // A segment nothing ever wrote, out past the end of the file. Which is
+        // what a manifest committed before the segment it names would leave, and
+        // the reason `append_segment` syncs before `commit` is called.
+        manifest.segments.push(Segment {
+            offset: store.segments_end(),
+            len: 1 << 30,
+            docs: 1,
+            ..Segment::default()
+        });
+        store.commit(manifest, 2).expect("committed");
+        let error = store.view().expect_err("not in the file");
+        assert!(
+            matches!(error, Trouble::Format(Error::Truncated { .. })),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_segment_that_starts_before_the_segment_region_is_refused() {
+        let path = path("intheslots");
+        let mut store = stored(&path, &[20]);
+        let mut manifest = store.manifest().clone();
+        // Pointing at a manifest slot. Every byte of it is in the file, so the
+        // length check passes and this is the one that has to catch it, and what
+        // it catches is a query reading a manifest as though it were postings.
+        manifest.segments.push(Segment {
+            offset: SLOT_A_OFFSET,
+            len: SLOT_LEN as u64,
+            docs: 1,
+            ..Segment::default()
+        });
+        store.commit(manifest, 2).expect("committed");
+        let error = store.view().expect_err("not in the region");
+        assert!(
+            matches!(error, Trouble::Format(Error::SectionOutOfRange { .. })),
+            "{error:?}"
+        );
     }
 
     /// Changes one byte of a file in place, which is what a torn write leaves.
