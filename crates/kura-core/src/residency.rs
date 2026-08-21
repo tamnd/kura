@@ -243,6 +243,34 @@ pub fn measured<T, E>(
     Ok((answer, counters))
 }
 
+/// The most memory this process has had resident at once, in bytes.
+///
+/// A high water mark rather than a reading of this moment, which is what every
+/// system here keeps and is also the number an operator is actually worried
+/// about. Nothing lowers it, so two readings taken either side of a piece of
+/// work say how much that piece of work added to the worst the process has ever
+/// been, and a difference of zero means it stayed under a mark something earlier
+/// had already set.
+///
+/// It is the process and not this crate. Anything else the program does is in
+/// here too, which is exact for a tool that indexes and then exits and is not
+/// exact for a server that indexes while it serves. Read it as the same number
+/// `/usr/bin/time` prints, because on the systems that have both it is.
+///
+/// This is a different question from [`Held`](crate::index::Held), and both are
+/// needed. `Held` is what the engine knows it is holding, this is what the
+/// operating system says the process has, and the gap between them is the
+/// allocator, the buffers a finished segment is built in and the pages of any
+/// file that has just been written.
+///
+/// # Errors
+///
+/// Returns a message if the system will not answer, which today means the web,
+/// where there is no process to ask about.
+pub fn peak_resident() -> Result<u64, &'static str> {
+    platform::peak_resident()
+}
+
 /// A length or a count as the width the report uses.
 ///
 /// `usize` is never wider than `u64` on anything we build for, so the fallback
@@ -282,11 +310,34 @@ mod platform {
     #[cfg(target_os = "linux")]
     const RUSAGE_WHO: i32 = 1;
 
+    /// The whole calling process, asked for by name.
+    ///
+    /// The high water mark is kept for the process and not for the thread, so
+    /// this is the one to ask about it with even where the fault counts come
+    /// from somewhere narrower.
+    const RUSAGE_PROCESS: i32 = 0;
+
     /// `mincore` sets this bit when the page is resident.
     ///
     /// Linux defines only this bit. The Apple systems define several more and
     /// this is the first of them, so one mask serves both.
     const RESIDENT: u8 = 1;
+
+    /// Where `ru_maxrss` sits among the longs, which is first.
+    const MAXRSS: usize = 0;
+
+    /// What `ru_maxrss` counts in.
+    ///
+    /// Bytes on the Apple systems and kilobytes on Linux and the BSDs. The two
+    /// differ by a factor of a thousand and nothing in the value says which one
+    /// it is, so this is the whole of the difference and it is written down here
+    /// rather than found out later by somebody wondering why a laptop reported a
+    /// hundred gigabytes.
+    #[cfg(target_vendor = "apple")]
+    const MAXRSS_UNIT: u64 = 1;
+    /// What `ru_maxrss` counts in.
+    #[cfg(not(target_vendor = "apple"))]
+    const MAXRSS_UNIT: u64 = 1024;
 
     /// Where `ru_minflt` sits among the longs.
     const MINOR: usize = 4;
@@ -361,6 +412,21 @@ mod platform {
         })
     }
 
+    /// Reads the high water mark.
+    pub fn peak_resident() -> Result<u64, &'static str> {
+        let mut usage = Rusage::zeroed();
+        // SAFETY: `usage` is live, correctly aligned, and at least as large as
+        // this system's `struct rusage`.
+        let rc = unsafe { getrusage(RUSAGE_PROCESS, &raw mut usage) };
+        if rc != 0 {
+            return Err("getrusage refused, so this process cannot see its own high water mark");
+        }
+        Ok(usage.longs[MAXRSS]
+            .max(0)
+            .unsigned_abs()
+            .saturating_mul(MAXRSS_UNIT))
+    }
+
     /// Counts the bytes of `index` that are resident.
     pub fn resident_bytes(index: &[u8], page: usize) -> Result<u64, &'static str> {
         // `mincore` wants a page boundary. A mapped file starts on one, so this
@@ -433,8 +499,9 @@ mod platform {
     struct ProcessMemoryCounters {
         /// The size of this structure, which the call checks.
         cb: u32,
-        /// What this is called for.
+        /// One of the two things this is called for.
         page_fault_count: u32,
+        /// The other one.
         peak_working_set_size: usize,
         working_set_size: usize,
         quota_peak_paged_pool_usage: usize,
@@ -502,8 +569,8 @@ mod platform {
             .unwrap_or(4096)
     }
 
-    /// Reads the fault counter.
-    pub fn faults() -> Result<Faults, &'static str> {
+    /// Reads the process counters, which two of these functions want.
+    fn counters(refused: &'static str) -> Result<ProcessMemoryCounters, &'static str> {
         let mut counters = ProcessMemoryCounters {
             cb: 0,
             page_fault_count: 0,
@@ -524,8 +591,23 @@ mod platform {
         // constant and needs no closing.
         let ok = unsafe { process_memory_info(current_process(), &raw mut counters, size) };
         if ok == 0 {
-            return Err("GetProcessMemoryInfo refused, so this process cannot see its fault count");
+            return Err(refused);
         }
+        Ok(counters)
+    }
+
+    /// Reads the high water mark.
+    pub fn peak_resident() -> Result<u64, &'static str> {
+        let counters = counters(
+            "GetProcessMemoryInfo refused, so this process cannot see its high water mark",
+        )?;
+        Ok(super::as_u64(counters.peak_working_set_size))
+    }
+
+    /// Reads the fault counter.
+    pub fn faults() -> Result<Faults, &'static str> {
+        let counters =
+            counters("GetProcessMemoryInfo refused, so this process cannot see its fault count")?;
         Ok(Faults {
             faults: u64::from(counters.page_fault_count),
             // Windows counts faults but does not say which of them went to
@@ -590,6 +672,11 @@ mod platform {
     /// Says there is nothing to read.
     pub fn faults() -> Result<Faults, &'static str> {
         Err("this platform does not account for page faults")
+    }
+
+    /// Says there is nothing to ask.
+    pub fn peak_resident() -> Result<u64, &'static str> {
+        Err("this platform has no process whose memory can be counted")
     }
 
     /// Says there is nothing to ask.
@@ -764,5 +851,40 @@ mod tests {
         let region = vec![0u8; WARM];
         let failed: Result<((), Counters), &str> = measured(&region, || Err("no such term"));
         assert_eq!(failed.err(), Some("no such term"));
+    }
+
+    #[test]
+    fn a_high_water_mark_never_falls() {
+        // Which is the whole property two readings either side of a piece of
+        // work rely on. If it could fall, a difference of zero would mean
+        // nothing rather than meaning the work stayed under an earlier mark.
+        let Ok(before) = peak_resident() else {
+            return;
+        };
+        let mut region = vec![0u8; 64 << 20];
+        // Written to rather than only allocated, because a page nothing has
+        // touched is a page the system has not had to find memory for.
+        for at in (0..region.len()).step_by(4096) {
+            region[at] = 1;
+        }
+        let after = peak_resident().expect("the same call answered a moment ago");
+        assert!(after >= before, "{after} is below {before}");
+        drop(region);
+        let later = peak_resident().expect("and again");
+        assert!(later >= after, "{later} fell back to below {after}");
+    }
+
+    #[test]
+    fn a_reading_is_in_bytes_and_not_in_whatever_the_system_felt_like() {
+        // The unit is the one thing about this that differs between systems and
+        // the one thing a caller cannot check for itself. A test binary that
+        // has already allocated is worth more than a megabyte and cannot be
+        // worth a terabyte, and those bounds are three orders of magnitude
+        // apart, which is the mistake being guarded against.
+        let Ok(peak) = peak_resident() else {
+            return;
+        };
+        assert!(peak > 1 << 20, "{peak} bytes is too little to be a process");
+        assert!(peak < 1 << 40, "{peak} bytes is too much to be this one");
     }
 }
