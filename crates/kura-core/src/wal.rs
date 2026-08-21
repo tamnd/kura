@@ -211,7 +211,8 @@ fn seal(body: &[u8], position: u64) -> u128 {
 /// it does not have.
 ///
 /// The position is where the record is being read from, and a record does not
-/// decode anywhere else. See [`seal`].
+/// decode anywhere else, because the checksum covers the logical position the
+/// record was written at as well as its bytes.
 pub fn decode(bytes: &[u8], position: u64) -> Result<Record<'_>> {
     let (span, rest) = get_u32(bytes)?;
     let claimed = span as usize;
