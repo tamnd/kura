@@ -25,8 +25,9 @@
 use crate::DocId;
 use crate::analysis::Analyzer;
 use crate::error::Result;
+use crate::explain::{Counters, Off, Tally};
 use crate::index::Reader;
-use crate::posting::Cursor;
+use crate::posting::{BLOCK_SIZE, Cursor};
 
 /// How quickly a term's contribution saturates as it repeats.
 ///
@@ -116,16 +117,36 @@ impl<'a, 'b> Searcher<'a, 'b> {
     ///
     /// Returns an error if a posting list in the index does not decode.
     pub fn count_terms(&self, terms: &[&[u8]]) -> Result<u64> {
-        let mut lists = self.open(terms)?;
+        self.count_with(terms, &mut Off)
+    }
+
+    /// How many documents hold at least one of a query's terms, and what the
+    /// walk did to find out.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a posting list in the index does not decode.
+    pub fn count_explained(&self, query: &str) -> Result<(u64, Counters)> {
+        let words = analyse(query);
+        let terms: Vec<&[u8]> = words.iter().map(Vec::as_slice).collect();
+        let mut counters = Counters::default();
+        let total = self.count_with(&terms, &mut counters)?;
+        Ok((total, counters))
+    }
+
+    fn count_with<T: Tally>(&self, terms: &[&[u8]], tally: &mut T) -> Result<u64> {
+        let mut lists = self.open(terms, tally)?;
         // One term is the common case and its answer is already in the header
         // of its posting list, so nothing needs decoding at all.
         if lists.len() <= 1 {
+            lists.report(tally);
             return Ok(lists.counts.first().map_or(0, |&count| u64::from(count)));
         }
         let mut total = 0;
         loop {
             let (which, doc, second) = lists.front_two();
             if doc == DocId::MAX {
+                lists.report(tally);
                 return Ok(total);
             }
 
@@ -137,14 +158,14 @@ impl<'a, 'b> Searcher<'a, 'b> {
             if let Some(last) = lists.cursors[which].block_last()
                 && last < second
             {
-                total += lists.take_block(which, last)?;
+                total += lists.take_block(which, last, tally)?;
                 continue;
             }
 
             total += 1;
             for at in 0..lists.len() {
                 if lists.heads[at].doc == doc {
-                    lists.advance(at)?;
+                    lists.advance(at, tally)?;
                 }
             }
         }
@@ -179,10 +200,39 @@ impl<'a, 'b> Searcher<'a, 'b> {
     ///
     /// Returns an error if a posting list in the index does not decode.
     pub fn search_and_count_terms(&self, terms: &[&[u8]], k: usize) -> Result<(Vec<Hit>, u64)> {
+        self.search_and_count_with(terms, k, &mut Off)
+    }
+
+    /// The best `k` documents, the total, and a count of what the walk did.
+    ///
+    /// The same answer [`search_and_count`](Self::search_and_count) gives, with
+    /// the numbers that say what it cost. See [`crate::explain`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a posting list in the index does not decode.
+    pub fn search_and_count_explained(
+        &self,
+        query: &str,
+        k: usize,
+    ) -> Result<(Vec<Hit>, u64, Counters)> {
+        let words = analyse(query);
+        let terms: Vec<&[u8]> = words.iter().map(Vec::as_slice).collect();
+        let mut counters = Counters::default();
+        let (hits, total) = self.search_and_count_with(&terms, k, &mut counters)?;
+        Ok((hits, total, counters))
+    }
+
+    fn search_and_count_with<T: Tally>(
+        &self,
+        terms: &[&[u8]],
+        k: usize,
+        tally: &mut T,
+    ) -> Result<(Vec<Hit>, u64)> {
         if k == 0 {
             return Ok((Vec::new(), self.count_terms(terms)?));
         }
-        let mut lists = self.open(terms)?;
+        let mut lists = self.open(terms, tally)?;
         if lists.is_empty() {
             return Ok((Vec::new(), 0));
         }
@@ -191,7 +241,9 @@ impl<'a, 'b> Searcher<'a, 'b> {
             // has to be walked to know it, so the search can prune the way it
             // does when no total was asked for.
             let total = u64::from(lists.counts[0]);
-            return Ok((self.search_terms(terms, k)?, total));
+            let hits = self.search_one(&mut lists, k, tally)?;
+            lists.report(tally);
+            return Ok((hits, total));
         }
 
         let norm = Norm::new(self.k1, self.b, self.index.average_length());
@@ -212,7 +264,7 @@ impl<'a, 'b> Searcher<'a, 'b> {
                 && last < second
                 && lists.block_bound(which, self.k1, floor) <= top.threshold()
             {
-                total += lists.take_block(which, last)?;
+                total += lists.take_block(which, last, tally)?;
                 continue;
             }
 
@@ -235,15 +287,17 @@ impl<'a, 'b> Searcher<'a, 'b> {
                         score += lists.score(at, self.k1, norm);
                     }
                 }
+                tally.scored();
                 top.push(Hit { doc, score });
             }
 
             for at in 0..lists.len() {
                 if lists.heads[at].doc == doc {
-                    lists.advance(at)?;
+                    lists.advance(at, tally)?;
                 }
             }
         }
+        lists.report(tally);
         Ok((top.into_sorted(), total))
     }
 
@@ -258,15 +312,51 @@ impl<'a, 'b> Searcher<'a, 'b> {
     ///
     /// Returns an error if a posting list in the index does not decode.
     pub fn search_terms(&self, terms: &[&[u8]], k: usize) -> Result<Vec<Hit>> {
+        self.search_with(terms, k, &mut Off)
+    }
+
+    /// The best `k` documents, and a count of what the walk did to find them.
+    ///
+    /// The same answer [`search`](Self::search) gives, with the numbers that say
+    /// what it cost. See [`crate::explain`] for what they mean and for why
+    /// asking for them does not change them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a posting list in the index does not decode.
+    pub fn search_explained(&self, query: &str, k: usize) -> Result<(Vec<Hit>, Counters)> {
+        let words = analyse(query);
+        let terms: Vec<&[u8]> = words.iter().map(Vec::as_slice).collect();
+        self.search_terms_explained(&terms, k)
+    }
+
+    /// The best `k` documents for analysed terms, and what the walk did.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a posting list in the index does not decode.
+    pub fn search_terms_explained(
+        &self,
+        terms: &[&[u8]],
+        k: usize,
+    ) -> Result<(Vec<Hit>, Counters)> {
+        let mut counters = Counters::default();
+        let hits = self.search_with(terms, k, &mut counters)?;
+        Ok((hits, counters))
+    }
+
+    fn search_with<T: Tally>(&self, terms: &[&[u8]], k: usize, tally: &mut T) -> Result<Vec<Hit>> {
         if k == 0 || self.index.is_empty() {
             return Ok(Vec::new());
         }
-        let mut lists = self.open(terms)?;
+        let mut lists = self.open(terms, tally)?;
         if lists.is_empty() {
             return Ok(Vec::new());
         }
         if lists.len() == 1 {
-            return self.search_one(&mut lists, k);
+            let hits = self.search_one(&mut lists, k, tally)?;
+            lists.report(tally);
+            return Ok(hits);
         }
 
         let norm = Norm::new(self.k1, self.b, self.index.average_length());
@@ -296,7 +386,7 @@ impl<'a, 'b> Searcher<'a, 'b> {
                 // where they are and the pivot can reach the threshold, so there
                 // is no reason to decode any of it.
                 for &at in &order[..pivot] {
-                    lists.seek(at, candidate)?;
+                    lists.seek(at, candidate, tally)?;
                 }
                 continue;
             }
@@ -318,7 +408,7 @@ impl<'a, 'b> Searcher<'a, 'b> {
                     .max(candidate.saturating_add(1));
                 for at in 0..lists.len() {
                     if lists.heads[at].doc < next {
-                        lists.seek(at, next)?;
+                        lists.seek(at, next, tally)?;
                     }
                 }
                 continue;
@@ -331,16 +421,18 @@ impl<'a, 'b> Searcher<'a, 'b> {
                 score += lists.score(order[moved], self.k1, norm);
                 moved += 1;
             }
+            tally.scored();
             top.push(Hit {
                 doc: candidate,
                 score,
             });
             threshold = top.threshold();
             for &at in &order[..moved] {
-                lists.advance(at)?;
+                lists.advance(at, tally)?;
             }
         }
 
+        lists.report(tally);
         Ok(top.into_sorted())
     }
 
@@ -351,7 +443,12 @@ impl<'a, 'b> Searcher<'a, 'b> {
     /// of them score. What is left of the pruning is the block bound, which
     /// still steps over a whole block whose best posting cannot displace the
     /// worst hit in hand.
-    fn search_one(&self, lists: &mut Lists<'b>, k: usize) -> Result<Vec<Hit>> {
+    fn search_one<T: Tally>(
+        &self,
+        lists: &mut Lists<'b>,
+        k: usize,
+        tally: &mut T,
+    ) -> Result<Vec<Hit>> {
         let norm = Norm::new(self.k1, self.b, self.index.average_length());
         let floor = self.k1 * (1.0 - self.b);
         let mut top = TopK::new(k);
@@ -372,27 +469,30 @@ impl<'a, 'b> Searcher<'a, 'b> {
                     .unwrap_or(doc)
                     .saturating_add(1)
                     .max(doc.saturating_add(1));
-                lists.seek(0, next)?;
+                lists.seek(0, next, tally)?;
                 continue;
             }
+            tally.scored();
             top.push(Hit {
                 doc,
                 score: lists.score(0, self.k1, norm.of(self.index, doc)),
             });
-            lists.advance(0)?;
+            lists.advance(0, tally)?;
         }
 
         Ok(top.into_sorted())
     }
 
     /// Opens a cursor for each term that is in the index.
-    fn open(&self, terms: &[&[u8]]) -> Result<Lists<'b>> {
+    fn open<T: Tally>(&self, terms: &[&[u8]], tally: &mut T) -> Result<Lists<'b>> {
         let documents = self.index.documents();
         let mut lists = Lists {
             heads: Vec::with_capacity(terms.len()),
             cursors: Vec::with_capacity(terms.len()),
             counts: Vec::with_capacity(terms.len()),
         };
+        let mut postings = 0u64;
+        let mut blocks = 0u64;
         for term in terms {
             let Some(list) = self.index.postings(term)? else {
                 continue;
@@ -405,6 +505,13 @@ impl<'a, 'b> Searcher<'a, 'b> {
             let Some(doc) = cursor.advance()? else {
                 continue;
             };
+            postings += u64::from(list.len());
+            // The leftovers at the end of a list are a block as far as a walk is
+            // concerned, so they count as one here.
+            blocks += list.blocks() as u64;
+            if list.len() as usize > list.blocks() * BLOCK_SIZE {
+                blocks += 1;
+            }
             lists.heads.push(Head {
                 doc,
                 idf,
@@ -413,6 +520,13 @@ impl<'a, 'b> Searcher<'a, 'b> {
             lists.cursors.push(cursor);
             lists.counts.push(list.len());
         }
+        // A query with four billion terms in it is not a query, so the saturation
+        // here is a formality rather than a case.
+        tally.opened(
+            u32::try_from(lists.len()).unwrap_or(u32::MAX),
+            postings,
+            blocks,
+        );
         Ok(lists)
     }
 }
@@ -481,25 +595,42 @@ impl Lists<'_> {
     ///
     /// Only sound when the caller has established that no other list reaches
     /// into this block, which [`Lists::front_two`] is what answers.
-    fn take_block(&mut self, at: usize, last: DocId) -> Result<u64> {
+    fn take_block<T: Tally>(&mut self, at: usize, last: DocId, tally: &mut T) -> Result<u64> {
         let taken = self.cursors[at].remaining_in_block() as u64;
         match last.checked_add(1) {
-            Some(next) => self.seek(at, next)?,
+            Some(next) => self.seek(at, next, tally)?,
             None => self.heads[at].doc = DocId::MAX,
         }
         Ok(taken)
     }
 
     /// Moves one list to its next document.
-    fn advance(&mut self, at: usize) -> Result<()> {
+    fn advance<T: Tally>(&mut self, at: usize, tally: &mut T) -> Result<()> {
+        tally.advanced();
         self.heads[at].doc = self.cursors[at].advance()?.unwrap_or(DocId::MAX);
         Ok(())
     }
 
     /// Moves one list to the first document at or after `target`.
-    fn seek(&mut self, at: usize, target: DocId) -> Result<()> {
+    fn seek<T: Tally>(&mut self, at: usize, target: DocId, tally: &mut T) -> Result<()> {
+        tally.sought();
         self.heads[at].doc = self.cursors[at].seek(target)?.unwrap_or(DocId::MAX);
         Ok(())
+    }
+
+    /// Hands the cursors' decode counts to the tally, once the walk is over.
+    ///
+    /// Collected at the end rather than as it happens because the cursor is the
+    /// only thing that knows a block was unpacked and it has no tally to tell.
+    fn report<T: Tally>(&self, tally: &mut T) {
+        let mut blocks = 0;
+        let mut postings = 0;
+        for cursor in &self.cursors {
+            let (b, p) = cursor.decoded();
+            blocks += b;
+            postings += p;
+        }
+        tally.decoded(blocks, postings);
     }
 
     /// The most one term can add to a document in the block its cursor is in.
@@ -986,6 +1117,119 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A corpus shaped like the one the engine is slow on.
+    ///
+    /// One term in every document at a frequency that varies, which is what a
+    /// stop word looks like, and one term in the first two percent of the
+    /// corpus. Where the rare term sits matters: spread evenly it would land in
+    /// every block of the common term's list and there would be nothing to skip
+    /// however good the bound was, so a test that wants to see skipping has to
+    /// put it somewhere.
+    fn skewed(documents: usize) -> Vec<String> {
+        (0..documents)
+            .map(|i| {
+                let repeats = 1 + i % 40;
+                let mut text = "common ".repeat(repeats);
+                for word in 0..8 {
+                    use core::fmt::Write as _;
+                    let _ = write!(text, "word{} ", (i + word) % 500);
+                }
+                if i < documents / 50 {
+                    text.push_str("rare ");
+                }
+                text
+            })
+            .collect()
+    }
+
+    #[test]
+    fn counting_does_not_change_the_answer() {
+        let bytes = build(&DOCS);
+        let segment = Segment::open(&bytes).expect("opens");
+        let index = Reader::open(&segment).expect("opens");
+        let searcher = Searcher::new(&index);
+        for query in ["fox", "the dog fox", "quick brown", "absent"] {
+            let plain = searcher.search(query, 5).expect("searches");
+            let (explained, _) = searcher.search_explained(query, 5).expect("searches");
+            assert_eq!(plain, explained, "{query}");
+        }
+    }
+
+    #[test]
+    fn the_counters_describe_the_lists_the_query_opened() {
+        let docs = skewed(6_000);
+        let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+        let bytes = build(&refs);
+        let segment = Segment::open(&bytes).expect("opens");
+        let index = Reader::open(&segment).expect("opens");
+        let searcher = Searcher::new(&index);
+
+        let (_, counters) = searcher.search_explained("common", 10).expect("searches");
+        assert_eq!(counters.terms, 1);
+        assert_eq!(counters.postings, 6_000);
+        // Forty six full blocks and the leftovers.
+        assert_eq!(counters.blocks, 6_000 / BLOCK_SIZE as u64 + 1);
+        // What the skipped count is subtracted from, so it is worth checking on
+        // a real walk rather than assuming. A cursor that loaded a block twice
+        // would break the subtraction quietly and this is where that shows up.
+        assert!(
+            counters.blocks_decoded <= counters.blocks,
+            "read {} blocks of {}",
+            counters.blocks_decoded,
+            counters.blocks
+        );
+        assert_eq!(counters.advances + counters.seeks, 6_000);
+    }
+
+    #[test]
+    fn a_rare_term_beside_a_common_one_skips_most_of_the_common_one() {
+        // This is the pruning working, and it is the case the block bound was
+        // written for: the rare term's documents are the only candidates, so
+        // most of the common term's blocks never get unpacked.
+        let docs = skewed(6_000);
+        let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+        let bytes = build(&refs);
+        let segment = Segment::open(&bytes).expect("opens");
+        let index = Reader::open(&segment).expect("opens");
+        let searcher = Searcher::new(&index);
+
+        let (_, counters) = searcher
+            .search_explained("rare common", 10)
+            .expect("searches");
+        assert!(
+            counters.skipped() > 0.5,
+            "read {} of {} postings",
+            counters.postings_decoded,
+            counters.postings
+        );
+    }
+
+    #[test]
+    fn a_common_term_on_its_own_skips_nothing_at_all() {
+        // Not an assertion that this is right. It is an assertion of what the
+        // engine does today, which is decode every posting of a term that is in
+        // every document, because the block bound is computed from the largest
+        // frequency in the block with the length normalisation pinned to zero
+        // and is therefore too loose to ever fall under the threshold.
+        //
+        // The fix changes this test, and the test is here so that the fix has to
+        // change it rather than being believed.
+        let docs = skewed(6_000);
+        let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+        let bytes = build(&refs);
+        let segment = Segment::open(&bytes).expect("opens");
+        let index = Reader::open(&segment).expect("opens");
+        let searcher = Searcher::new(&index);
+
+        let (_, counters) = searcher.search_explained("common", 10).expect("searches");
+        assert_eq!(
+            counters.blocks_skipped, 0,
+            "skipped {} of {} blocks, which would mean the bound now fires",
+            counters.blocks_skipped, counters.blocks
+        );
+        assert_eq!(counters.documents_scored, 6_000);
     }
 
     #[test]

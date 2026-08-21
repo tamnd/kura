@@ -23,6 +23,7 @@ pub mod bitpack;
 pub mod checksum;
 pub mod codec;
 pub mod error;
+pub mod explain;
 pub mod index;
 pub mod lz;
 pub mod posting;
