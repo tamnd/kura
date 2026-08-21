@@ -643,6 +643,58 @@ impl Marks {
     }
 }
 
+/// The largest a single document took what the writer holds, and which document
+/// it was.
+///
+/// A budget is checked after a document rather than in the middle of one,
+/// because a document cannot be split across two segments. So what a run with
+/// `--memory` holds is the budget plus this, and this is the only part of that
+/// sum a person setting a budget on their own corpus cannot read off the report.
+#[derive(Debug, Default)]
+struct Steepest<'a> {
+    step: u64,
+    file: Option<&'a Path>,
+    /// What was held before the document being looked at.
+    before: u64,
+}
+
+impl<'a> Steepest<'a> {
+    /// One measuring from what a writer holds before it is given anything.
+    fn from(held: u64) -> Self {
+        Self {
+            before: held,
+            ..Self::default()
+        }
+    }
+
+    /// Takes the reading after a document.
+    fn saw(&mut self, file: &'a Path, held: u64) {
+        if held.saturating_sub(self.before) > self.step {
+            self.step = held - self.before;
+            self.file = Some(file);
+        }
+        self.before = held;
+    }
+
+    /// Says that what is being measured is a fresh writer from here on.
+    fn emptied(&mut self, held: u64) {
+        self.before = held;
+    }
+
+    /// Prints the reading, if there was a document to take one from.
+    fn tell(&self, budget: u64, peak: u64) {
+        if let Some(file) = self.file {
+            println!(
+                "the most one document added was {}, {}, so a budget of {} held {}",
+                report::bytes(self.step),
+                file.display(),
+                report::bytes(budget),
+                report::bytes(peak)
+            );
+        }
+    }
+}
+
 /// Prints what a writer was holding at its largest.
 ///
 /// Split rather than totalled, because the total on its own says a run needs so
@@ -771,6 +823,7 @@ fn index(args: &[String]) -> Result<(), Failure> {
     let mut skipped = 0usize;
     let mut segments = 0usize;
     let mut peak = Held::default();
+    let mut steepest = Steepest::from(writer.held().total());
     let mut marks = Marks::default();
     for file in &files {
         let Ok(content) = fs::read(file) else {
@@ -797,6 +850,7 @@ fn index(args: &[String]) -> Result<(), Failure> {
         if now.total() > peak.total() {
             peak = now;
         }
+        steepest.saw(file, now.total());
 
         // The budget is checked after the document rather than before it,
         // because a budget that stopped short of a document would be a budget
@@ -807,6 +861,10 @@ fn index(args: &[String]) -> Result<(), Failure> {
             written += size;
             documents += count;
             pending = 0;
+            // The writer this measures is a new one, so the next document is a
+            // step from what an empty writer holds rather than from what the one
+            // that was just written out did.
+            steepest.emptied(writer.held().total());
         }
     }
 
@@ -853,6 +911,9 @@ fn index(args: &[String]) -> Result<(), Failure> {
         took
     );
     tell_held(peak);
+    if let Some(budget) = memory {
+        steepest.tell(budget, peak.total());
+    }
     marks.tell();
     if into_store {
         println!("{} now holds {segments} segments", out.display());
@@ -1285,6 +1346,41 @@ impl fmt::Display for Failure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_steepest_document_is_the_one_that_added_the_most() {
+        let mut steepest = Steepest::from(1_000);
+        steepest.saw(Path::new("small"), 1_500);
+        steepest.saw(Path::new("large"), 4_000);
+        steepest.saw(Path::new("also small"), 4_100);
+        assert_eq!(steepest.step, 2_500);
+        assert_eq!(steepest.file, Some(Path::new("large")));
+    }
+
+    #[test]
+    fn a_document_after_a_flush_is_measured_from_the_empty_writer() {
+        // Without this the first document of a new segment reads as a fall
+        // rather than a step, because what the writer holds drops when it is
+        // written out, and the largest step in a run with a small budget is
+        // exactly the document that follows a flush.
+        let mut steepest = Steepest::from(1_000);
+        steepest.saw(Path::new("filled it up"), 9_000);
+        steepest.emptied(1_000);
+        steepest.saw(Path::new("first after the flush"), 5_000);
+        assert_eq!(steepest.step, 8_000);
+        assert_eq!(steepest.file, Some(Path::new("filled it up")));
+
+        steepest.saw(Path::new("bigger"), 15_000);
+        assert_eq!(steepest.step, 10_000);
+        assert_eq!(steepest.file, Some(Path::new("bigger")));
+    }
+
+    #[test]
+    fn a_run_that_indexed_nothing_has_no_steepest_document() {
+        let steepest = Steepest::from(1_000);
+        assert_eq!(steepest.file, None);
+        assert_eq!(steepest.step, 0);
+    }
 
     #[test]
     fn a_text_file_with_one_bad_byte_is_still_text() {
