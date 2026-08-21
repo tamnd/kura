@@ -26,6 +26,8 @@
 //! measurement, and having the number available unconditionally is what lets a
 //! caller ask a cursor what it cost after the fact.
 
+use crate::residency::Residency;
+
 /// What one query did, in counts rather than in time.
 ///
 /// Every field is a number a person can check by hand against a small index,
@@ -68,6 +70,14 @@ pub struct Counters {
     pub seeks: u64,
     /// How many times a cursor was moved to its next document.
     pub advances: u64,
+    /// What the query cost in memory, when somebody asked.
+    ///
+    /// The odd one out. Every other field here is filled in by the walk as it
+    /// goes, and this one is filled in by whoever wrapped the walk, because
+    /// faults are counted by the operating system around a span of time rather
+    /// than by the code inside it. `None` means nobody asked. See
+    /// [`residency`](crate::residency) for what it can and cannot say.
+    pub residency: Option<Residency>,
 }
 
 impl Counters {

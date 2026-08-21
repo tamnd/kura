@@ -1115,6 +1115,10 @@ fn queries(searcher: &Searcher<'_, '_>) {
                 documents_scored: counting.documents_scored + searching.documents_scored,
                 seeks: counting.seeks + searching.seeks,
                 advances: counting.advances + searching.advances,
+                // Neither walk was probed, and two readings would not add up
+                // anyway, because faults are counted over a span of time and a
+                // span of time is not a thing two of can be summed.
+                residency: None,
             }
         }),
     );

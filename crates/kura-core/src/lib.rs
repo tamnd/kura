@@ -27,6 +27,7 @@ pub mod explain;
 pub mod index;
 pub mod lz;
 pub mod posting;
+pub mod residency;
 pub mod search;
 pub mod segment;
 pub mod store;
