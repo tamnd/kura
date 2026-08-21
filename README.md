@@ -27,7 +27,8 @@ The crate holds the pieces the rest is built out of, and each one is tested and 
 
 - **Integer codecs.** LEB128 varints with zigzag mapping for signed values, which is what carries the lengths, the offsets and the runs too short to be worth packing.
 - **Posting lists.** Fixed size blocks packed at a width chosen per block, with a skip table, so a membership test on a list of millions decodes one block rather than all of them.
-  The blocks decode four ids at a time, which is what makes reading them three times faster than reading the same ids as varints, at a little over half the size.
+  The blocks are laid out the way FastLanes describes, four ids to a step, and there is a decoder compiled for each of the thirty two widths so that every shift and mask in it is a constant.
+  That makes reading them six times faster than reading the same ids as varints, at half the size.
   Term frequencies ride alongside the ids in a second packed stream that a caller only pays for when it reads it, and each block carries the largest frequency in it so a scorer can skip a block whose best possible contribution cannot reach the current cutoff.
 - **Term dictionary.** Terms in order, in blocks of sixteen, with the shared prefix folded out and one index entry per block.
   A lookup binary searches the index and then walks a block, so it touches two cache lines rather than the whole vocabulary, and the folding makes the dictionary smaller than the terms it holds even though it also stores three numbers for each of them.
