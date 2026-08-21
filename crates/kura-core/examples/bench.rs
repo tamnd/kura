@@ -386,6 +386,27 @@ fn stores() {
         }
     });
 
+    compression(&corpus);
+}
+
+/// What the compressor costs and what it buys, on its own.
+///
+/// The store row above is the number that counts, because it is the compressor
+/// running the way the engine runs it. This is the compressor with the store
+/// taken off it, which is what says whether a change to the compressor is what
+/// moved the store.
+///
+/// Both block sizes are here for the same reason. The whole corpus as one block
+/// is the rate the format can reach and is not something the engine ever asks
+/// for. Eight kilobytes is what a segment is written in, and a block that small
+/// has far less history to find matches in, so its ratio is the one that ends
+/// up on disk.
+fn compression(corpus: &[String]) {
+    /// What the store writes at a time, kept here as its own copy because the
+    /// one in the store is private and this row is measuring the compressor and
+    /// not the store.
+    const BLOCK: usize = 8 * 1024;
+
     let text: String = corpus[..2_000].concat();
     let mut compressed = Vec::new();
     let mut compressor = lz::Compressor::new();
@@ -412,6 +433,41 @@ fn stores() {
             ("input_bytes", text.len() as f64),
             ("output_bytes", compressed.len() as f64),
             ("ratio", compressed.len() as f64 / text.len() as f64),
+        ],
+    );
+
+    let mut blocks: Vec<(usize, Vec<u8>)> = Vec::new();
+    bench("compress it in blocks the store's size", text.len(), || {
+        blocks.clear();
+        for chunk in text.as_bytes().chunks(BLOCK) {
+            let mut out = Vec::new();
+            compressor.compress(chunk, &mut out);
+            blocks.push((chunk.len(), out));
+        }
+        black_box(&blocks);
+    });
+    bench("decompress those blocks", text.len(), || {
+        for (len, block) in &blocks {
+            back.clear();
+            lz::decompress(block, *len, &mut back).expect("what was written decodes");
+            black_box(&back);
+        }
+    });
+    let blocked: usize = blocks.iter().map(|(_, block)| block.len()).sum();
+    fact(
+        "compress_blocked",
+        &format!(
+            "compress in blocks: {:.1} MB into {:.1} MB, {:.2} of the input, {} blocks",
+            text.len() as f64 / 1e6,
+            blocked as f64 / 1e6,
+            blocked as f64 / text.len() as f64,
+            blocks.len(),
+        ),
+        vec![
+            ("input_bytes", text.len() as f64),
+            ("output_bytes", blocked as f64),
+            ("ratio", blocked as f64 / text.len() as f64),
+            ("blocks", blocks.len() as f64),
         ],
     );
 }

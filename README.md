@@ -41,6 +41,8 @@ The crate holds the pieces the rest is built out of, and each one is tested and 
   A total is a separate call from a page, because a total cannot be pruned and most callers do not need one.
 - **Stored fields.** The values that come back with a hit, held beside the index rather than in it.
   Field names go in a dictionary at the front and each value refers to its name by number, and the offset array narrows to four bytes per document when the payload fits, which for a corpus of short documents is most of what the section costs.
+  The text itself is compressed in blocks of eight kilobytes in the LZ4 format, so a lookup decompresses one block rather than the file, and any other LZ4 implementation reads a block written here.
+  The match finder keeps a chain per hash rather than one candidate, which puts a quarter of a megabyte in the writer and takes a fifth off the largest section in a segment.
 - **Bitmaps.** A set of document ids held the Roaring way, cut into chunks of 65536, with each chunk kept as a sorted list, a block of words or a list of runs, whichever of the three is smallest for what is in it.
   This is what a permission filter runs on, which is why it matters that a reader in a company wide group costs three and a half kilobytes rather than six hundred, and a contractor with a few thousand ids scattered across a hundred million documents costs sixty nine kilobytes rather than twelve megabytes.
 - **Vectors.** Cosine similarity, unit normalisation and eight bit quantisation with a per vector scale, which cuts the memory a corpus costs by four with a bounded error.

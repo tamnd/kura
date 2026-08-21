@@ -23,7 +23,7 @@
 //! stored fields of ten. Spending a decompression on those ten to make the
 //! whole file half the size is the easiest trade in the format.
 //!
-//! Records are packed into blocks of about sixteen kilobytes and each block is
+//! Records are packed into blocks of about eight kilobytes and each block is
 //! compressed on its own. Compressing the whole store as one stream would give
 //! up random access, and compressing each document on its own would throw away
 //! the repetition between documents, which on a real corpus is most of what
@@ -56,17 +56,20 @@ use crate::lz;
 /// How much raw record data a block holds before the next document starts a new
 /// one.
 ///
-/// The trade is compression against the cost of one lookup, and it is lopsided.
-/// Over fifty thousand generated documents of about five kilobytes each, four
-/// kilobyte blocks stored the corpus at 0.40 of its size and read a document in
-/// 4.1 microseconds, eight at 0.39 and 5.9, sixteen at 0.38 and 9.6, and thirty
-/// two at 0.37 and 16.7. Quadrupling the block buys three percent of the size
-/// and costs four times the read.
+/// The trade is compression against the cost of one lookup. Over fifty thousand
+/// generated documents of about five kilobytes each, four kilobyte blocks stored
+/// the corpus at 0.322 of its size and read a document in 2.7 microseconds,
+/// eight at 0.314 and 3.3, sixteen at 0.286 and 6.2, and thirty two at 0.264 and
+/// 14.3.
 ///
-/// Eight is the point where the ratio has nearly stopped moving. Documents
-/// shorter than this share a block and compress against each other, which is
-/// where blocking earns its keep; documents longer than it are on their own
-/// either way.
+/// Eight is where the ratio is still nearly free. Documents shorter than this
+/// share a block and compress against each other, which is where blocking earns
+/// its keep; documents longer than it are on their own either way. Going on to
+/// sixteen is nine percent of the section for twice the read, and that is a
+/// trade rather than a mistake, so it is written down here rather than settled.
+/// A caller that reads a page of hits at a time pays the read once for the whole
+/// page and would take the ratio, and a caller that fetches scattered documents
+/// would not.
 const BLOCK: usize = 8 * 1024;
 
 /// The size of one entry in the block directory.
