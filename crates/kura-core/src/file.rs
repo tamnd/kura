@@ -20,6 +20,21 @@
 //! own checksum covers. See [`crate::manifest`] for why that is not the design
 //! it started as.
 //!
+//! # The log is a different promise
+//!
+//! A commit is durable when it returns. An append is not, and that is the point
+//! of having both. Appending puts a record in the log region and returns, and
+//! syncing puts everything appended so far on the platter, so a batch of writers
+//! that arrived together pay for one fsync between them rather than one each.
+//! Nothing has been promised to anybody until the sync returns, and what happens
+//! between the two is the writer's business rather than this module's.
+//!
+//! Recovery reads the log forward from the head the last commit named. It does
+//! not stop where that commit said the tail was, because the records past it are
+//! the ones a store that stopped without warning needs, and it does not read the
+//! whole region either, because that region is a quarter of a gigabyte of mostly
+//! nothing. It reads a window at a time and follows the records through it.
+//!
 //! # Positioned reads and writes
 //!
 //! Every read and write here names its own offset rather than seeking first. Two
@@ -44,6 +59,7 @@ use crate::error::Error;
 use crate::manifest::{
     Committed, Manifest, SLOT_A_OFFSET, SLOT_B_OFFSET, SLOT_LEN, SUPERBLOCK_LEN, Slot, Superblock,
 };
+use crate::wal::{self, MIN_RECORD, Record, Ring};
 
 #[cfg(not(any(unix, windows)))]
 compile_error!(
@@ -115,6 +131,9 @@ pub struct Store {
     /// Which slot the committed state is in, so the next commit knows which one
     /// it is free to overwrite.
     slot: Slot,
+    /// Where the log is up to, which runs ahead of the committed manifest
+    /// between commits and is written into the next one.
+    log: Ring,
 }
 
 impl Store {
@@ -135,12 +154,25 @@ impl Store {
     /// The manifest it writes describes no segments and cannot be too large for
     /// its slot.
     pub fn create(path: &Path, store: u128, created: u64) -> Result<Self> {
+        Self::create_with_log(path, store, created, crate::manifest::DEFAULT_WAL_LEN)
+    }
+
+    /// Creates a store whose log region is a size of the caller's choosing.
+    ///
+    /// As [`Store::create`], except that the log is not the default quarter of a
+    /// gigabyte. It is fixed for the life of the store, because the segments
+    /// start where it ends.
+    ///
+    /// # Errors
+    ///
+    /// As [`Store::create`].
+    pub fn create_with_log(path: &Path, store: u128, created: u64, wal_len: u64) -> Result<Self> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
             .open(path)?;
-        let superblock = Superblock::new(store, created);
+        let superblock = Superblock::with_log(store, created, wal_len);
         let manifest = Manifest::empty(created);
         // The file is given its full length up front so that the regions the
         // superblock names exist before anything claims they do. It is a sparse
@@ -152,11 +184,18 @@ impl Store {
         // Everything, not just the data, because the length of the file is part
         // of what has to survive here.
         file.sync_all()?;
+        let log = Ring::new(
+            superblock.wal_len,
+            manifest.wal_head,
+            manifest.wal_tail,
+            manifest.wal_sequence,
+        )?;
         Ok(Self {
             file,
             superblock,
             manifest,
             slot: Slot::A,
+            log,
         })
     }
 
@@ -185,11 +224,18 @@ impl Store {
         read_at(&file, &mut a, SLOT_A_OFFSET)?;
         read_at(&file, &mut b, SLOT_B_OFFSET)?;
         let Committed { slot, manifest } = crate::manifest::recover(&a, &b)?;
+        let log = Ring::new(
+            superblock.wal_len,
+            manifest.wal_head,
+            manifest.wal_tail,
+            manifest.wal_sequence,
+        )?;
         Ok(Self {
             file,
             superblock,
             manifest,
             slot,
+            log,
         })
     }
 
@@ -211,6 +257,75 @@ impl Store {
         self.slot
     }
 
+    /// Where the log is up to.
+    ///
+    /// Ahead of the committed manifest whenever something has been appended
+    /// since the last commit, which is the ordinary state of a store that is
+    /// being written to.
+    #[must_use]
+    pub const fn log(&self) -> &Ring {
+        &self.log
+    }
+
+    /// Appends a record to the log and returns the sequence it was given.
+    ///
+    /// This does not make anything durable. The bytes are with the operating
+    /// system when it returns and on the platter when [`Store::sync`] returns,
+    /// and the gap between those two is deliberate: it is what lets a batch of
+    /// writers that arrived together share one fsync instead of paying for one
+    /// each. Deciding when to close that gap is the writer's job and not this
+    /// one's.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Trouble::Format`] with [`Error::LogFull`] if the record does
+    /// not fit in what the log has free, which is a signal to flush a segment
+    /// and truncate rather than a failure of the store, and [`Trouble::Io`] if
+    /// the write fails. Either way the log is where it was, because the ring
+    /// only moves once the bytes are written.
+    pub fn append(&mut self, kind: u32, payload: &[u8]) -> Result<u64> {
+        let placement = self.log.place(payload.len())?;
+        let base = self.superblock.wal_offset;
+        if let Some((at, span)) = placement.pad {
+            let mut bytes = Vec::with_capacity(MIN_RECORD);
+            wal::encode_pad(span, placement.sequence, at, &mut bytes);
+            write_at(&self.file, &bytes, base + self.log.physical(at))?;
+        }
+        let mut bytes = Vec::with_capacity(as_usize(u64::from(placement.span)));
+        wal::encode(kind, placement.sequence, payload, placement.at, &mut bytes)?;
+        write_at(&self.file, &bytes, base + self.log.physical(placement.at))?;
+        Ok(self.log.taken(&placement))
+    }
+
+    /// Puts everything appended since the last one on the platter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Trouble::Io`] if the sync fails, which is the one failure that
+    /// cannot be recovered from by trying again, since the platform is entitled
+    /// to have thrown the writes away.
+    pub fn sync(&self) -> Result<()> {
+        self.file.sync_data()?;
+        Ok(())
+    }
+
+    /// Frees the log up to `through`.
+    ///
+    /// Called once the records before that position are in a segment and the
+    /// manifest naming that segment has been committed. Nothing is written here:
+    /// the head moves in memory and reaches the file with the next commit, which
+    /// is the right order, because a head that ran ahead of the commit would
+    /// free records the store still needs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Trouble::Format`] with [`Error::BadPositions`] if the position
+    /// is behind the head or past the tail.
+    pub fn truncate_log(&mut self, through: u64) -> Result<()> {
+        self.log.truncate(through)?;
+        Ok(())
+    }
+
     /// Commits a new manifest, and returns the epoch it was given.
     ///
     /// The epoch is assigned here rather than taken from the caller. Everything
@@ -222,6 +337,12 @@ impl Store {
     /// stopped at any point before it returned, the store would come back at the
     /// state before this call, whole.
     ///
+    /// The log positions are taken from the log rather than from the caller, for
+    /// the same reason the epoch is. They say which records the store still
+    /// needs, and a manifest that disagrees with the ring it describes is a
+    /// store that either replays records it has already applied or loses records
+    /// it has not.
+    ///
     /// # Errors
     ///
     /// Returns [`Trouble::Format`] if the manifest is too large for a slot, and
@@ -232,6 +353,9 @@ impl Store {
         let mut next = manifest;
         next.epoch = self.manifest.epoch.saturating_add(1);
         next.written = written;
+        next.wal_head = self.log.head();
+        next.wal_tail = self.log.tail();
+        next.wal_sequence = self.log.sequence();
         let bytes = next.encode()?;
         let slot = self.slot.other();
         write_at(&self.file, &bytes, slot.offset())?;
@@ -243,6 +367,116 @@ impl Store {
         self.slot = slot;
         Ok(self.manifest.epoch)
     }
+
+    /// Walks the records the log holds and hands each one to `each`.
+    ///
+    /// This is what a store does after opening one that was not closed: the
+    /// manifest says what is in segments, and the log says what was promised
+    /// after that and never got there. Records arrive oldest first, and when it
+    /// returns the log is positioned at the end of what was really written, so
+    /// the next append carries on from there.
+    ///
+    /// The walk starts at the committed head and stops at the first record that
+    /// is damaged, that runs off the end of the region, or whose sequence does
+    /// not continue the one before it. It does not stop at the committed tail,
+    /// because a store that stopped without warning has records past it and
+    /// those are exactly the ones worth having.
+    ///
+    /// One case is not covered yet. A record torn in the middle of a run leaves
+    /// intact records from that same run behind it, at the positions and with
+    /// the numbering they were written with. The walk stops at the torn one, as
+    /// it should, but if the next record appended over it happens to be exactly
+    /// as long as the record it replaced, then the intact one behind it lines up
+    /// again and a later walk reads it. It was a real record, so nothing catches
+    /// it, and replaying it applies a write the store never promised. Closing
+    /// that means resuming on a fresh lap after an unclean recovery, which needs
+    /// the checkpoint path this does not have yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Trouble::Io`] if the log cannot be read. Damage in the log is
+    /// not an error: it is where the log ends, and a torn record at the end is
+    /// the ordinary shape of a machine that lost power midway through a write.
+    pub fn recover(&mut self, mut each: impl FnMut(&Record<'_>)) -> Result<u64> {
+        let ring = self.superblock.wal_len;
+        let base = self.superblock.wal_offset;
+        let head = self.manifest.wal_head;
+        // One lap and no more. Past that the walk would be reading records it
+        // has already read, and a ring that somehow chains all the way round
+        // would otherwise never end.
+        let stop = head.saturating_add(ring);
+        let mut position = head;
+        let mut expected: Option<u64> = None;
+        let mut window = vec![0u8; WINDOW];
+        let mut count = 0u64;
+        'walk: while position < stop {
+            let physical = position % ring;
+            let lap = ring - physical;
+            if lap < MIN_RECORD as u64 {
+                // Too close to the end of the region for a record to start, so
+                // the writer wrapped here and so does this.
+                position += lap;
+                continue;
+            }
+            let want = as_usize(lap.min(window.len() as u64));
+            read_at(&self.file, &mut window[..want], base + physical)?;
+            let mut offset = 0;
+            while offset + MIN_RECORD <= want {
+                let span = as_usize(u64::from(span_of(&window[offset..])?));
+                if span > want - offset {
+                    if span as u64 > lap - offset as u64 {
+                        // A record cannot claim more than the lap it is in, so
+                        // whatever this is, it is not one.
+                        break 'walk;
+                    }
+                    // It runs past the window rather than past the region, so
+                    // widen the window and read it again from where it starts.
+                    if span > window.len() {
+                        window.resize(span, 0);
+                    }
+                    break;
+                }
+                let Ok(record) = wal::decode(&window[offset..offset + span], position) else {
+                    break 'walk;
+                };
+                if expected.is_some_and(|expected| record.sequence != expected) {
+                    break 'walk;
+                }
+                offset += span;
+                position += span as u64;
+                if record.kind == wal::kind::PAD {
+                    expected = Some(record.sequence);
+                    continue;
+                }
+                expected = Some(record.sequence.saturating_add(1));
+                each(&Record { position, ..record });
+                count += 1;
+            }
+        }
+        // The committed sequence is a floor and not a starting point. A replay
+        // that ended early because a record was torn would otherwise hand out
+        // numbers the ring has already seen, and those are the one thing that
+        // tells a stale lap from a live one.
+        let sequence = expected
+            .unwrap_or(self.manifest.wal_sequence)
+            .max(self.manifest.wal_sequence);
+        self.log = Ring::new(ring, head, position, sequence)?;
+        Ok(count)
+    }
+}
+
+/// How much of the log a recovery reads at a time.
+///
+/// Big enough that one read covers many records, so a recovery is a handful of
+/// them rather than one per record, and small enough to be nothing beside the
+/// region, which is a quarter of a gigabyte by default and not something to pull
+/// into memory to find out that it is empty.
+const WINDOW: usize = 1 << 20;
+
+/// The length a record at the front of `bytes` claims.
+fn span_of(bytes: &[u8]) -> Result<u32> {
+    let (span, _) = crate::codec::get_u32(bytes)?;
+    Ok(span)
 }
 
 /// Reads exactly `buf.len()` bytes from `offset`.
@@ -504,6 +738,213 @@ mod tests {
         let store = Store::open(&path).expect("a store");
         assert_eq!(store.manifest().epoch, 65);
         assert_eq!(store.manifest().terms, 64_000);
+    }
+
+    /// A log region small enough that a test can go round it, and a whole page,
+    /// because everything structural in a store is page aligned.
+    const RING: u64 = 4096;
+
+    /// A payload that says which record it came from.
+    fn payload(n: u64, len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|i| u8::try_from((n + i as u64) % 251).unwrap_or_default())
+            .collect()
+    }
+
+    /// Every record in the log, as a recovery sees them.
+    fn replayed(store: &mut Store) -> Vec<(u32, u64, Vec<u8>)> {
+        let mut found = Vec::new();
+        store
+            .recover(|record| found.push((record.kind, record.sequence, record.payload.to_vec())))
+            .expect("recovered");
+        found
+    }
+
+    #[test]
+    fn a_new_store_has_an_empty_log() {
+        let path = path("emptylog");
+        let mut store = Store::create_with_log(&path, STORE, 1, RING).expect("a store");
+        assert!(store.log().is_empty());
+        assert_eq!(store.log().len(), RING);
+        assert_eq!(store.log().sequence(), 1);
+        assert!(replayed(&mut store).is_empty());
+    }
+
+    #[test]
+    fn what_is_appended_to_the_log_is_there_when_the_store_is_opened_again() {
+        let path = path("append");
+        {
+            let mut store = Store::create_with_log(&path, STORE, 1, RING).expect("a store");
+            for n in 0..8 {
+                let sequence = store
+                    .append(wal::kind::UPSERT, &payload(n, 40))
+                    .expect("appended");
+                assert_eq!(sequence, n + 1);
+            }
+            store.sync().expect("synced");
+        }
+        // Nothing was committed after the appends, so the manifest still says
+        // the log is empty. The records are found anyway, which is the whole
+        // point: the committed tail is a floor and not a fact.
+        let mut store = Store::open(&path).expect("a store");
+        assert_eq!(store.manifest().wal_tail, 0);
+        let found = replayed(&mut store);
+        assert_eq!(found.len(), 8);
+        for (n, (kind, sequence, bytes)) in found.iter().enumerate() {
+            let n = n as u64;
+            assert_eq!(*kind, wal::kind::UPSERT);
+            assert_eq!(*sequence, n + 1);
+            assert_eq!(*bytes, payload(n, 40));
+        }
+        assert_eq!(store.log().sequence(), 9);
+    }
+
+    #[test]
+    fn a_recovery_follows_the_log_round_the_ring_without_reading_the_lap_before() {
+        let path = path("lap");
+        let tail = {
+            let mut store = Store::create_with_log(&path, STORE, 1, RING).expect("a store");
+            for n in 0..16 {
+                store
+                    .append(wal::kind::UPSERT, &payload(n, 200))
+                    .expect("appended");
+            }
+            // Everything so far is in a segment, as far as this test is
+            // concerned, so the log is free to move over it.
+            let through = store.log().tail();
+            store.truncate_log(through).expect("truncated");
+            let manifest = store.manifest().clone();
+            store.commit(manifest, 2).expect("committed");
+            for n in 100..110 {
+                store
+                    .append(wal::kind::DELETE, &payload(n, 200))
+                    .expect("appended");
+            }
+            store.sync().expect("synced");
+            store.log().tail()
+        };
+        let mut store = Store::open(&path).expect("a store");
+        let found = replayed(&mut store);
+        assert_eq!(
+            found.len(),
+            10,
+            "the walk did not stop where this lap stopped"
+        );
+        for (n, (kind, _, bytes)) in found.iter().enumerate() {
+            assert_eq!(*kind, wal::kind::DELETE);
+            assert_eq!(*bytes, payload(100 + n as u64, 200));
+        }
+        assert_eq!(store.log().tail(), tail);
+        assert_eq!(store.log().sequence(), 27);
+    }
+
+    #[test]
+    fn a_torn_record_is_where_the_log_ends_and_the_next_append_takes_its_place() {
+        let path = path("tornlog");
+        let at = {
+            let mut store = Store::create_with_log(&path, STORE, 1, RING).expect("a store");
+            store
+                .append(wal::kind::UPSERT, &payload(1, 40))
+                .expect("appended");
+            store
+                .append(wal::kind::UPSERT, &payload(2, 40))
+                .expect("appended");
+            let at = store.log().tail();
+            for n in 3..5 {
+                store
+                    .append(wal::kind::UPSERT, &payload(n, 40))
+                    .expect("appended");
+            }
+            store.sync().expect("synced");
+            at
+        };
+        // A record that was being written when the machine stopped.
+        damage(&path, crate::manifest::WAL_OFFSET + at + 20);
+        {
+            let mut store = Store::open(&path).expect("a store");
+            let found = replayed(&mut store);
+            assert_eq!(found.len(), 2);
+            assert_eq!(store.log().tail(), at);
+            assert_eq!(store.log().sequence(), 3);
+            // And the log carries on from there, into the bytes the torn record
+            // and the one after it were in.
+            store
+                .append(wal::kind::COMMIT, &payload(9, 12))
+                .expect("appended");
+            store.sync().expect("synced");
+        }
+        let mut store = Store::open(&path).expect("a store");
+        let found = replayed(&mut store);
+        assert_eq!(found.len(), 3);
+        assert_eq!(found[2].0, wal::kind::COMMIT);
+        assert_eq!(found[2].1, 3);
+        assert_eq!(found[2].2, payload(9, 12));
+    }
+
+    #[test]
+    fn a_record_that_does_not_fit_the_log_is_refused_and_the_log_does_not_move() {
+        let path = path("full");
+        let mut store = Store::create_with_log(&path, STORE, 1, RING).expect("a store");
+        store
+            .append(wal::kind::UPSERT, &payload(1, 40))
+            .expect("appended");
+        let (tail, sequence) = (store.log().tail(), store.log().sequence());
+        let error = store
+            .append(wal::kind::UPSERT, &payload(2, as_usize(RING)))
+            .expect_err("too big");
+        assert!(
+            matches!(error, Trouble::Format(Error::LogFull { .. })),
+            "{error:?}"
+        );
+        assert_eq!(store.log().tail(), tail);
+        assert_eq!(store.log().sequence(), sequence);
+        assert_eq!(replayed(&mut store).len(), 1);
+    }
+
+    #[test]
+    fn a_record_larger_than_a_recovery_window_is_read_on_its_own() {
+        let path = path("window");
+        let big = WINDOW + WINDOW / 2;
+        {
+            let mut store =
+                Store::create_with_log(&path, STORE, 1, 8 * 1024 * 1024).expect("a store");
+            store
+                .append(wal::kind::UPSERT, &payload(1, 64))
+                .expect("appended");
+            store
+                .append(wal::kind::UPSERT, &payload(2, big))
+                .expect("appended");
+            store
+                .append(wal::kind::UPSERT, &payload(3, 64))
+                .expect("appended");
+            store.sync().expect("synced");
+        }
+        let mut store = Store::open(&path).expect("a store");
+        let found = replayed(&mut store);
+        assert_eq!(found.len(), 3);
+        assert_eq!(found[1].2, payload(2, big));
+        assert_eq!(found[2].2, payload(3, 64));
+    }
+
+    #[test]
+    fn a_commit_writes_where_the_log_is_rather_than_what_the_caller_says() {
+        let path = path("logcommit");
+        let mut store = Store::create_with_log(&path, STORE, 1, RING).expect("a store");
+        store
+            .append(wal::kind::UPSERT, &payload(1, 40))
+            .expect("appended");
+        let mut manifest = store.manifest().clone();
+        // Numbers a caller has no business setting, and which would cost the
+        // store a record each if they were taken at face value.
+        manifest.wal_head = 900;
+        manifest.wal_tail = 900;
+        manifest.wal_sequence = 900;
+        store.commit(manifest, 2).expect("committed");
+        assert_eq!(store.manifest().wal_head, 0);
+        assert_eq!(store.manifest().wal_tail, store.log().tail());
+        assert_eq!(store.manifest().wal_sequence, 2);
+        let mut store = Store::open(&path).expect("a store");
+        assert_eq!(replayed(&mut store).len(), 1);
     }
 
     /// Changes one byte of a file in place, which is what a torn write leaves.
