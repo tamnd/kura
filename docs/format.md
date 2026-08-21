@@ -150,11 +150,17 @@ The dictionary and the stored fields are intact, the postings are not, and that 
 | 8 | tombstones | documents deleted by a later segment |
 | 9 | norms | how long each document is, and how long they are on average |
 | 10 | bounds | the best score each block of postings can reach, which is what block max pruning compares against |
+| 11 | keys | the primary key of each document that has one, sorted, with the document number beside it |
+| 12 | key filter | a bloom filter over those keys, so a segment that does not hold a key can say so without the table being read |
 
 A section may be absent, and an absent section is not the same as an empty one.
 A term dictionary with no terms is a fact about the segment.
 A missing term dictionary is a fact about the build that wrote it.
 The reader keeps them apart, and so should anything built on top.
+
+The keys and the key filter are the one pair that has to be absent or present together.
+A filter without a table can say a key is probably here and then produce nothing, and a table without a filter is searched by every lookup for every key it does not hold, which is the case the filter exists for.
+A segment with one and not the other is refused rather than read.
 
 ## Sections that are worked out from other sections
 
@@ -254,6 +260,11 @@ That is the shape you want: opening should cost what the table costs, and verify
 For a memory mapped file the difference is larger still, since verifying means faulting in every page rather than the one the table lives on.
 That trade is worth making for a segment this process wrote and published and has not touched since.
 It is not worth making for a file that arrived from somewhere else.
+
+The key lookup path is where that trade was taken next.
+A lookup by primary key opens every segment in the store, asks its filter and moves on, so opening is the whole of what it does apart from the probe.
+On a ten segment store of eleven thousand documents keyed by path, verifying the digests on the way in made a lookup 511 microseconds and skipping them made it 615 nanoseconds, on the same machine and the same store.
+The segments were written by this process and published, and a store that wants its bytes proved has `kura-cli verify` for that, which reads every segment once instead of once per key.
 
 Verifying runs at about 19 GB/s on that machine, which is what xxh3-128 gets on thirty two megabytes that do not fit in cache.
 The CRC-32 it replaced gets about 3 GB/s, and got 538 MB/s before it was rewritten to consume sixteen bytes at a time.

@@ -22,7 +22,7 @@ use crate::codec::{get_u32, get_u64, get_uvarint, put_u32, put_u64, put_uvarint}
 use crate::error::{Error, Result};
 use crate::search::{B, K1};
 use crate::segment::{Segment, Writer as SegmentWriter, kind};
-use crate::{DocId, bitmap::Bitmap, bound, posting, store, terms};
+use crate::{DocId, bitmap::Bitmap, bound, filter, keys, posting, store, terms};
 
 /// The size of one link in a term's posting chain, in bytes.
 ///
@@ -305,6 +305,15 @@ pub struct Writer {
     /// section is written at all. An index nobody asks values back from should
     /// not carry eight bytes per document saying so.
     stored: bool,
+    /// The primary key of each document that was given one, in the order they
+    /// were given rather than in order. They are sorted once, in
+    /// [`Writer::build`], because that is where the parts are folded and the
+    /// document numbers move, so sorting here would sort the wrong numbers.
+    keys: Vec<(Box<[u8]>, DocId)>,
+    /// How many bytes those keys come to, kept as they arrive because
+    /// [`Writer::held`] is asked after every document and walking the keys to
+    /// add them up would make a budgeted run quadratic.
+    key_bytes: u64,
     /// How much this writer is willing to hold before it says it is full, if
     /// anybody said.
     budget: Option<u64>,
@@ -333,6 +342,9 @@ pub struct Held {
     /// Per document numbers that are neither of the above, which is the length
     /// of each document.
     pub lengths: u64,
+    /// The primary keys, which are held whole until the segment is written
+    /// because they arrive in no particular order.
+    pub keys: u64,
 }
 
 impl Held {
@@ -343,6 +355,7 @@ impl Held {
             .saturating_add(self.vocabulary)
             .saturating_add(self.stored)
             .saturating_add(self.lengths)
+            .saturating_add(self.keys)
     }
 }
 
@@ -436,6 +449,66 @@ impl Writer {
         text: &str,
         fields: impl IntoIterator<Item = (&'f str, &'f [u8])>,
     ) -> Result<DocId> {
+        self.insert(None, text, fields)
+    }
+
+    /// Adds a document under a primary key.
+    ///
+    /// The key is what names the document from outside the store. Nothing else
+    /// does: a document identifier belongs to the segment it is in and moves
+    /// when segments are merged, so it cannot be written down anywhere and used
+    /// again later. A key can, which is what makes replacing a document and
+    /// deleting it by name possible at all.
+    ///
+    /// It is bytes rather than a string because the caller knows what its keys
+    /// are and this does not. A path, a URL, a message identifier and a row
+    /// identifier are all keys somebody has, and the only property this needs
+    /// from them is that they compare.
+    ///
+    /// The key goes in the segment beside the terms, not in the stored fields.
+    /// A stored field is handed back with a hit and cannot be searched for,
+    /// which is the wrong way round for the one value the caller looks documents
+    /// up by.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotSorted`] if more documents are added than a document
+    /// identifier can hold.
+    pub fn add_keyed(&mut self, key: &[u8], text: &str) -> Result<DocId> {
+        self.insert(Some(key), text, core::iter::empty())
+    }
+
+    /// Adds a document under a primary key, and keeps `fields` to hand back with
+    /// a hit.
+    ///
+    /// [`add_keyed`](Self::add_keyed) and
+    /// [`add_with_fields`](Self::add_with_fields) at once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotSorted`] if more documents are added than a document
+    /// identifier can hold.
+    pub fn add_keyed_with_fields<'f>(
+        &mut self,
+        key: &[u8],
+        text: &str,
+        fields: impl IntoIterator<Item = (&'f str, &'f [u8])>,
+    ) -> Result<DocId> {
+        self.insert(Some(key), text, fields)
+    }
+
+    /// The one place a document is added, whether or not it was named.
+    ///
+    /// The key is taken here rather than in a method of its own so that a
+    /// document has one key or none by construction. A writer that let a key be
+    /// attached to a document already added would have to answer what a second
+    /// key for the same document means, and there is no good answer to that.
+    fn insert<'f>(
+        &mut self,
+        key: Option<&[u8]>,
+        text: &str,
+        fields: impl IntoIterator<Item = (&'f str, &'f [u8])>,
+    ) -> Result<DocId> {
         let doc =
             u32::try_from(self.lengths.len()).map_err(|_| Error::NotSorted { at: u32::MAX })?;
         // The stamp is the document number plus one so that zero can mean a term
@@ -449,6 +522,8 @@ impl Writer {
             total,
             store,
             stored,
+            keys,
+            key_bytes,
             budget: _,
         } = self;
         let length = analyzer.analyze(text, |term, _| postings.count(term, stamp));
@@ -458,6 +533,10 @@ impl Writer {
         let before = store.values();
         store.push(fields)?;
         *stored |= store.values() > before;
+        if let Some(key) = key {
+            keys.push((key.into(), doc));
+            *key_bytes = key_bytes.saturating_add(u64::try_from(key.len()).unwrap_or(u64::MAX));
+        }
         Ok(doc)
     }
 
@@ -488,6 +567,12 @@ impl Writer {
         let mut held = self.postings.held();
         held.stored = self.store.held();
         held.lengths = holding::<u32>(self.lengths.capacity());
+        // The keys themselves as well as the table pointing at them, because a
+        // key is usually longer than the sixteen bytes of the pair that holds
+        // it and a budget that counted only the pairs would be out by an order
+        // of magnitude on a corpus keyed by path.
+        held.keys =
+            holding::<(Box<[u8]>, DocId)>(self.keys.capacity()).saturating_add(self.key_bytes);
         held
     }
 
@@ -633,13 +718,20 @@ impl Writer {
         // twice.
         let mut stored = false;
         let mut store: Option<store::Writer> = None;
-        for part in parts {
+        let mut named: Vec<(Box<[u8]>, DocId)> = Vec::new();
+        for (index, part) in parts.into_iter().enumerate() {
             stored |= part.stored;
+            named.extend(
+                part.keys
+                    .into_iter()
+                    .map(|(key, doc)| (key, doc.saturating_add(base[index]))),
+            );
             match &mut store {
                 Some(held) => held.merge(part.store)?,
                 None => store = Some(part.store),
             }
         }
+        let key_sections = key_index(named)?;
 
         let mut segment = SegmentWriter::new();
         segment.add(kind::TERMS, dictionary.finish())?;
@@ -653,8 +745,47 @@ impl Writer {
         if let (true, Some(store)) = (stored, store) {
             segment.add(kind::FIELDS, store.finish()?)?;
         }
+        // Both or neither. A filter without a table cannot answer anything, and
+        // a table without a filter would be searched by every lookup for a key
+        // that is not in this segment, which is the case the filter is for.
+        if let Some((table, bits)) = key_sections {
+            segment.add(kind::KEYS, table)?;
+            segment.add(kind::KEY_FILTER, bits)?;
+        }
         Ok(segment)
     }
+}
+
+/// Turns the keys the parts were given into the two sections a segment carries,
+/// or nothing at all if no document was named.
+///
+/// The keys arrive in the order documents were added, which is no order, so they
+/// are sorted here. They are sorted by key and then by document descending, so
+/// that when a key was used twice the newest document is the one left standing:
+/// a batch that updates the same record twice in one segment means the second
+/// write, and that is the same rule a lookup across segments follows when it
+/// takes the newest segment that holds the key.
+///
+/// # Errors
+///
+/// Returns [`Error::Overflow`] if the keys together are more than a four byte
+/// offset can address, which is four gigabytes of key in one segment.
+fn key_index(mut named: Vec<(Box<[u8]>, DocId)>) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+    if named.is_empty() {
+        return Ok(None);
+    }
+    named.sort_unstable_by(|(left, at), (right, other)| left.cmp(right).then(other.cmp(at)));
+    named.dedup_by(|(later, _), (first, _)| later == first);
+
+    let mut table = keys::Writer::new();
+    let mut bits = filter::Writer::new(named.len());
+    for (key, doc) in &named {
+        // The sort put them in order and the dedup made them distinct, so the
+        // only thing left that can refuse one is a table too large to address.
+        table.push(key, *doc)?;
+        bits.insert(key);
+    }
+    Ok(Some((table.finish()?, bits.finish())))
 }
 
 /// A vocabulary and one posting chain per term in it.
@@ -955,6 +1086,94 @@ pub(crate) fn average(total: u64, documents: u32) -> f32 {
     (total as f64 / f64::from(documents)) as f32
 }
 
+/// The primary keys of one segment, and the filter in front of them.
+///
+/// This is separate from [`Reader`] because a lookup by key across a store opens
+/// every segment and asks each of them, and all but one of those questions is
+/// answered no by the filter. Opening a whole index to ask is decoding a term
+/// dictionary header, a norms section and whatever else is there, all so that
+/// sixty four bytes can be read and the segment dismissed.
+#[derive(Debug)]
+pub struct Keys<'a> {
+    table: keys::Reader<'a>,
+    filter: filter::Reader<'a>,
+}
+
+impl<'a> Keys<'a> {
+    /// Opens the key index of a segment, or `None` if it does not have one.
+    ///
+    /// A segment without keys is ordinary rather than damaged. Nothing forces a
+    /// document to be named, a build older than the sections did not write them,
+    /// and a segment of documents that were all added without a key has nothing
+    /// to put in one.
+    ///
+    /// # Errors
+    ///
+    /// Returns a decoding error if either section is not what it claims to be,
+    /// and [`Error::MissingSection`] if one of the two is there and the other is
+    /// not, which is a segment written by something that did not finish.
+    pub fn open(segment: &Segment<'a>) -> Result<Option<Self>> {
+        match (
+            segment.section(kind::KEYS),
+            segment.section(kind::KEY_FILTER),
+        ) {
+            (Some(table), Some(bits)) => Ok(Some(Self {
+                table: keys::Reader::new(table)?,
+                filter: filter::Reader::new(bits)?,
+            })),
+            (None, None) => Ok(None),
+            (Some(_), None) => Err(Error::MissingSection {
+                kind: kind::KEY_FILTER,
+            }),
+            (None, Some(_)) => Err(Error::MissingSection { kind: kind::KEYS }),
+        }
+    }
+
+    /// How many keys the segment holds.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.table.len()
+    }
+
+    /// Whether it holds none, which no segment written by this build does.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.table.is_empty()
+    }
+
+    /// Whether the key might be here, from the filter alone.
+    ///
+    /// False means it is certainly not, which is the answer worth having: a key
+    /// lives in one segment and every other segment in the store has to say no,
+    /// and this says it for the price of one cache line.
+    ///
+    /// True means it is probably here, at about one in a hundred wrong, and the
+    /// caller has to look in the table to find out.
+    #[must_use]
+    pub fn maybe_holds(&self, key: &[u8]) -> bool {
+        self.filter.maybe_holds(key)
+    }
+
+    /// The document a key names, or `None` if this segment does not name it.
+    ///
+    /// Deleted documents are not considered here, because this does not know
+    /// what has been deleted. [`Reader::document`] is the one that does.
+    #[must_use]
+    pub fn get(&self, key: &[u8]) -> Option<DocId> {
+        if !self.filter.maybe_holds(key) {
+            return None;
+        }
+        self.table.get(key)
+    }
+
+    /// The table underneath, for a caller walking every key rather than asking
+    /// after one.
+    #[must_use]
+    pub const fn table(&self) -> &keys::Reader<'a> {
+        &self.table
+    }
+}
+
 /// Reads an index out of a segment.
 #[derive(Debug)]
 pub struct Reader<'a> {
@@ -963,6 +1182,7 @@ pub struct Reader<'a> {
     lengths: &'a [u8],
     bounds: Option<bound::Reader<'a>>,
     store: Option<store::Reader<'a>>,
+    keys: Option<Keys<'a>>,
     documents: u32,
     total: u64,
     /// Which of this segment's documents have been deleted, if any.
@@ -1014,6 +1234,7 @@ impl<'a> Reader<'a> {
             lengths,
             bounds,
             store,
+            keys: Keys::open(segment)?,
             documents,
             total,
             deleted: None,
@@ -1159,6 +1380,28 @@ impl<'a> Reader<'a> {
     #[must_use]
     pub const fn store(&self) -> Option<&store::Reader<'a>> {
         self.store.as_ref()
+    }
+
+    /// The keys of this segment, or nothing if no document in it was named.
+    #[must_use]
+    pub const fn keys(&self) -> Option<&Keys<'a>> {
+        self.keys.as_ref()
+    }
+
+    /// The document a key names, or `None` if this segment has no live document
+    /// under it.
+    ///
+    /// Deleted is the same answer as absent on purpose. A key naming a document
+    /// somebody deleted is a key nothing holds any more, and a caller that had
+    /// to tell the two apart would be reasoning about a document it can no
+    /// longer read.
+    ///
+    /// A segment that was written without keys answers `None` to everything,
+    /// which is the same thing it would answer for a key it does not hold.
+    #[must_use]
+    pub fn document(&self, key: &[u8]) -> Option<DocId> {
+        let doc = self.keys.as_ref()?.get(key)?;
+        self.is_live(doc).then_some(doc)
     }
 
     /// The posting list of a term, or nothing if the term is not in the index.
@@ -1893,5 +2136,198 @@ mod tests {
                 .expect("decodes")
                 .is_some_and(|list| list.len() == 2)
         );
+    }
+
+    /// Indexes the documents under the keys beside them, in the order given.
+    fn keyed(docs: &[(&[u8], &str)]) -> Vec<u8> {
+        let mut writer = Writer::new();
+        for (key, text) in docs {
+            writer.add_keyed(key, text).expect("a handful fit");
+        }
+        writer.finish().expect("what was written decodes")
+    }
+
+    #[test]
+    fn a_key_comes_back_with_the_document_it_was_given_to() {
+        let bytes = keyed(&[
+            (b"docs/second.md", DOCS[1]),
+            (b"docs/first.md", DOCS[0]),
+            (b"docs/third.md", DOCS[2]),
+        ]);
+        let segment = Segment::open(&bytes).expect("opens");
+        let index = Reader::open(&segment).expect("opens");
+        // The keys went in out of order, which is the ordinary case, and the
+        // numbering follows the order documents were added rather than the
+        // order the table ends up in.
+        assert_eq!(index.document(b"docs/second.md"), Some(0));
+        assert_eq!(index.document(b"docs/first.md"), Some(1));
+        assert_eq!(index.document(b"docs/third.md"), Some(2));
+    }
+
+    #[test]
+    fn a_key_nothing_was_written_under_is_absent_rather_than_an_error() {
+        let bytes = keyed(&[(b"docs/first.md", DOCS[0])]);
+        let segment = Segment::open(&bytes).expect("opens");
+        let index = Reader::open(&segment).expect("opens");
+        assert_eq!(index.document(b"docs/nothing.md"), None);
+        assert_eq!(index.document(b""), None);
+        // A prefix of a key that is there is not that key.
+        assert_eq!(index.document(b"docs/first"), None);
+    }
+
+    #[test]
+    fn a_segment_nobody_named_a_document_in_carries_no_keys() {
+        let bytes = build(&DOCS);
+        let segment = Segment::open(&bytes).expect("opens");
+        assert!(segment.section(kind::KEYS).is_none());
+        assert!(segment.section(kind::KEY_FILTER).is_none());
+        let index = Reader::open(&segment).expect("opens");
+        assert!(index.keys().is_none());
+        // And it answers the way a segment without the key is expected to,
+        // rather than refusing to be asked.
+        assert_eq!(index.document(b"docs/first.md"), None);
+        // Everything else about it still works, which is what makes the key
+        // sections something a build can start writing without a version step.
+        assert_eq!(index.documents(), 4);
+        assert!(index.postings(b"quick").expect("decodes").is_some());
+    }
+
+    #[test]
+    fn naming_some_of_the_documents_leaves_the_others_findable_only_by_term() {
+        let mut writer = Writer::new();
+        writer.add(DOCS[0]).expect("adds");
+        writer.add_keyed(b"docs/second.md", DOCS[1]).expect("adds");
+        writer.add(DOCS[2]).expect("adds");
+        let bytes = writer.finish().expect("finishes");
+        let segment = Segment::open(&bytes).expect("opens");
+        let index = Reader::open(&segment).expect("opens");
+        assert_eq!(index.keys().expect("there is a key").len(), 1);
+        assert_eq!(index.document(b"docs/second.md"), Some(1));
+        assert_eq!(index.documents(), 3);
+    }
+
+    #[test]
+    fn a_key_used_twice_in_one_segment_names_the_later_document() {
+        // A batch that writes the same record twice means the second write, and
+        // that is the same rule a lookup across segments follows.
+        let bytes = keyed(&[
+            (b"docs/first.md", DOCS[0]),
+            (b"docs/second.md", DOCS[1]),
+            (b"docs/first.md", DOCS[2]),
+        ]);
+        let segment = Segment::open(&bytes).expect("opens");
+        let index = Reader::open(&segment).expect("opens");
+        assert_eq!(index.document(b"docs/first.md"), Some(2));
+        assert_eq!(index.keys().expect("there are keys").len(), 2);
+        // The document that lost the key is still in the segment. Nothing here
+        // deletes anything, and the segment's numbering has to stay as wide as
+        // the documents that went into it.
+        assert_eq!(index.documents(), 3);
+    }
+
+    #[test]
+    fn a_key_naming_a_deleted_document_is_absent() {
+        let bytes = keyed(&[(b"docs/first.md", DOCS[0]), (b"docs/second.md", DOCS[1])]);
+        let segment = Segment::open(&bytes).expect("opens");
+        let index = Reader::open(&segment)
+            .expect("opens")
+            .hiding(Bitmap::from_sorted(&[0]))
+            .expect("hides");
+        assert_eq!(index.document(b"docs/first.md"), None);
+        assert_eq!(index.document(b"docs/second.md"), Some(1));
+        // The table still holds it. A deletion is beside the segment and the
+        // segment is not rewritten for one, so the key is there and the answer
+        // is no.
+        assert_eq!(
+            index.keys().expect("there are keys").get(b"docs/first.md"),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn keys_survive_a_segment_written_in_parts() {
+        // The document numbers move when the parts are folded, and the keys of
+        // a later part sort in among the keys of an earlier one, so this is
+        // both halves of the fold at once.
+        let mut parts = Vec::new();
+        for slice in [
+            [(&b"b.md"[..], DOCS[0]), (&b"d.md"[..], DOCS[1])],
+            [(&b"a.md"[..], DOCS[2]), (&b"c.md"[..], DOCS[3])],
+        ] {
+            let mut part = Writer::new();
+            for (key, text) in slice {
+                part.add_keyed(key, text).expect("adds");
+            }
+            parts.push(part);
+        }
+        let bytes = Writer::concat(parts).expect("folds");
+        let segment = Segment::open(&bytes).expect("opens");
+        let index = Reader::open(&segment).expect("opens");
+        assert_eq!(index.document(b"b.md"), Some(0));
+        assert_eq!(index.document(b"d.md"), Some(1));
+        assert_eq!(index.document(b"a.md"), Some(2));
+        assert_eq!(index.document(b"c.md"), Some(3));
+        // In the table they are in key order, not in document order, which is
+        // what a binary search needs.
+        let keys = index.keys().expect("there are keys");
+        let found: Vec<&[u8]> = keys.table().entries().map(|(key, _)| key).collect();
+        assert_eq!(found, [&b"a.md"[..], b"b.md", b"c.md", b"d.md"]);
+    }
+
+    #[test]
+    fn a_key_used_in_two_parts_names_the_document_in_the_later_one() {
+        let mut first = Writer::new();
+        first.add_keyed(b"a.md", DOCS[0]).expect("adds");
+        let mut second = Writer::new();
+        second.add_keyed(b"a.md", DOCS[1]).expect("adds");
+        let bytes = Writer::concat(vec![first, second]).expect("folds");
+        let segment = Segment::open(&bytes).expect("opens");
+        let index = Reader::open(&segment).expect("opens");
+        assert_eq!(index.document(b"a.md"), Some(1));
+    }
+
+    #[test]
+    fn the_filter_answers_for_a_key_the_segment_does_not_hold() {
+        // Not a test of the rate, which is measured on real keys elsewhere.
+        // This is the arrangement: the filter is asked first, and a key it says
+        // no to never reaches the table.
+        let bytes = keyed(&[(b"docs/first.md", DOCS[0]), (b"docs/second.md", DOCS[1])]);
+        let segment = Segment::open(&bytes).expect("opens");
+        let index = Reader::open(&segment).expect("opens");
+        let keys = index.keys().expect("there are keys");
+        assert!(keys.maybe_holds(b"docs/first.md"));
+        assert!(keys.maybe_holds(b"docs/second.md"));
+        let absent = (0..200).map(|n| format!("docs/{n}.md"));
+        let said_yes = absent
+            .filter(|key| keys.maybe_holds(key.as_bytes()))
+            .count();
+        // Two keys in a filter sized for two, so the odds of any of two hundred
+        // strangers getting through are small enough to assert on.
+        assert_eq!(said_yes, 0);
+    }
+
+    #[test]
+    fn a_segment_carrying_keys_without_the_filter_is_refused() {
+        // Neither section is any use alone, and a reader that shrugged at one
+        // of them missing would answer differently depending on which.
+        let bytes = keyed(&[(b"a.md", DOCS[0])]);
+        let segment = Segment::open(&bytes).expect("opens");
+        let table = segment
+            .section(kind::KEYS)
+            .expect("there are keys")
+            .to_vec();
+        let mut without = SegmentWriter::new();
+        without
+            .add(kind::TERMS, b"not a dictionary".to_vec())
+            .expect("adds");
+        without.add(kind::KEYS, table).expect("adds");
+        let bytes = without.finish();
+        let segment = Segment::open(&bytes).expect("opens");
+        assert!(matches!(
+            Keys::open(&segment),
+            Err(Error::MissingSection {
+                kind: kind::KEY_FILTER
+            })
+        ));
     }
 }

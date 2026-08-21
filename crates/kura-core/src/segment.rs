@@ -146,6 +146,12 @@ pub mod kind {
     /// What each block of postings can score at best, which is what block max
     /// pruning compares against.
     pub const BOUNDS: u16 = 10;
+    /// The primary key of each document that has one, sorted, with the document
+    /// number beside it.
+    pub const KEYS: u16 = 11;
+    /// A bloom filter over those keys, so a segment that does not hold a key can
+    /// say so without the table being read at all.
+    pub const KEY_FILTER: u16 = 12;
 }
 
 /// Builds a segment.
@@ -709,6 +715,8 @@ pub const fn name(kind: u16) -> Option<&'static str> {
         kind::TOMBSTONES => Some("tombstones"),
         kind::NORMS => Some("norms"),
         kind::BOUNDS => Some("bounds"),
+        kind::KEYS => Some("keys"),
+        kind::KEY_FILTER => Some("key filter"),
         _ => None,
     }
 }
