@@ -138,6 +138,157 @@ impl Arena {
     }
 }
 
+/// How many terms one block of the per term arrays holds.
+///
+/// A power of two so that splitting an identifier into a block and a position in
+/// it is a shift and a mask, and eight thousand of them so that a block is tens
+/// of kilobytes rather than a fraction of a page.
+const TERMS: usize = 8 << 10;
+
+/// How far to shift a term identifier to get the block it is in.
+const TERMS_SHIFT: u32 = TERMS.trailing_zeros();
+
+/// What to mask a term identifier with to get its position in its block.
+const TERMS_MASK: usize = TERMS - 1;
+
+const _: () = assert!(
+    TERMS.is_power_of_two(),
+    "a block that is not a power of two is a block an identifier cannot be split by shifting"
+);
+
+/// An array with an entry per term, grown by adding a block.
+///
+/// A vector would do everything this does and would double to do it, which on a
+/// large vocabulary means a single document taking the writer megabytes past
+/// whatever budget it was given, since the step a doubling takes is the size of
+/// everything already held. This grows by a fixed amount instead, so the largest
+/// step is a block however large the corpus is, and nothing already written is
+/// ever copied.
+///
+/// Entries are handed out in order and never given back, so an identifier means
+/// the same thing for the life of the writer.
+#[derive(Debug, Default)]
+struct Blocks<T> {
+    blocks: Vec<Box<[T]>>,
+    len: usize,
+}
+
+impl<T: Copy + Default> Blocks<T> {
+    /// Adds an entry at the end.
+    fn push(&mut self, value: T) {
+        if self.len & TERMS_MASK == 0 {
+            self.blocks
+                .push(vec![T::default(); TERMS].into_boxed_slice());
+        }
+        self.blocks[self.len >> TERMS_SHIFT][self.len & TERMS_MASK] = value;
+        self.len += 1;
+    }
+
+    /// How many entries there are.
+    const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// How many bytes this is holding.
+    ///
+    /// The whole of every block, including the part of the last one that has not
+    /// been handed out, because that is what the allocator is holding.
+    fn held(&self) -> u64 {
+        holding::<T>(self.blocks.len().saturating_mul(TERMS))
+            + holding::<Box<[T]>>(self.blocks.capacity())
+    }
+}
+
+impl<T> core::ops::Index<usize> for Blocks<T> {
+    type Output = T;
+
+    fn index(&self, at: usize) -> &T {
+        &self.blocks[at >> TERMS_SHIFT][at & TERMS_MASK]
+    }
+}
+
+impl<T> core::ops::IndexMut<usize> for Blocks<T> {
+    fn index_mut(&mut self, at: usize) -> &mut T {
+        &mut self.blocks[at >> TERMS_SHIFT][at & TERMS_MASK]
+    }
+}
+
+/// The bytes of every term seen, grown by adding a block.
+///
+/// Same reasoning as [`Blocks`], and a separate type because the entries are
+/// runs of bytes of different lengths rather than one fixed size thing. A term
+/// that will not fit in what is left of the last block starts a new one, so a
+/// term is always one slice and a reader never has to deal with a term that
+/// straddles a block. Terms are capped at 255 bytes, so what that wastes is at
+/// most a quarter of a kilobyte in every sixty four.
+#[derive(Debug, Default)]
+struct Text {
+    blocks: Vec<Box<[u8]>>,
+    /// How much of the last block has been handed out.
+    used: usize,
+}
+
+impl Text {
+    /// Copies a term in and says where it went.
+    fn push(&mut self, term: &[u8]) -> u32 {
+        if self.blocks.is_empty() || BLOCK - self.used < term.len() {
+            self.blocks.push(vec![0u8; BLOCK].into_boxed_slice());
+            self.used = 0;
+        }
+        let at = (self.blocks.len() - 1) * BLOCK + self.used;
+        let block = self
+            .blocks
+            .last_mut()
+            .expect("a block was just made sure of");
+        block[self.used..self.used + term.len()].copy_from_slice(term);
+        self.used += term.len();
+        u32::try_from(at).expect("the vocabulary is under four gigabytes")
+    }
+
+    /// `len` bytes from `at`, which is one whole term.
+    fn at(&self, at: usize, len: usize) -> &[u8] {
+        let offset = at & BLOCK_MASK;
+        &self.blocks[at >> BLOCK_SHIFT][offset..offset + len]
+    }
+
+    /// How many bytes this is holding.
+    fn held(&self) -> u64 {
+        holding::<u8>(self.blocks.len().saturating_mul(BLOCK))
+            + holding::<Box<[u8]>>(self.blocks.capacity())
+    }
+}
+
+/// What is known about a term while a document is being counted.
+///
+/// The two are together because they are read and written together, once per
+/// occurrence of a term, which is the hottest line in an index build.
+#[derive(Debug, Default, Clone, Copy)]
+struct Counting {
+    /// The document this term was last counted in, plus one, so that zero can
+    /// mean a term no document has held yet.
+    stamp: u32,
+    /// How often it occurs in the document being counted.
+    frequency: u32,
+}
+
+/// Where a term's posting chain is and what has gone into it so far.
+///
+/// These five are together because they are read and written together, once per
+/// term per document, when the counted document is appended to the chains.
+#[derive(Debug, Default, Clone, Copy)]
+struct Chain {
+    /// Where the chain starts.
+    head: u32,
+    /// Where the chunk being written to starts.
+    tail: u32,
+    /// How much of that chunk has been written.
+    used: u32,
+    /// How many documents are in the chain.
+    documents: u32,
+    /// The last document appended, which the next gap is measured from.
+    last: DocId,
+}
+
 /// Builds an index from documents.
 ///
 /// Documents are numbered in the order they are added, from zero, and that
@@ -444,7 +595,7 @@ impl Writer {
                     continue;
                 }
                 part.postings.walk(id, base[index], &mut list)?;
-                docs += part.postings.documents[id as usize];
+                docs += part.postings.chains[id as usize].documents;
                 front[index] += 1;
             }
             let offset = blob.len() as u64;
@@ -498,15 +649,11 @@ impl Writer {
 struct Accumulator {
     vocabulary: Vocabulary,
     arena: Arena,
-    head: Vec<u32>,
-    tail: Vec<u32>,
-    used: Vec<u32>,
-    documents: Vec<u32>,
-    last: Vec<DocId>,
-    /// The document a term was last counted in, plus one.
-    stamp: Vec<u32>,
-    /// How often a term occurs in the document being counted.
-    frequency: Vec<u32>,
+    /// Where each term's postings are, one entry per term.
+    chains: Blocks<Chain>,
+    /// What each term has been counted as in the document being indexed, one
+    /// entry per term.
+    counting: Blocks<Counting>,
     /// The terms counted in the document being counted, so that flushing does
     /// not have to walk the whole vocabulary.
     touched: Vec<u32>,
@@ -518,21 +665,21 @@ impl Accumulator {
     fn count(&mut self, term: &[u8], stamp: u32) {
         let id = self.vocabulary.intern(term);
         let at = id as usize;
-        if at == self.head.len() {
+        if at == self.chains.len() {
             let chunk = self.chunk();
-            self.head.push(chunk);
-            self.tail.push(chunk);
-            self.used.push(0);
-            self.documents.push(0);
-            self.last.push(0);
-            self.stamp.push(0);
-            self.frequency.push(0);
+            self.chains.push(Chain {
+                head: chunk,
+                tail: chunk,
+                ..Chain::default()
+            });
+            self.counting.push(Counting::default());
         }
-        if self.stamp[at] == stamp {
-            self.frequency[at] += 1;
+        let counting = &mut self.counting[at];
+        if counting.stamp == stamp {
+            counting.frequency += 1;
         } else {
-            self.stamp[at] = stamp;
-            self.frequency[at] = 1;
+            counting.stamp = stamp;
+            counting.frequency = 1;
             self.touched.push(id);
         }
     }
@@ -541,52 +688,51 @@ impl Accumulator {
     fn flush(&mut self, doc: DocId) {
         for index in 0..self.touched.len() {
             let at = self.touched[index] as usize;
-            let gap = if self.documents[at] == 0 {
+            let chain = self.chains[at];
+            let gap = if chain.documents == 0 {
                 doc
             } else {
-                doc - self.last[at]
+                doc - chain.last
             };
-            self.append(at, gap, self.frequency[at]);
-            self.documents[at] += 1;
-            self.last[at] = doc;
+            self.append(at, gap, self.counting[at].frequency);
+            let chain = &mut self.chains[at];
+            chain.documents += 1;
+            chain.last = doc;
         }
         self.touched.clear();
     }
 
     /// Writes one document gap and frequency into a term's chain.
     fn append(&mut self, at: usize, gap: u32, frequency: u32) {
-        if self.used[at] as usize + MAX_PAIR > PAYLOAD {
+        if self.chains[at].used as usize + MAX_PAIR > PAYLOAD {
             let next = self.chunk();
-            let tail = self.tail[at] as usize;
+            let tail = self.chains[at].tail as usize;
             self.arena
                 .at_mut(tail, LINK)
                 .copy_from_slice(&next.to_le_bytes());
-            self.tail[at] = next;
-            self.used[at] = 0;
+            let chain = &mut self.chains[at];
+            chain.tail = next;
+            chain.used = 0;
         }
         self.scratch.clear();
         put_uvarint(&mut self.scratch, u64::from(gap));
         put_uvarint(&mut self.scratch, u64::from(frequency));
-        let start = self.tail[at] as usize + LINK + self.used[at] as usize;
+        let chain = self.chains[at];
+        let start = chain.tail as usize + LINK + chain.used as usize;
         let len = self.scratch.len();
         self.arena.at_mut(start, len).copy_from_slice(&self.scratch);
-        self.used[at] += u32::try_from(self.scratch.len()).expect("a pair is at most ten bytes");
+        self.chains[at].used +=
+            u32::try_from(self.scratch.len()).expect("a pair is at most ten bytes");
     }
 
     /// What this is holding, split into the chains and the vocabulary.
     ///
-    /// The seven vectors indexed by term identifier are counted with the arena
+    /// The two arrays indexed by term identifier are counted with the arena
     /// rather than with the vocabulary, because they are per term bookkeeping
     /// for the postings and they grow with the postings. The vocabulary is the
     /// terms and the table that finds them, and nothing else.
     fn held(&self) -> Held {
-        let per_term = holding::<u32>(self.head.capacity())
-            + holding::<u32>(self.tail.capacity())
-            + holding::<u32>(self.used.capacity())
-            + holding::<u32>(self.documents.capacity())
-            + holding::<DocId>(self.last.capacity())
-            + holding::<u32>(self.stamp.capacity())
-            + holding::<u32>(self.frequency.capacity());
+        let per_term = self.chains.held() + self.counting.held();
         Held {
             postings: self.arena.held()
                 + per_term
@@ -624,10 +770,11 @@ impl Accumulator {
     /// after another part in one segment.
     fn walk(&self, id: u32, base: DocId, writer: &mut posting::Writer) -> Result<()> {
         let at = id as usize;
-        let mut chunk = self.head[at] as usize;
+        let chain = self.chains[at];
+        let mut chunk = chain.head as usize;
         let mut offset = 0;
         let mut doc: DocId = 0;
-        for index in 0..self.documents[at] {
+        for index in 0..chain.documents {
             if offset + MAX_PAIR > PAYLOAD {
                 let link = self.arena.at(chunk, LINK);
                 chunk = u32::from_le_bytes(link.try_into().expect("four bytes")) as usize;
@@ -655,16 +802,23 @@ impl Accumulator {
 /// an attacker rather than to be quick, and neither is what an indexer wants.
 #[derive(Debug)]
 struct Vocabulary {
-    arena: Vec<u8>,
-    spans: Vec<(u32, u32)>,
+    text: Text,
+    spans: Blocks<(u32, u32)>,
+    /// The slots, which are the one thing here that does double.
+    ///
+    /// Everything else grows by adding a block, because an entry that has been
+    /// written never moves. A slot is where a hash says it is, so growing the
+    /// table moves every entry in it and the table has to be built again
+    /// whatever shape it is kept in. Paging it would bound nothing and cost a
+    /// shift and a mask on the hottest lookup in the writer.
     table: Vec<u32>,
 }
 
 impl Default for Vocabulary {
     fn default() -> Self {
         Self {
-            arena: Vec::new(),
-            spans: Vec::new(),
+            text: Text::default(),
+            spans: Blocks::default(),
             table: vec![NONE; 1024],
         }
     }
@@ -686,9 +840,7 @@ impl Vocabulary {
             at = (at + 1) & mask;
         }
         let id = u32::try_from(self.spans.len()).expect("under four billion distinct terms");
-        let start =
-            u32::try_from(self.arena.len()).expect("the vocabulary is under four gigabytes");
-        self.arena.extend_from_slice(term);
+        let start = self.text.push(term);
         self.spans.push((
             start,
             u32::try_from(term.len()).expect("terms are capped at 255 bytes"),
@@ -718,7 +870,7 @@ impl Vocabulary {
     /// The bytes of a term.
     fn term(&self, id: u32) -> &[u8] {
         let (start, len) = self.spans[id as usize];
-        &self.arena[start as usize..start as usize + len as usize]
+        self.text.at(start as usize, len as usize)
     }
 
     /// How many distinct terms there are.
@@ -728,9 +880,7 @@ impl Vocabulary {
 
     /// What the terms and the table that finds them are costing.
     fn held(&self) -> u64 {
-        holding::<u8>(self.arena.capacity())
-            + holding::<(u32, u32)>(self.spans.capacity())
-            + holding::<u32>(self.table.capacity())
+        self.text.held() + self.spans.held() + holding::<u32>(self.table.capacity())
     }
 }
 
@@ -1442,6 +1592,38 @@ mod tests {
         assert!(!writer.is_full());
         assert!(writer.held().total() < held);
         assert_eq!(writer.budget(), Some(budget));
+    }
+
+    #[test]
+    fn what_one_document_adds_to_what_a_writer_holds_does_not_grow_with_the_corpus() {
+        // This is what a budget is worth. A writer that doubled its per term
+        // arrays took a step the size of everything it already held, so on a
+        // vocabulary of two hundred thousand terms one document could take it
+        // 4.7 MB past whatever it had been told it may hold, and on a larger
+        // one further still. Every array a term is counted in now grows by a
+        // block, so the largest step is a handful of blocks and it is the same
+        // handful at the end of a corpus as at the start.
+        //
+        // Forty thousand terms is enough to tell the two apart without being
+        // enough to slow a test run down. The worst step here was 1.13 MB
+        // before and is 416.4 KB after, and only the second of those stays put
+        // as the corpus grows.
+        let mut writer = Writer::new();
+        let mut worst = 0;
+        let mut held = writer.held().total();
+        for doc in 0..40_000u32 {
+            // A term nothing else holds, so every document grows every array.
+            writer
+                .add(&format!("term{doc} the quick brown fox"))
+                .expect("adds");
+            let now = writer.held().total();
+            worst = worst.max(now - held);
+            held = now;
+        }
+        assert!(
+            worst < (512 << 10),
+            "one document took the writer {worst} bytes further"
+        );
     }
 
     #[test]
