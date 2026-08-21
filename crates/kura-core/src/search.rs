@@ -747,10 +747,6 @@ impl<'a, 'b> Searcher<'a, 'b> {
     /// this list, which is a list shorter than a block, a segment written before
     /// the section existed, or a query scoring with parameters other than the
     /// ones the ceilings assume.
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "the same bound as block_bound, on the same quantity"
-    )]
     fn page_of_one_by_bound<T: Tally>(
         &self,
         shard: &mut Shard<'a, 'b>,
@@ -770,7 +766,7 @@ impl<'a, 'b> Searcher<'a, 'b> {
         let idf = lists.heads[0].idf;
         let bound = lists.heads[0].bound;
         let scale = lists.scale;
-        let k1 = self.k1;
+        let mut scratch = Scratch::new();
         for &step in &order_by_ceiling(ceilings) {
             let quantum = ceilings[step as usize];
             // `bound` is the term's `idf * (k1 + 1)`, which is what it
@@ -779,30 +775,21 @@ impl<'a, 'b> Searcher<'a, 'b> {
             // different average length can push a ceiling past the most a term
             // can ever contribute.
             let ceiling = bound * (bound::ceiling(quantum) * scale).min(1.0);
-            if ceiling <= top.threshold() {
+            // Under the bar rather than at it. A document scoring exactly what
+            // the worst hit scores still gets on the page when its identifier
+            // is lower, and this walk does not visit documents in that order,
+            // so a block that can only reach the bar can still hold one. The
+            // document ordered walks are strict here and are right to be:
+            // everything they have left to read has a higher identifier than
+            // everything already on the page, so a tie there always loses.
+            if ceiling < top.threshold() {
                 break;
             }
             tally.sought();
             lists.cursors[0].jump(step as usize)?;
             let (docs, freqs) = lists.cursors[0].block_postings();
-            for (&doc, &frequency) in docs.iter().zip(freqs) {
-                // This walk takes a whole block at a time and scores everything
-                // in it, so the deleted documents are met here rather than at a
-                // cursor. Skipping the block for holding one is not on: the
-                // ceiling it was chosen by is the best any of its documents can
-                // score, and the rest of them are still answers.
-                if !index.is_live(doc) {
-                    tally.hidden();
-                    continue;
-                }
-                let frequency = frequency as f32;
-                let score = idf * (frequency * (k1 + 1.0)) / (frequency + norm.of(index, doc));
-                tally.scored();
-                top.push(Hit {
-                    doc: base.saturating_add(doc),
-                    score,
-                });
-            }
+            let scores = scratch.score(index, docs, freqs, norm, idf, self.k1);
+            offer(index, *base, docs, scores, top, tally);
         }
         // The cursor is left somewhere in the middle of the list rather than off
         // the end of it, and the only thing that touches it afterwards is the
@@ -1204,6 +1191,62 @@ fn analyse(query: &str) -> Vec<Vec<u8>> {
     words
 }
 
+/// Offers a block of scores to the heap.
+///
+/// The threshold is read once for the whole block rather than once per posting.
+/// It only rises as hits go in, so anything the heap would have taken is still
+/// at or above where it was when the block started, and reading it once is what
+/// keeps the heap out of the pass that does the arithmetic.
+///
+/// At or above rather than above. A document scoring exactly what the worst hit
+/// scores gets on the page when its identifier is lower, and this walk does not
+/// meet documents in identifier order, so it cannot assume a tie has already
+/// lost.
+fn offer<T: Tally>(
+    index: &Reader<'_>,
+    base: DocId,
+    docs: &[DocId],
+    scores: &[f32],
+    top: &mut TopK,
+    tally: &mut T,
+) {
+    let bar = top.threshold();
+    if !index.any_deleted() {
+        tally.scored_many(scores.len() as u64);
+        for (&score, &doc) in scores.iter().zip(docs) {
+            if score >= bar {
+                top.push(Hit {
+                    doc: base.saturating_add(doc),
+                    score,
+                });
+            }
+        }
+        return;
+    }
+
+    // This walk takes a whole block at a time, so the deleted documents are met
+    // here rather than at a cursor. Dropping the block for holding one is not
+    // on: the ceiling it was chosen by is the best any of its documents can
+    // score, and the rest of them are still answers. They are scored either way,
+    // because finding out costs a lookup and the arithmetic that would be saved
+    // is a multiply and a divide.
+    let mut live = 0;
+    for (&score, &doc) in scores.iter().zip(docs) {
+        if !index.is_live(doc) {
+            tally.hidden();
+            continue;
+        }
+        live += 1;
+        if score >= bar {
+            top.push(Hit {
+                doc: base.saturating_add(doc),
+                score,
+            });
+        }
+    }
+    tally.scored_many(live);
+}
+
 /// The blocks of one list, ordered by their ceiling, largest first.
 ///
 /// A counting sort rather than a comparison sort, because the thing being sorted
@@ -1318,6 +1361,73 @@ impl Norm {
 
     fn of(self, index: &Reader<'_>, doc: DocId) -> f32 {
         self.per_term.mul_add(length_of(index, doc), self.base)
+    }
+}
+
+/// Room to work out a whole block of scores before looking at any of them.
+///
+/// The document at a time loop this replaces reads a length out of the index,
+/// does the arithmetic, and offers the result to the heap, for every posting in
+/// turn. Three unrelated jobs in one loop body, and the first of them is a load
+/// from somewhere else in the file that the arithmetic then waits on. Nothing
+/// overlaps, and the heap sits in the middle of it holding a branch the
+/// processor cannot predict.
+///
+/// Split into passes over a block, each pass does one job. The gather walks the
+/// lengths, which for a common term are next to each other, so the loads run
+/// ahead of each other rather than one at a time. The arithmetic is then three
+/// arrays in and one array out with no memory it has not already got, which is
+/// a loop a compiler can widen. Only the third pass touches the heap, and it
+/// skips the postings that cannot get in.
+///
+/// A kilobyte, built once per walk rather than once per block.
+struct Scratch {
+    norms: [f32; BLOCK_SIZE],
+    scores: [f32; BLOCK_SIZE],
+}
+
+impl Scratch {
+    const fn new() -> Self {
+        Self {
+            norms: [0.0; BLOCK_SIZE],
+            scores: [0.0; BLOCK_SIZE],
+        }
+    }
+
+    /// Scores a block, and hands back the scores in the block's own order.
+    ///
+    /// The arithmetic is written the way the document at a time scorer writes
+    /// it, down to where the brackets are. Floating point multiplication does
+    /// not associate, so folding `idf * (k1 + 1)` into one constant outside the
+    /// loop would move the last bit of some scores, and the last bit of a score
+    /// is a tie, and a tie is two documents changing places.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "the same bound as block_bound, on the same quantity"
+    )]
+    fn score(
+        &mut self,
+        index: &Reader<'_>,
+        docs: &[DocId],
+        freqs: &[u32],
+        norm: Norm,
+        idf: f32,
+        k1: f32,
+    ) -> &[f32] {
+        let len = docs.len().min(freqs.len()).min(BLOCK_SIZE);
+        let docs = &docs[..len];
+        let freqs = &freqs[..len];
+        let norms = &mut self.norms[..len];
+        let scores = &mut self.scores[..len];
+
+        for (place, &doc) in norms.iter_mut().zip(docs) {
+            *place = norm.of(index, doc);
+        }
+        for ((place, &frequency), &norm) in scores.iter_mut().zip(freqs).zip(norms.iter()) {
+            let frequency = frequency as f32;
+            *place = idf * (frequency * (k1 + 1.0)) / (frequency + norm);
+        }
+        scores
     }
 }
 
@@ -2301,6 +2411,55 @@ mod tests {
                 same(&hits, &wanted[..k.min(wanted.len())]);
             }
         }
+    }
+
+    /// Documents that all score exactly the same, with one that scores more.
+    ///
+    /// Every document is the same length and holds the term once, so their
+    /// scores are bit identical rather than close, and `hot` holds it forty
+    /// times, which lifts the block it is in above every other block. Ties are
+    /// then settled by document identifier and nothing else, which is what the
+    /// caller of this wants to look at.
+    fn one_winner_and_a_field_of_ties(documents: usize, hot: usize) -> Vec<String> {
+        (0..documents)
+            .map(|at| {
+                let common = if at == hot { 40 } else { 1 };
+                let mut words = vec!["common"; common];
+                words.resize(100, "filler");
+                words.join(" ")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_tie_in_a_later_block_still_beats_the_page_on_document_order() {
+        // The bound ordered walk reads the block holding the winner first, and
+        // that block also fills the rest of the page with documents that tie.
+        // The block that comes second is full of documents that tie with those
+        // and have lower identifiers, and a tie is settled by identifier, so
+        // every one of them belongs on the page and the ones already there do
+        // not.
+        //
+        // This is the case a threshold test gets wrong by being strict. A
+        // document scoring exactly what the worst hit scores does get in when
+        // its identifier is lower, so a block of them cannot be dropped for
+        // failing to beat the bar.
+        let docs = one_winner_and_a_field_of_ties(BLOCK_SIZE * 2, BLOCK_SIZE + 72);
+        let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+        let bytes = build(&refs);
+        let segment = Segment::open(&bytes).expect("opens");
+        let index = Reader::open(&segment).expect("opens");
+        let hits = Searcher::new(&index).search("common", 3).expect("searches");
+
+        let wanted = by_hand(&index, &[b"common"], K1, B);
+        same(&hits, &wanted[..3]);
+        // Spelled out as well as compared, because the check by hand would
+        // agree with the walk if both of them preferred the wrong documents.
+        let docs: Vec<DocId> = hits.iter().map(|hit| hit.doc).collect();
+        assert_eq!(
+            docs,
+            vec![u32::try_from(BLOCK_SIZE + 72).expect("small"), 0, 1]
+        );
     }
 
     #[test]
