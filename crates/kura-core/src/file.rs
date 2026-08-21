@@ -676,6 +676,84 @@ impl Store {
         self.commit(manifest, written)
     }
 
+    /// Publishes a segment and deletions across any number of segments in one
+    /// commit.
+    ///
+    /// This is what replacing a document takes. The new copy and the deletion of
+    /// the old one have to become visible together, because a store that shows
+    /// both is a store that answers twice and a store that shows neither is a
+    /// store that lost a document, and the old copy is usually not in the same
+    /// segment as anything else being deleted in the same batch.
+    ///
+    /// Each set is the whole answer for its segment rather than a change to it,
+    /// the same rule [`delete`](Self::delete) follows and for the same reason: it
+    /// is the only form that can be replayed. A caller adding one document to
+    /// what a segment already hides passes the set it read back with one more in
+    /// it.
+    ///
+    /// Everything is on the platter before the manifest names any of it. The
+    /// segment is written and synced, then each bitmap is written and synced,
+    /// and only then does one manifest naming all of them go into the other slot
+    /// and get fsynced. A machine that stops anywhere in here comes back to the
+    /// store as it was, with some bytes in the segment region that nothing
+    /// points at, which is what the region being append only makes harmless.
+    ///
+    /// Passing `None` for the segment is a commit of deletions alone, which is
+    /// what deleting several documents that happen to live in different segments
+    /// looks like.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Trouble::Format`] with [`Error::RepeatedSegment`] if two sets
+    /// name the same segment, [`Error::MissingSection`] if a set names a segment
+    /// that is not there, [`Error::NoSuchDocument`] if a set names a document its
+    /// segment does not have, [`Error::TooManySegments`] if the new segment does
+    /// not fit the manifest, a decoding error if a set already committed cannot
+    /// be read back, and [`Trouble::Io`] if any write, sync or commit fails.
+    /// Nothing is committed unless all of it is.
+    pub fn publish(
+        &mut self,
+        segment: Option<(&[u8], u32)>,
+        created: u64,
+        deletions: &[(usize, Bitmap)],
+        written: u64,
+    ) -> Result<u64> {
+        for (n, (at, _)) in deletions.iter().enumerate() {
+            if deletions[..n].iter().any(|(earlier, _)| earlier == at) {
+                return Err(Trouble::Format(Error::RepeatedSegment { at: *at }));
+            }
+            if *at >= self.manifest.segments.len() {
+                return Err(Trouble::Format(Error::MissingSection { kind: 0 }));
+            }
+        }
+
+        // Read what each of them hides now before anything is written, because
+        // the live count is worked out from the difference and a half written
+        // batch should not have moved it.
+        let mut before = Vec::with_capacity(deletions.len());
+        for (at, _) in deletions {
+            before.push(self.committed_deletions(&self.manifest.segments[*at])?);
+        }
+
+        let mut manifest = self.manifest.clone();
+        if let Some((bytes, docs)) = segment {
+            let described = self.append_segment(bytes, docs, created)?;
+            manifest.segments.push(described);
+            manifest.total = manifest.total.saturating_add(u64::from(docs));
+            manifest.live = manifest.live.saturating_add(u64::from(docs));
+        }
+        for ((at, deleted), was) in deletions.iter().zip(before) {
+            let described = self.manifest.segments[*at];
+            let next = self.append_tombstones(&described, deleted)?;
+            manifest.segments[*at] = next;
+            manifest.live = manifest
+                .live
+                .saturating_add(was)
+                .saturating_sub(deleted.len() as u64);
+        }
+        self.commit(manifest, written)
+    }
+
     /// How many documents a committed descriptor says are deleted.
     ///
     /// Read back rather than remembered, because the store does not hold the
@@ -2413,6 +2491,171 @@ mod tests {
                 .expect("looked up"),
             Some((1, 0))
         );
+    }
+
+    #[test]
+    fn a_segment_and_the_deletions_that_go_with_it_arrive_in_one_commit() {
+        let path = path("publish");
+        let mut store = stored(&path, &[10, 10]);
+        let epoch = store.manifest().epoch;
+        let (bytes, docs) = built(100, 4);
+        store
+            .publish(
+                Some((&bytes, docs)),
+                1_700_000_100,
+                &[
+                    (0, Bitmap::from_sorted(&[0, 1])),
+                    (1, Bitmap::from_sorted(&[9])),
+                ],
+                7,
+            )
+            .expect("published");
+        // One commit for all three, which is what makes a replacement a single
+        // event rather than a window somebody can read half of.
+        assert_eq!(store.manifest().epoch, epoch + 1);
+        assert_eq!(store.manifest().segments.len(), 3);
+        assert_eq!(store.manifest().total, 24);
+        assert_eq!(store.manifest().live, 21);
+
+        let view = store.view().expect("a view");
+        assert_eq!(view.deleted(0).expect("read").expect("a set").len(), 2);
+        assert_eq!(view.deleted(1).expect("read").expect("a set").len(), 1);
+        assert_eq!(view.deleted(2).expect("read"), None);
+        assert_eq!(counted(&store), 21);
+    }
+
+    #[test]
+    fn deletions_alone_are_a_publish_without_a_segment() {
+        let path = path("publishnoseg");
+        let mut store = stored(&path, &[10, 10]);
+        store
+            .publish(
+                None,
+                0,
+                &[
+                    (0, Bitmap::from_sorted(&[3])),
+                    (1, Bitmap::from_sorted(&[4])),
+                ],
+                7,
+            )
+            .expect("published");
+        assert_eq!(store.manifest().segments.len(), 2);
+        assert_eq!(store.manifest().live, 18);
+        assert_eq!(counted(&store), 18);
+    }
+
+    #[test]
+    fn a_publish_naming_one_segment_twice_is_refused() {
+        // Two sets for one segment is a caller that has not decided what is
+        // deleted, and taking the later one would lose the other quietly.
+        let path = path("publishtwice");
+        let mut store = stored(&path, &[10, 10]);
+        let epoch = store.manifest().epoch;
+        let outcome = store.publish(
+            None,
+            0,
+            &[
+                (1, Bitmap::from_sorted(&[1])),
+                (1, Bitmap::from_sorted(&[2])),
+            ],
+            7,
+        );
+        assert!(matches!(
+            outcome,
+            Err(Trouble::Format(Error::RepeatedSegment { at: 1 }))
+        ));
+        assert_eq!(store.manifest().epoch, epoch);
+        assert_eq!(store.manifest().live, 20);
+    }
+
+    #[test]
+    fn a_publish_naming_a_segment_that_is_not_there_is_refused() {
+        let path = path("publishmissing");
+        let mut store = stored(&path, &[10]);
+        let outcome = store.publish(None, 0, &[(4, Bitmap::from_sorted(&[0]))], 7);
+        assert!(matches!(
+            outcome,
+            Err(Trouble::Format(Error::MissingSection { kind: 0 }))
+        ));
+        assert_eq!(store.manifest().live, 10);
+    }
+
+    #[test]
+    fn a_publish_whose_deletions_do_not_fit_their_segment_commits_nothing() {
+        // The segment is written before the bitmaps, so this is the case where
+        // half the batch is already on disk when the other half is refused.
+        let path = path("publishbaddoc");
+        let mut store = stored(&path, &[10]);
+        let epoch = store.manifest().epoch;
+        let (bytes, docs) = built(100, 4);
+        let outcome = store.publish(
+            Some((&bytes, docs)),
+            1_700_000_100,
+            &[(0, Bitmap::from_sorted(&[40]))],
+            7,
+        );
+        assert!(matches!(
+            outcome,
+            Err(Trouble::Format(Error::NoSuchDocument {
+                doc: 40,
+                documents: 10
+            }))
+        ));
+        // The bytes of the new segment are in the file and nothing names them,
+        // which is what an append only region makes harmless.
+        assert_eq!(store.manifest().epoch, epoch);
+        assert_eq!(store.manifest().segments.len(), 1);
+        assert_eq!(store.manifest().live, 10);
+        drop(store);
+        let store = Store::open(&path).expect("a store");
+        assert_eq!(store.manifest().segments.len(), 1);
+        assert_eq!(counted(&store), 10);
+    }
+
+    #[test]
+    fn a_published_batch_is_still_there_when_the_store_is_opened_again() {
+        let path = path("publishreopen");
+        let mut store = stored(&path, &[10, 10]);
+        let (bytes, docs) = built(100, 4);
+        store
+            .publish(
+                Some((&bytes, docs)),
+                1_700_000_100,
+                &[(0, Bitmap::from_sorted(&[0, 1, 2]))],
+                7,
+            )
+            .expect("published");
+        drop(store);
+
+        let store = Store::open(&path).expect("a store");
+        assert_eq!(store.manifest().segments.len(), 3);
+        assert_eq!(store.manifest().live, 21);
+        assert_eq!(counted(&store), 21);
+        let view = store.view().expect("a view");
+        assert_eq!(view.deleted(0).expect("read").expect("a set").len(), 3);
+    }
+
+    #[test]
+    fn publishing_deletions_twice_leaves_the_second_set_and_the_count_that_goes_with_it() {
+        // A set is the whole answer for its segment, so a caller that wants one
+        // more document gone passes the set it had with one more in it, and the
+        // live count follows the difference rather than the size of what it was
+        // handed.
+        let path = path("publishagain");
+        let mut store = stored(&path, &[10]);
+        store
+            .publish(None, 0, &[(0, Bitmap::from_sorted(&[0, 1]))], 7)
+            .expect("published");
+        assert_eq!(store.manifest().live, 8);
+        store
+            .publish(None, 0, &[(0, Bitmap::from_sorted(&[0, 1, 2]))], 8)
+            .expect("published");
+        assert_eq!(store.manifest().live, 7);
+        assert_eq!(counted(&store), 7);
+        // And the older set is still where it was, because a newer one is
+        // written somewhere else and the manifest is repointed.
+        let view = store.view().expect("a view");
+        assert_eq!(view.deleted(0).expect("read").expect("a set").len(), 3);
     }
 
     /// Changes one byte of a file in place, which is what a torn write leaves.
