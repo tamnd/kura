@@ -424,6 +424,57 @@ impl<'a> Segment<'a> {
     pub fn kinds(&self) -> impl Iterator<Item = u16> + '_ {
         (0..self.count).filter_map(move |index| self.entry(index).map(|(kind, _, _)| kind))
     }
+
+    /// Iterates the section table, in the order it was written.
+    ///
+    /// The whole entry rather than only the kind, which is what a tool that
+    /// prints a file's layout needs. Every entry was checked at open, so an
+    /// offset and a length here are known to fit inside the body.
+    pub fn sections(&self) -> impl Iterator<Item = Section> + '_ {
+        (0..self.count).filter_map(move |index| {
+            self.entry(index).map(|(kind, offset, length)| Section {
+                kind,
+                offset,
+                length,
+            })
+        })
+    }
+}
+
+/// One row of the section table.
+///
+/// The offset is from the start of the body and not from the start of the file,
+/// which is the same thing the table itself stores. Anything printing these for
+/// a person to compare against a hex dump has to add [`HEADER_LEN`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Section {
+    /// Which kind of section this is, from [`kind`].
+    pub kind: u16,
+    /// Where it starts, from the start of the body.
+    pub offset: u64,
+    /// How many bytes it holds.
+    pub length: u64,
+}
+
+/// The name a person knows a section kind by.
+///
+/// Returns `None` for a kind this build has never heard of, which is not an
+/// error: a reader skips an unknown section, and a tool that prints the table
+/// should say the number rather than pretend the section is not there.
+#[must_use]
+pub const fn name(kind: u16) -> Option<&'static str> {
+    match kind {
+        kind::TERMS => Some("terms"),
+        kind::POSTINGS => Some("postings"),
+        kind::FIELDS => Some("fields"),
+        kind::VECTORS => Some("vectors"),
+        kind::ACL => Some("acl"),
+        kind::COLUMNS => Some("columns"),
+        kind::GRAPH => Some("graph"),
+        kind::TOMBSTONES => Some("tombstones"),
+        kind::NORMS => Some("norms"),
+        _ => None,
+    }
 }
 
 /// Reads the checksum field out of a header that has already been length
@@ -438,6 +489,38 @@ fn stored_checksum(bytes: &[u8]) -> Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_section_table_reads_back_as_it_was_written() {
+        let mut writer = Writer::new();
+        writer.add(kind::TERMS, vec![1; 40]).expect("adds");
+        writer.add(kind::POSTINGS, vec![2; 400]).expect("adds");
+        let bytes = writer.finish();
+        let segment = Segment::open(&bytes).expect("opens");
+
+        let sections: Vec<Section> = segment.sections().collect();
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].kind, kind::TERMS);
+        assert_eq!(sections[0].length, 40);
+        assert_eq!(sections[1].kind, kind::POSTINGS);
+        assert_eq!(sections[1].length, 400);
+        // In the order written, and each one where the section itself is.
+        assert!(sections[0].offset < sections[1].offset);
+        for section in &sections {
+            let start = usize::try_from(section.offset).expect("fits");
+            let end = start + usize::try_from(section.length).expect("fits");
+            assert!(end <= segment.body.len());
+        }
+    }
+
+    #[test]
+    fn a_kind_has_a_name_and_an_unknown_kind_does_not() {
+        assert_eq!(name(kind::POSTINGS), Some("postings"));
+        assert_eq!(name(kind::NORMS), Some("norms"));
+        // Not an error, because a reader skips a section it has never heard of
+        // and a tool printing the table should say so rather than hide it.
+        assert_eq!(name(4_242), None);
+    }
 
     fn sample() -> Vec<u8> {
         let mut writer = Writer::new();

@@ -165,7 +165,7 @@ impl Writer {
 /// Opening one reads the header and nothing else. The terms stay where they are
 /// and are compared in place, so a lookup allocates a buffer for the one term it
 /// is reconstructing and nothing more.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct Reader<'a> {
     terms: u32,
     blocks: usize,
@@ -246,6 +246,22 @@ impl<'a> Reader<'a> {
         Ok(None)
     }
 
+    /// Walks every term in the dictionary, in order.
+    ///
+    /// For the tools rather than for a query. Nothing on the query path wants
+    /// every term, and anything that did would be a scan where a lookup would
+    /// do. What does want them is `verify`, which has to decode each posting
+    /// list to find out whether it decodes, and cannot ask for a list without
+    /// first knowing which term it belongs to.
+    #[must_use]
+    pub const fn entries(&self) -> Entries<'a> {
+        Entries {
+            reader: *self,
+            block: 0,
+            walk: None,
+        }
+    }
+
     /// The index of the last block whose first term is not after `term`, which
     /// is the only block that can hold it.
     fn block_for(&self, term: &[u8]) -> Result<Option<usize>> {
@@ -310,10 +326,59 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// A walk over every term in a dictionary, in order.
+///
+/// Made by [`Reader::entries`]. It is not an [`Iterator`], because a term is
+/// handed back as a slice of a buffer the walk owns and rewrites in place, and
+/// terms are stored as suffixes onto each other, so a term that outlived the
+/// call fetching the next one would be a term that had been overwritten.
+#[derive(Debug)]
+pub struct Entries<'a> {
+    /// The dictionary being walked, which is five words and copies freely.
+    reader: Reader<'a>,
+    /// The next block to open, so the walk below is over the block before it.
+    block: usize,
+    /// The block being walked, or nothing before the first and after the last.
+    walk: Option<Walk<'a>>,
+}
+
+impl Entries<'_> {
+    /// Reads the next term and its entry, or `None` past the end of the last
+    /// block.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever decoding a block returns, which is the point of having
+    /// this at all: a dictionary that has been damaged stops here, at the term
+    /// where the damage starts, rather than quietly reporting fewer terms than
+    /// it holds.
+    pub fn next_term(&mut self) -> Result<Option<(&[u8], Entry)>> {
+        // Blocks are opened here and not inside the read below, because a borrow
+        // of the walk that outlives one turn of a loop is a borrow the compiler
+        // will not grant. This leaves the walk on a block that has something in
+        // it, so the read after the loop either answers or is the end.
+        while self.walk.as_ref().is_none_or(Walk::is_done) {
+            if self.block >= self.reader.blocks {
+                return Ok(None);
+            }
+            self.walk = Some(self.reader.walk(self.block)?);
+            self.block += 1;
+        }
+        match &mut self.walk {
+            Some(walk) => walk.next_term(),
+            // Unreachable, since the loop above either left a walk in place or
+            // returned. Written out rather than unwrapped so that this cannot
+            // be the thing that panics on a damaged file.
+            None => Ok(None),
+        }
+    }
+}
+
 /// A walk over the terms of one block.
 ///
 /// It carries the term it last produced, because the next one is stored as a
 /// suffix onto a prefix of it.
+#[derive(Debug)]
 struct Walk<'a> {
     rest: &'a [u8],
     term: Vec<u8>,
@@ -322,6 +387,11 @@ struct Walk<'a> {
 }
 
 impl Walk<'_> {
+    /// Whether this block has nothing left in it.
+    const fn is_done(&self) -> bool {
+        self.rest.is_empty()
+    }
+
     /// Reads the next term and its entry, or `None` at the end of the block.
     fn next_term(&mut self) -> Result<Option<(&[u8], Entry)>> {
         if self.rest.is_empty() {
@@ -407,6 +477,71 @@ mod tests {
         let mut out: Vec<String> = (0..count).map(|i| format!("configuration{i:06}")).collect();
         out.sort();
         out
+    }
+
+    /// Every term a walk produces, with its entry.
+    fn walked(encoded: &[u8]) -> Vec<(Vec<u8>, Entry)> {
+        let reader = Reader::new(encoded).expect("header");
+        let mut entries = reader.entries();
+        let mut out = Vec::new();
+        while let Some((term, entry)) = entries.next_term().expect("walk") {
+            out.push((term.to_vec(), entry));
+        }
+        out
+    }
+
+    #[test]
+    fn a_walk_produces_every_term_in_order_and_stops() {
+        let words = vocabulary(500);
+        let refs: Vec<&str> = words.iter().map(String::as_str).collect();
+        let walked = walked(&build(&refs));
+
+        // Five hundred terms is several blocks, so this is also the check that
+        // the walk carries on across a block boundary rather than stopping at
+        // the end of the first one.
+        assert_eq!(walked.len(), words.len());
+        let mut offset = 0u64;
+        for (i, ((term, entry), word)) in walked.iter().zip(&words).enumerate() {
+            let len = (i as u64 % 7) + 1;
+            assert_eq!(term, word.as_bytes());
+            assert_eq!(entry.docs, u32::try_from(i).expect("small") + 1);
+            assert_eq!(entry.offset, offset);
+            assert_eq!(entry.len, len);
+            offset += len;
+        }
+    }
+
+    #[test]
+    fn a_walk_agrees_with_looking_each_term_up() {
+        // The two paths share the block decoder and nothing else. A walk that
+        // drifted from a lookup would mean `verify` checking a posting list that
+        // no query would ever ask for.
+        let words = vocabulary(300);
+        let refs: Vec<&str> = words.iter().map(String::as_str).collect();
+        let encoded = build(&refs);
+        let reader = Reader::new(&encoded).expect("header");
+
+        for (term, entry) in walked(&encoded) {
+            assert_eq!(reader.get(&term).expect("lookup"), Some(entry));
+        }
+    }
+
+    #[test]
+    fn a_walk_over_an_empty_dictionary_is_empty() {
+        assert!(walked(&Writer::new().finish()).is_empty());
+    }
+
+    #[test]
+    fn a_walk_that_has_ended_stays_ended() {
+        // Asking again after the end has to keep saying no. Calling code that
+        // loops until `None` would otherwise loop forever the moment a block
+        // boundary landed on the last term.
+        let encoded = build(&["alpha", "beta"]);
+        let reader = Reader::new(&encoded).expect("header");
+        let mut entries = reader.entries();
+        while entries.next_term().expect("walk").is_some() {}
+        assert!(entries.next_term().expect("walk").is_none());
+        assert!(entries.next_term().expect("walk").is_none());
     }
 
     #[test]
