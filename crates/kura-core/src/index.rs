@@ -49,6 +49,95 @@ const MAX_PAIR: usize = 10;
 /// The end of a chain.
 const NONE: u32 = u32::MAX;
 
+/// The size of one block of the arena the posting chains live in.
+///
+/// The arena grows by adding a block rather than by growing a vector, so the
+/// bytes already written are never copied and the process never holds two copies
+/// of the postings at once. A vector that doubles does both: it copies
+/// everything written so far at every growth, and for the length of that copy
+/// the old block and the new one are live together, which on a corpus whose
+/// postings come to forty six megabytes is a transient of about seventy.
+///
+/// A power of two, so that splitting an offset into a block and a position in it
+/// is a shift and a mask. A multiple of [`CHUNK`], so that a chunk never
+/// straddles two blocks and every read stays inside one slice.
+///
+/// Sixty four kilobytes is a thousand chunks, which is small enough that a
+/// writer given ten documents does not hold a megabyte and large enough that a
+/// writer given a large corpus spends its time indexing rather than allocating.
+const BLOCK: usize = 64 << 10;
+
+/// How far to shift an arena offset to get the block it is in.
+const BLOCK_SHIFT: u32 = BLOCK.trailing_zeros();
+
+/// What to mask an arena offset with to get its position in its block.
+const BLOCK_MASK: usize = BLOCK - 1;
+
+// The two things every accessor on the arena takes for granted. Checked here
+// rather than in a test, because a test that fails is a test somebody has to
+// run and this is a build that does not happen.
+const _: () = assert!(
+    BLOCK.is_power_of_two(),
+    "a block that is not a power of two is a block an offset cannot be split by shifting"
+);
+const _: () = assert!(
+    BLOCK.is_multiple_of(CHUNK),
+    "a block that is not a whole number of chunks is a block a chunk can straddle"
+);
+
+/// The bytes the posting chains live in.
+///
+/// Chunks are handed out in order and never given back, and an offset into this
+/// is a whole number that means the same thing for the life of the writer, which
+/// is what lets a chain be a list of `u32` links rather than a list of pointers.
+///
+/// Every accessor here takes a length and every range it is asked for lies
+/// inside a single chunk, which is why none of them has to deal with a read that
+/// crosses a block. That is not a hope, it is [`BLOCK`] being a multiple of
+/// [`CHUNK`].
+#[derive(Debug, Default)]
+struct Arena {
+    blocks: Vec<Box<[u8]>>,
+    /// How much of the last block has been handed out.
+    used: usize,
+}
+
+impl Arena {
+    /// Hands out one zeroed chunk and says where it starts.
+    fn chunk(&mut self) -> u32 {
+        if self.used == 0 || self.used == BLOCK {
+            // A fresh block is zeroed, and a chunk is handed out once, so
+            // nothing here ever has to be cleared again.
+            self.blocks.push(vec![0u8; BLOCK].into_boxed_slice());
+            self.used = 0;
+        }
+        let at = (self.blocks.len() - 1) * BLOCK + self.used;
+        self.used += CHUNK;
+        u32::try_from(at).expect("the arena is under four gigabytes")
+    }
+
+    /// `len` bytes from `at`, which must not run past the chunk `at` is in.
+    fn at(&self, at: usize, len: usize) -> &[u8] {
+        let offset = at & BLOCK_MASK;
+        &self.blocks[at >> BLOCK_SHIFT][offset..offset + len]
+    }
+
+    /// The same, to write into.
+    fn at_mut(&mut self, at: usize, len: usize) -> &mut [u8] {
+        let offset = at & BLOCK_MASK;
+        &mut self.blocks[at >> BLOCK_SHIFT][offset..offset + len]
+    }
+
+    /// How many bytes this is holding.
+    ///
+    /// The whole of every block, including the part of the last one that has not
+    /// been handed out yet, because that is what the allocator is holding.
+    fn held(&self) -> u64 {
+        holding::<u8>(self.blocks.len().saturating_mul(BLOCK))
+            + holding::<Box<[u8]>>(self.blocks.capacity())
+    }
+}
+
 /// Builds an index from documents.
 ///
 /// Documents are numbered in the order they are added, from zero, and that
@@ -353,7 +442,7 @@ impl Writer {
 #[derive(Debug, Default)]
 struct Accumulator {
     vocabulary: Vocabulary,
-    arena: Vec<u8>,
+    arena: Arena,
     head: Vec<u32>,
     tail: Vec<u32>,
     used: Vec<u32>,
@@ -414,7 +503,9 @@ impl Accumulator {
         if self.used[at] as usize + MAX_PAIR > PAYLOAD {
             let next = self.chunk();
             let tail = self.tail[at] as usize;
-            self.arena[tail..tail + LINK].copy_from_slice(&next.to_le_bytes());
+            self.arena
+                .at_mut(tail, LINK)
+                .copy_from_slice(&next.to_le_bytes());
             self.tail[at] = next;
             self.used[at] = 0;
         }
@@ -422,7 +513,8 @@ impl Accumulator {
         put_uvarint(&mut self.scratch, u64::from(gap));
         put_uvarint(&mut self.scratch, u64::from(frequency));
         let start = self.tail[at] as usize + LINK + self.used[at] as usize;
-        self.arena[start..start + self.scratch.len()].copy_from_slice(&self.scratch);
+        let len = self.scratch.len();
+        self.arena.at_mut(start, len).copy_from_slice(&self.scratch);
         self.used[at] += u32::try_from(self.scratch.len()).expect("a pair is at most ten bytes");
     }
 
@@ -441,7 +533,7 @@ impl Accumulator {
             + holding::<u32>(self.stamp.capacity())
             + holding::<u32>(self.frequency.capacity());
         Held {
-            postings: holding::<u8>(self.arena.capacity())
+            postings: self.arena.held()
                 + per_term
                 + holding::<u32>(self.touched.capacity())
                 + holding::<u8>(self.scratch.capacity()),
@@ -452,9 +544,10 @@ impl Accumulator {
 
     /// Adds an empty chunk and returns where it starts.
     fn chunk(&mut self) -> u32 {
-        let at = u32::try_from(self.arena.len()).expect("the arena is under four gigabytes");
-        self.arena.resize(self.arena.len() + CHUNK, 0);
-        self.arena[at as usize..at as usize + LINK].copy_from_slice(&NONE.to_le_bytes());
+        let at = self.arena.chunk();
+        self.arena
+            .at_mut(at as usize, LINK)
+            .copy_from_slice(&NONE.to_le_bytes());
         at
     }
 
@@ -481,12 +574,12 @@ impl Accumulator {
         let mut doc: DocId = 0;
         for index in 0..self.documents[at] {
             if offset + MAX_PAIR > PAYLOAD {
-                let link = &self.arena[chunk..chunk + LINK];
+                let link = self.arena.at(chunk, LINK);
                 chunk = u32::from_le_bytes(link.try_into().expect("four bytes")) as usize;
                 offset = 0;
             }
             let start = chunk + LINK + offset;
-            let rest = &self.arena[start..chunk + CHUNK];
+            let rest = self.arena.at(start, chunk + CHUNK - start);
             let (gap, rest) = get_uvarint(rest)?;
             let (frequency, rest) = get_uvarint(rest)?;
             offset = chunk + CHUNK - rest.len() - chunk - LINK;
@@ -1108,6 +1201,64 @@ mod tests {
             let _ = index.postings(b"the");
             let _ = index.length(0);
         }
+    }
+
+    #[test]
+    fn the_arena_hands_out_each_chunk_once_and_keeps_them_apart() {
+        // Enough to cross several blocks, because the failure this is looking
+        // for is two chunks in different blocks landing on the same offset,
+        // which nothing inside a single block can show.
+        let wanted = 4 * BLOCK / CHUNK + 3;
+        let mut arena = Arena::default();
+        let handed: Vec<u32> = (0..wanted).map(|_| arena.chunk()).collect();
+
+        let mut seen: Vec<u32> = handed.clone();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), handed.len(), "a chunk was handed out twice");
+
+        // Written to through the accessor and read back through it, so that an
+        // offset that decoded to the wrong block would show up as somebody
+        // else's bytes rather than as nothing at all.
+        for (nth, at) in handed.iter().enumerate() {
+            let mark = u32::try_from(nth).expect("a few thousand");
+            arena
+                .at_mut(*at as usize, LINK)
+                .copy_from_slice(&mark.to_le_bytes());
+        }
+        for (nth, at) in handed.iter().enumerate() {
+            let bytes = arena.at(*at as usize, LINK);
+            let read = u32::from_le_bytes(bytes.try_into().expect("four bytes"));
+            assert_eq!(read as usize, nth, "chunk {nth} at {at} read back wrong");
+        }
+    }
+
+    #[test]
+    fn a_chain_that_runs_over_many_blocks_decodes() {
+        // One term in every document, so its chain is the longest a corpus of
+        // this size can produce, and enough documents that the chain alone runs
+        // past a block. Every other term is there to push the chain's chunks
+        // apart, because a chain whose chunks happen to be consecutive is a
+        // chain that would decode even if the links were ignored.
+        let documents = 8 * BLOCK / CHUNK;
+        let mut writer = Writer::new();
+        for doc in 0..documents {
+            writer.add(&format!("common d{doc} d{doc}")).expect("adds");
+        }
+        let bytes = writer.finish().expect("finishes");
+        let segment = Segment::open(&bytes).expect("opens");
+        let index = Reader::open(&segment).expect("opens");
+
+        let found = index
+            .postings(b"common")
+            .expect("decodes")
+            .expect("the term is there")
+            .to_postings()
+            .expect("decodes");
+        let wanted: Vec<(DocId, u32)> = (0..documents)
+            .map(|doc| (DocId::try_from(doc).expect("a few thousand"), 1))
+            .collect();
+        assert_eq!(found, wanted);
     }
 
     #[test]
