@@ -36,12 +36,49 @@ pub enum Error {
         expected: u16,
     },
 
-    /// A checksum did not match, so the bytes changed after they were written.
+    /// A CRC-32 checksum did not match, so the bytes changed after they were
+    /// written.
     ChecksumMismatch {
         /// The checksum stored in the file.
         stored: u32,
         /// The checksum computed over the bytes that were read.
         computed: u32,
+    },
+
+    /// An xxh3-128 checksum did not match, so the bytes changed after they were
+    /// written.
+    ///
+    /// Separate from [`Error::ChecksumMismatch`] because the two cover different
+    /// parts of the file with different algorithms, and the first question after
+    /// a checksum failure is which check failed.
+    Xxh3Mismatch {
+        /// The checksum stored in the file.
+        stored: u128,
+        /// The checksum computed over the bytes that were read.
+        computed: u128,
+    },
+
+    /// Neither manifest slot could be read, so the store has no committed state
+    /// to open at.
+    ///
+    /// A store with one damaged slot opens on the other one, which is the whole
+    /// point of there being two. Both failing at once means either the file was
+    /// never a store or the damage reaches further than the manifest.
+    NoManifest,
+
+    /// A manifest claims more segments than one slot holds.
+    TooManySegments {
+        /// The count the manifest asked for.
+        count: usize,
+    },
+
+    /// The superblock declares a page size this build does not use, so every
+    /// structural offset in the file would be in the wrong place.
+    UnsupportedPageSize {
+        /// The page size found in the file.
+        found: u32,
+        /// The page size this build writes.
+        expected: u32,
     },
 
     /// Two vectors of different lengths were compared, which is a caller bug
@@ -130,6 +167,22 @@ impl fmt::Display for Error {
                     f,
                     "checksum mismatch: stored {stored:#010x}, computed {computed:#010x}"
                 )
+            }
+            Self::Xxh3Mismatch { stored, computed } => {
+                write!(
+                    f,
+                    "checksum mismatch: stored {stored:#034x}, computed {computed:#034x}"
+                )
+            }
+            Self::NoManifest => f.write_str("neither manifest slot is readable"),
+            Self::TooManySegments { count } => {
+                write!(
+                    f,
+                    "manifest claims {count} segments, which is more than one slot holds"
+                )
+            }
+            Self::UnsupportedPageSize { found, expected } => {
+                write!(f, "page size {found} is not the {expected} this build uses")
             }
             Self::DimensionMismatch { left, right } => {
                 write!(f, "vectors of different lengths: {left} and {right}")

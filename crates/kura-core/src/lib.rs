@@ -26,6 +26,7 @@ pub mod error;
 pub mod explain;
 pub mod index;
 pub mod lz;
+pub mod manifest;
 pub mod posting;
 pub mod residency;
 pub mod search;
