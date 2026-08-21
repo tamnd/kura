@@ -152,6 +152,23 @@ pub fn get_u64(input: &[u8]) -> Result<(u64, &[u8])> {
     Ok((u64::from_le_bytes(buf), rest))
 }
 
+/// Writes a little endian `u128`.
+pub fn put_u128(out: &mut Vec<u8>, value: u128) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+/// Reads a little endian `u128` from the front of `input`.
+///
+/// # Errors
+///
+/// Returns [`Error::Truncated`] if fewer than sixteen bytes are available.
+pub fn get_u128(input: &[u8]) -> Result<(u128, &[u8])> {
+    let (head, rest) = split_at(input, 16)?;
+    let mut buf = [0u8; 16];
+    buf.copy_from_slice(head);
+    Ok((u128::from_le_bytes(buf), rest))
+}
+
 /// Splits `input` at `n`, or reports how much was missing.
 ///
 /// # Errors
