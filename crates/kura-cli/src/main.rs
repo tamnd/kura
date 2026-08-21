@@ -536,6 +536,35 @@ fn label(
     }
 }
 
+/// The high water mark read at three points in an index run.
+///
+/// A high water mark never falls, so these are cumulative rather than separate,
+/// and each one says how much further the work between it and the one before it
+/// pushed the worst the process had been. That is what separates the memory a
+/// writer accumulates from the memory the finish needs to turn it into a segment
+/// from the pages of the file that was just written.
+///
+/// A platform that will not answer leaves them all as errors and the run says
+/// nothing rather than printing zeroes.
+#[derive(Default)]
+struct Marks {
+    documents: Option<Result<u64, &'static str>>,
+    built: Option<Result<u64, &'static str>>,
+    written: Option<Result<u64, &'static str>>,
+}
+
+impl Marks {
+    /// The three readings, or nothing if this system does not keep them.
+    fn read(&self) -> Option<(u64, u64, u64)> {
+        match (&self.documents, &self.built, &self.written) {
+            (Some(Ok(documents)), Some(Ok(built)), Some(Ok(written))) => {
+                Some((*documents, *built, *written))
+            }
+            _ => None,
+        }
+    }
+}
+
 /// What an index run was asked to do, once its arguments have been read.
 struct Plan {
     inputs: Vec<PathBuf>,
@@ -615,6 +644,7 @@ fn index(args: &[String]) -> Result<(), Failure> {
     let mut skipped = 0usize;
     let mut segments = 0usize;
     let mut peak = Held::default();
+    let mut marks = Marks::default();
     for file in &files {
         let Ok(content) = fs::read(file) else {
             skipped += 1;
@@ -654,6 +684,13 @@ fn index(args: &[String]) -> Result<(), Failure> {
         }
     }
 
+    // Three readings of the same high water mark, taken either side of the two
+    // things that happen after the reading is done. Nothing lowers a high water
+    // mark, so what each of these says is how much further the one before it was
+    // pushed, and that is the only way to tell the memory that accumulates from
+    // the memory a finish needs from the pages of the file that was written.
+    let read_documents = Some(residency::peak_resident());
+
     // The last flush, and on a run without the option the only one. A writer
     // holding nothing is not written out, because a segment of no documents is a
     // segment every later reader has to skip over for the rest of the file's
@@ -663,11 +700,17 @@ fn index(args: &[String]) -> Result<(), Failure> {
         let segment = writer.finish()?;
         written += segment.len() as u64;
         documents += count;
+        let read_built = Some(residency::peak_resident());
         segments = if into_store {
             add_to_store(&out, &segment, count)?
         } else {
             fs::write(&out, &segment).map_err(|error| Failure::Io(out.clone(), error))?;
             1
+        };
+        marks = Marks {
+            documents: read_documents,
+            built: read_built,
+            written: Some(residency::peak_resident()),
         };
     }
     let took = started.elapsed();
@@ -692,6 +735,14 @@ fn index(args: &[String]) -> Result<(), Failure> {
         report::bytes(peak.stored),
         report::bytes(peak.lengths)
     );
+    if let Some((by_document, by_build, by_write)) = marks.read() {
+        println!(
+            "peak resident {} by the last document, {} once the segment was built, {} once it was written",
+            report::bytes(by_document),
+            report::bytes(by_build),
+            report::bytes(by_write)
+        );
+    }
     if into_store {
         println!("{} now holds {segments} segments", out.display());
     }

@@ -207,7 +207,30 @@ The same tree at four budgets, three runs each, and the numbers were identical o
 
 Two things fall out of that table.
 The postings are about three quarters of what a writer holds and the vocabulary is most of the rest, so a change that made the stored fields cheaper would be a change nobody could measure.
-And what the writer holds is only about half of what the process holds, at every budget, so the other half is the finish that turns a writer into a segment plus the pages of the store being written, and neither of those is bounded by `--flush-every` at all.
+And what the writer holds is only about half of what the process holds, at every budget, so the other half is somewhere else entirely and `--flush-every` does not bound it.
+
+A third line says where that other half is.
+
+```
+peak resident 93.4 MB by the last document, 111.7 MB once the segment was built, 111.7 MB once it was written
+```
+
+That is the high water mark of the whole process, the same number `/usr/bin/time` reports, read at three points.
+A high water mark never falls, so each reading says how much further the work since the one before it pushed the worst the process had been.
+Three runs of the tree above with no budget, so one segment:
+
+| | by the last document | once the segment was built | once it was written |
+| --- | --- | --- | --- |
+| run 1 | 96.6 MB | 108.4 MB | 108.4 MB |
+| run 2 | 93.4 MB | 111.7 MB | 111.7 MB |
+| run 3 | 109.2 MB | 118.1 MB | 118.1 MB |
+
+Writing the file costs nothing, on every run.
+Turning the writer into a segment costs 9 to 18 MB, which is about the size of the segment, and it is a real cost that no budget bounds because it happens once per segment however many there are.
+Everything else, and it is the largest part, is already there by the last document: the writer says it is holding 63.7 MB and the process has 93 to 109 MB, so 30 to 45 MB of it is the allocator rather than anything the engine knows about.
+
+Unlike the held numbers these move from run to run, because they are the whole process and the whole process is at the mercy of what else the machine is doing.
+Read them as a shape and not as a measurement.
 
 ## Looking at the file itself
 
