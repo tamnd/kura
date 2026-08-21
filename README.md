@@ -159,6 +159,35 @@ The rank column in a run file is ignored and the score decides the order, ties b
 By default a query the run did not answer is not scored at all, which is `trec_eval` without its `-c` flag.
 Pass `--complete` to score it as a zero instead, which is the honest choice when comparing two engines, because an engine that returns nothing for its hard queries should not score as though nobody asked them.
 
+## Bounding what an index run holds at once
+
+```sh
+./target/release/kura-cli index ./corpus -o /tmp/docs.kura --store --flush-every 32m
+```
+
+Without that option an index run keeps every posting in memory until the last file has been read, so the memory it needs is set by the size of what it was pointed at rather than by anything the machine can promise.
+`--flush-every` finishes a segment once that much text has gone in and starts a new one, so the memory is set by the budget instead.
+
+The Go source tree at go1.26.6, which is 10,888 text files and 106.4 MB, on an M4 with the files already in page cache, five runs each and the range across them:
+
+| budget | segments | wall | peak RSS |
+| --- | --- | --- | --- |
+| none | 1 | 1.0 s | 120 to 122 MB |
+| 32m | 4 | 1.0 to 1.1 s | 77 to 101 MB |
+| 8m | 14 | 1.2 to 1.5 s | 58 to 66 MB |
+| 2m | 49 | 2.1 to 3.2 s | 46 to 48 MB |
+
+It is a trade and the table is the shape of it.
+A budget near the corpus size costs nothing measurable and takes off about a third of the memory.
+A budget far below it holds the memory near the budget and starts costing real time, because every flush pays for a term dictionary and the segments the query has to merge across get more numerous.
+
+The segments cost disk as well.
+The same corpus is 14.3 MB in one segment and 17.4 MB across fourteen, which is 22 percent more, and it is the term dictionary being written fourteen times.
+
+Ranking does not change.
+Ten queries at depth 100 against the same corpus in one segment and in fourteen produced the same 1000 lines, the same documents in the same order with the same scores at every rank.
+Querying is not slower either, and on this corpus the fourteen segment version was slightly faster, 262 to 312 microseconds a query against 298 to 568.
+
 ## Looking at the file itself
 
 ```sh
