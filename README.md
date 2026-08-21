@@ -212,28 +212,30 @@ The postings are about three quarters of what a writer holds and the vocabulary 
 What the writer holds is also well under what the process holds, and a third line says where the difference is.
 
 ```
-peak resident 76.1 MB by the last document, 118.6 MB once the segment was built, 118.6 MB once it was written
+peak resident 122.0 MB, of which 86.1 MB by the last document, 15.2 MB more merging the postings, 20.6 MB more laying the segment out, 80.0 KB more writing it
 ```
 
-That is the high water mark of the whole process, the same number `/usr/bin/time` reports, read at three points.
-A high water mark never falls, so each reading says how much further the work since the one before it pushed the worst the process had been.
+That is the high water mark of the whole process, the same number `/usr/bin/time` reports, read at four points and reported as what each step added.
+A high water mark never falls, so the difference between two readings is how much further the work between them pushed the worst the process had been.
 Five runs of the tree above with no budget, so one segment:
 
-| | by the last document | once the segment was built | once it was written |
-| --- | --- | --- | --- |
-| run 1 | 80.2 MB | 111.3 MB | 111.3 MB |
-| run 2 | 69.6 MB | 113.4 MB | 113.5 MB |
-| run 3 | 84.2 MB | 127.9 MB | 127.9 MB |
-| run 4 | 79.1 MB | 123.0 MB | 123.0 MB |
-| run 5 | 76.1 MB | 118.6 MB | 118.6 MB |
+| | total | by the last document | merging the postings | laying the segment out | writing it |
+| --- | --- | --- | --- | --- | --- |
+| run 1 | 122.0 MB | 86.1 MB | 15.2 MB | 20.6 MB | 80.0 KB |
+| run 2 | 130.5 MB | 90.2 MB | 19.7 MB | 20.6 MB | 0 B |
+| run 3 | 111.3 MB | 69.3 MB | 21.3 MB | 20.6 MB | 96.0 KB |
+| run 4 | 121.6 MB | 90.2 MB | 10.7 MB | 20.6 MB | 64.0 KB |
+| run 5 | 126.6 MB | 84.0 MB | 21.9 MB | 20.6 MB | 0 B |
 
-Writing the file costs nothing, on every run.
-Reading the corpus costs 9 to 24 MB over what the writer says it holds, which is the allocator and the buffer each file is read into.
-Turning the writer into a segment costs 31 to 44 MB, which is more than twice the 14.3 MB the segment comes to, and it is the largest single part of an index run.
-It is also the part no budget bounds, because it happens once per segment however many segments there are.
+Writing the file costs nothing.
+Laying the segment out costs 20.6 MB on every run, to the tenth of a megabyte, because it is a copy of a thing whose size is decided by the corpus and not by the machine.
+The segment it produces is 14.3 MB, so laying it out costs about a copy and a half of it, and that is a copy that only exists because the finished bytes are handed back as a vector rather than written where they are going.
+Merging the postings costs 11 to 22 MB, which is the encoded lists and the term dictionary being built while the writer that fed them is still holding everything.
+The rest is already there by the last document, and it is most of it.
 
-Unlike the held numbers these move from run to run, because they are the whole process and the whole process is at the mercy of what else the machine is doing.
-Read them as a shape and not as a measurement.
+Unlike the held numbers the total moves from run to run, because it is the whole process and the whole process is at the mercy of what else the machine is doing.
+Read it as a shape and not as a measurement.
+The two middle steps are steadier, because they are the engine doing arithmetic on a corpus rather than the operating system handing out pages.
 
 ## Looking at the file itself
 

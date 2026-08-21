@@ -549,20 +549,57 @@ fn label(
 #[derive(Default)]
 struct Marks {
     documents: Option<Result<u64, &'static str>>,
-    built: Option<Result<u64, &'static str>>,
+    merged: Option<Result<u64, &'static str>>,
+    laid_out: Option<Result<u64, &'static str>>,
     written: Option<Result<u64, &'static str>>,
 }
 
 impl Marks {
-    /// The three readings, or nothing if this system does not keep them.
-    fn read(&self) -> Option<(u64, u64, u64)> {
-        match (&self.documents, &self.built, &self.written) {
-            (Some(Ok(documents)), Some(Ok(built)), Some(Ok(written))) => {
-                Some((*documents, *built, *written))
-            }
+    /// The four readings, or nothing if this system does not keep them.
+    fn read(&self) -> Option<[u64; 4]> {
+        match (&self.documents, &self.merged, &self.laid_out, &self.written) {
+            (Some(Ok(a)), Some(Ok(b)), Some(Ok(c)), Some(Ok(d))) => Some([*a, *b, *c, *d]),
             _ => None,
         }
     }
+
+    /// Prints them, or prints nothing on a system that does not keep them.
+    ///
+    /// The first number is the whole of it and the three after it are what each
+    /// step added, because a reader who wants to know where to look next wants
+    /// the steps and a reader who wants to know whether this run fits on the
+    /// machine wants the total.
+    fn tell(&self) {
+        let Some([documents, merged, laid_out, written]) = self.read() else {
+            return;
+        };
+        println!(
+            "peak resident {}, of which {} by the last document, {} more merging the postings, {} more laying the segment out, {} more writing it",
+            report::bytes(written),
+            report::bytes(documents),
+            report::bytes(merged - documents),
+            report::bytes(laid_out - merged),
+            report::bytes(written - laid_out)
+        );
+    }
+}
+
+/// Prints what a writer was holding at its largest.
+///
+/// Split rather than totalled, because the total on its own says a run needs so
+/// much more memory than the text takes and stops there, and the parts are what
+/// say which of them to go after. The number is the largest a single writer got,
+/// so on a run with --flush-every it is the peak of one segment and not of the
+/// corpus.
+fn tell_held(peak: Held) {
+    println!(
+        "held at most {} at once, {} postings, {} vocabulary, {} stored fields, {} lengths",
+        report::bytes(peak.total()),
+        report::bytes(peak.postings),
+        report::bytes(peak.vocabulary),
+        report::bytes(peak.stored),
+        report::bytes(peak.lengths)
+    );
 }
 
 /// What an index run was asked to do, once its arguments have been read.
@@ -684,11 +721,12 @@ fn index(args: &[String]) -> Result<(), Failure> {
         }
     }
 
-    // Three readings of the same high water mark, taken either side of the two
-    // things that happen after the reading is done. Nothing lowers a high water
-    // mark, so what each of these says is how much further the one before it was
-    // pushed, and that is the only way to tell the memory that accumulates from
-    // the memory a finish needs from the pages of the file that was written.
+    // Four readings of the same high water mark, taken either side of the three
+    // things that happen after the last document has been read. Nothing lowers a
+    // high water mark, so what each of these says is how much further the one
+    // before it was pushed, and that is the only way to tell the memory that
+    // accumulates from the memory the merge needs from the memory the segment is
+    // laid out in from the pages of the file that was written.
     let read_documents = Some(residency::peak_resident());
 
     // The last flush, and on a run without the option the only one. A writer
@@ -697,10 +735,15 @@ fn index(args: &[String]) -> Result<(), Failure> {
     // life.
     if !writer.is_empty() || documents == 0 {
         let count = writer.len();
-        let segment = writer.finish()?;
+        // Split where the engine splits it, so the reading between the two says
+        // what the merge cost and what the copy cost rather than what the pair
+        // of them came to.
+        let built = Writer::build(vec![writer])?;
+        let read_merged = Some(residency::peak_resident());
+        let segment = built.finish();
+        let read_laid_out = Some(residency::peak_resident());
         written += segment.len() as u64;
         documents += count;
-        let read_built = Some(residency::peak_resident());
         segments = if into_store {
             add_to_store(&out, &segment, count)?
         } else {
@@ -709,7 +752,8 @@ fn index(args: &[String]) -> Result<(), Failure> {
         };
         marks = Marks {
             documents: read_documents,
-            built: read_built,
+            merged: read_merged,
+            laid_out: read_laid_out,
             written: Some(residency::peak_resident()),
         };
     }
@@ -722,27 +766,8 @@ fn index(args: &[String]) -> Result<(), Failure> {
         report::bytes(written),
         took
     );
-    // Split rather than totalled, because the total on its own says a run needs
-    // three times the memory the text takes and stops there, and the three parts
-    // are what say which of them to go after. The number is the largest a single
-    // writer got, so on a run with --flush-every it is the peak of one segment
-    // and not of the corpus.
-    println!(
-        "held at most {} at once, {} postings, {} vocabulary, {} stored fields, {} lengths",
-        report::bytes(peak.total()),
-        report::bytes(peak.postings),
-        report::bytes(peak.vocabulary),
-        report::bytes(peak.stored),
-        report::bytes(peak.lengths)
-    );
-    if let Some((by_document, by_build, by_write)) = marks.read() {
-        println!(
-            "peak resident {} by the last document, {} once the segment was built, {} once it was written",
-            report::bytes(by_document),
-            report::bytes(by_build),
-            report::bytes(by_write)
-        );
-    }
+    tell_held(peak);
+    marks.tell();
     if into_store {
         println!("{} now holds {segments} segments", out.display());
     }
