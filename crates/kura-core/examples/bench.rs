@@ -782,11 +782,12 @@ fn segments(postings: &[u8]) {
 /// visible pause. Thirty two megabytes because a smaller buffer measures the
 /// last level cache rather than the loop.
 ///
-/// Both algorithms, because the format is moving from one to the other and the
-/// case for moving rests entirely on the ratio between these two lines. A
+/// Both algorithms, because the format has just moved from one to the other and
+/// the case for moving rested entirely on the ratio between these two lines. A
 /// checksum that is affordable on open buys one number over a whole file. One
 /// that is affordable on every touch buys a number per block, which is what
-/// makes damage locatable.
+/// makes damage locatable. CRC-32 goes when #57 does, and until then this is
+/// what says whether that was the right call.
 fn checksums() {
     let data: Vec<u8> = (0..32u32 << 20)
         .map(|i| (i.wrapping_mul(37) % 251) as u8)

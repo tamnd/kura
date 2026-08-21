@@ -547,9 +547,10 @@ fn identity(path: &Path, now: u64) -> u128 {
 /// A whole file check on every open is also the wrong shape for the job. It
 /// answers "was this file ever damaged" at a cost paid by every query, when the
 /// question a query needs answered is "is the block I am about to decode
-/// intact". Per section checksums are on the plan for the same reason, and when
-/// they land this stops being a trade and `--verify` goes back to being what it
-/// says: an explicit check of a file you have a reason to doubt.
+/// intact". The format now checksums each section rather than the body, which
+/// is half of the way there: a reader can check the dictionary without reading
+/// the postings. A number per block is what would close it, and until that
+/// lands this stays a trade rather than a free check.
 fn open(bytes: &[u8], verify: bool) -> Result<Segment<'_>, Failure> {
     if verify {
         Ok(Segment::open(bytes)?)
