@@ -26,6 +26,10 @@ An `unwrap` in a function that reads a byte slice is a crash waiting for the one
 **One encoding per value.** If an input can be spelled two ways and both decode, reject the one the encoder would not have produced.
 Formats with two spellings grow canonicalisation bugs.
 
+**A format change is a decision, not a diff.** `crates/kura-core/tests/format.rs` holds a segment and a store written by an earlier build and compares them both ways, so a change to what the writer produces or to what a decoder accepts fails there.
+Rewriting the fixture to make it pass is the wrong move.
+Move `FORMAT_VERSION`, teach `kura-cli migrate` the step, keep the old fixture as the input to a test of that step, and write a new fixture beside it.
+
 **No panic crosses the FFI boundary.** Every entry point in `kura-ffi` catches, returns a status code, and writes its out parameters before any failure path returns.
 
 **Unsafe carries a reason.** Every unsafe block needs a `// SAFETY:` comment saying which caller obligation makes it sound.

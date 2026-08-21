@@ -181,6 +181,22 @@ That is the whole forward compatibility story.
 A later build can add a section kind, and every file it writes stays readable by every build that came before.
 The version is a refusal and the kind is a shrug, and keeping those two apart is what makes it possible to add to the format without a migration.
 
+## What holds the format still
+
+Everything above is a description, and a description drifts.
+The thing that keeps it honest is `crates/kura-core/tests/format.rs`, which holds two files written by an earlier build and checked into `testdata/format`: a bare segment and a store with two segments in it, a manifest and a log ring.
+
+It runs them both ways.
+Writing the fixture again and comparing it byte for byte catches a change to what this build produces, including one a reader would happily accept, such as a field that grew or an ordering that moved.
+Reading the checked in bytes and asking them the same questions catches this build no longer understanding a file it wrote before, which is the failure that matters to somebody with data on disk and the one a change to a decoder alone can cause.
+
+The byte for byte half also pins the writer to being deterministic.
+A writer that walked a hash map would pass every other test in the crate and fail this one on somebody else's machine, and the fixtures are checked by CI on five platforms, so a number that came out of the host rather than the input has nowhere to hide.
+
+A failure here is not a broken test.
+It is a format change, and the answer to it is to move the version, teach `kura-cli migrate` the step from the old version to the new one, keep the old fixture as the input to a test of that step, and write a new fixture beside it.
+`KURA_BLESS=1` writes the fixtures rather than checking them, which is how a new one is made, and it is deliberately awkward to reach for.
+
 ## Reading without the checksums
 
 `Segment::open` verifies everything.
