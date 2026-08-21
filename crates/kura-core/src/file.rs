@@ -435,7 +435,11 @@ impl Store {
     /// so the check is about the same segment rather than about the same place
     /// in the file: a compaction that dropped a segment and an append that later
     /// reused the space is a different segment starting again at nothing, which
-    /// is not a step backwards.
+    /// is not a step backwards. The footer digest is zero on every segment this
+    /// engine has written so far, so today the match is by offset alone and the
+    /// reuse case would be refused. Nothing reuses an offset yet, because the
+    /// region is append only and space comes back by rewriting the file, and the
+    /// check reads correctly the moment the digest is filled in.
     ///
     /// Deletions only accumulate until a compaction rewrites the segment, so a
     /// generation that goes backwards means two writers hold different ideas of
