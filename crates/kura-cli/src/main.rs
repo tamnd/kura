@@ -44,7 +44,7 @@ use std::io::{BufWriter, Write as _};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use kura_core::analysis::Analyzer;
 use kura_core::file::{Store, Trouble};
@@ -1178,31 +1178,41 @@ fn query(args: &[String], explaining: bool) -> Result<(), Failure> {
     // counters read zero on a query where the pruning is working perfectly. The
     // default here is therefore the page walk, which is the one the pruning
     // applies to, and `--total` explains the other one on purpose.
-    let started = Instant::now();
+    // The stopwatch goes inside the probe rather than around it. Starting a
+    // probe scans the whole mapping to see what of it is already resident,
+    // which on an index of any size is most of a millisecond, and charging that
+    // to the query makes every query look like it took the same time. It is the
+    // search that is being timed here, not the instrument around it.
+    let mut took = Duration::ZERO;
     let (hits, total, counters) = match (explaining, with_total) {
         // Wrapped in a probe, so the report can say how much of the index was
         // already in memory and how much of it this query had to fetch. Only
         // `explain` pays for it, and only `explain` prints it.
         (true, false) => {
             let ((hits, total), counters) = residency::measured(index, || {
+                let started = Instant::now();
                 let (hits, counters) = searcher.search_explained(&text, k)?;
+                took = started.elapsed();
                 Ok::<_, Failure>(((hits, None), counters))
             })?;
             (hits, total, counters)
         }
         (true, true) => {
             let ((hits, total), counters) = residency::measured(index, || {
+                let started = Instant::now();
                 let (hits, total, counters) = searcher.search_and_count_explained(&text, k)?;
+                took = started.elapsed();
                 Ok::<_, Failure>(((hits, Some(total)), counters))
             })?;
             (hits, total, counters)
         }
         (false, _) => {
+            let started = Instant::now();
             let (hits, total) = searcher.search_and_count(&text, k)?;
+            took = started.elapsed();
             (hits, Some(total), kura_core::explain::Counters::default())
         }
     };
-    let took = started.elapsed();
 
     if explaining {
         let walk = if with_total {
