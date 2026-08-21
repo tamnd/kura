@@ -25,6 +25,7 @@
 mod eval;
 mod map;
 mod report;
+mod verify;
 
 use std::fmt;
 use std::fs;
@@ -78,6 +79,7 @@ usage:
   kura-cli explain <index> <query>           print what the query did to find them
   kura-cli topics <index> <topics> -o <run>  answer a file of queries into a run file
   kura-cli eval <qrels> <run>                score a run file against judgments
+  kura-cli verify <index>                    read an index through and report what is wrong
 
 options:
   -k <n>        how many results, for search and explain (default 10)
@@ -105,12 +107,41 @@ fn run() -> Result<(), Failure> {
         "explain" => query(&rest, true),
         "topics" => topics(&rest),
         "eval" => evaluate(&rest),
+        "verify" => check(&rest),
         "-h" | "--help" | "help" => {
             println!("{USAGE}");
             Ok(())
         }
         other => Err(Failure::usage(format!("unknown command {other}"))),
     }
+}
+
+/// Reads an index all the way through and says whether it is intact.
+///
+/// The report goes to standard output whatever it says, because a person who
+/// ran this wants to see it either way, and a damaged index is a failing exit
+/// rather than an error, because the report has already said everything there
+/// is to say about it. See [`verify`] for what is checked and what is not.
+fn check(args: &[String]) -> Result<(), Failure> {
+    let [path] = args else {
+        return Err(Failure::usage("wanted one index file"));
+    };
+    let path = Path::new(path);
+
+    let mut out = BufWriter::new(std::io::stdout());
+    let outcome = verify::check(path, &mut out).map_err(|error| {
+        // Reading the index and writing the report both come back as an io
+        // error here, and only one of them has a path worth printing. The
+        // report goes through a buffer, so a failure writing it surfaces at the
+        // flush below rather than out of here.
+        Failure::Io(path.to_path_buf(), error)
+    })?;
+    out.flush().map_err(Failure::Stdout)?;
+
+    if outcome.failures > 0 {
+        return Err(Failure::Damaged(path.to_path_buf(), outcome.failures));
+    }
+    Ok(())
 }
 
 /// Answers every query in a topics file and writes a run file.
@@ -596,6 +627,8 @@ enum Failure {
     Empty(PathBuf, &'static str),
     /// The engine refused the data.
     Engine(kura_core::Error),
+    /// An index was read through and found to be damaged, and how badly.
+    Damaged(PathBuf, usize),
 }
 
 impl Failure {
@@ -619,6 +652,9 @@ impl fmt::Display for Failure {
             Self::Format(path, bad) => write!(f, "{}: {bad}", path.display()),
             Self::Empty(path, why) => write!(f, "{}: {why}", path.display()),
             Self::Engine(error) => write!(f, "{error}"),
+            Self::Damaged(path, count) => {
+                write!(f, "{}: {count} checks failed", path.display())
+            }
         }
     }
 }

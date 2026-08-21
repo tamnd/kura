@@ -626,9 +626,30 @@ impl<'a> Reader<'a> {
     ///
     /// Returns an error if the dictionary or the posting list does not decode.
     pub fn postings(&self, term: &[u8]) -> Result<Option<posting::Reader<'a>>> {
-        let Some(entry) = self.terms.get(term)? else {
-            return Ok(None);
-        };
+        match self.terms.get(term)? {
+            Some(entry) => self.list(entry).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Walks every term in the index, in order.
+    ///
+    /// Paired with [`list`](Self::list), which takes the entry a walk hands
+    /// back without looking the term up a second time. Together they are what a
+    /// tool reading the whole index needs, and nothing a query does.
+    #[must_use]
+    pub const fn entries(&self) -> terms::Entries<'a> {
+        self.terms.entries()
+    }
+
+    /// The posting list an entry points at.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::SectionOutOfRange`] if the entry points outside the
+    /// postings section, and a decoding error if the list it points at is not a
+    /// posting list.
+    pub fn list(&self, entry: terms::Entry) -> Result<posting::Reader<'a>> {
         let out_of_range = || Error::SectionOutOfRange {
             kind: kind::POSTINGS,
             offset: entry.offset,
@@ -640,7 +661,7 @@ impl<'a> Reader<'a> {
         if end > self.postings.len() {
             return Err(out_of_range());
         }
-        posting::Reader::new(&self.postings[start..end]).map(Some)
+        posting::Reader::new(&self.postings[start..end])
     }
 }
 
