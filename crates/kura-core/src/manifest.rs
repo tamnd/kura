@@ -647,26 +647,48 @@ pub fn locate(
     manifest: &Manifest,
     len: usize,
 ) -> Result<Vec<core::ops::Range<usize>>> {
-    let mut ranges = Vec::with_capacity(manifest.segments.len());
-    for segment in &manifest.segments {
-        if segment.offset < superblock.segments_offset {
-            return Err(Error::SectionOutOfRange {
-                kind: 0,
-                offset: segment.offset,
-                length: segment.len,
-            });
-        }
-        let start = index_of(segment.offset, len)?;
-        let end = index_of(segment.offset.saturating_add(segment.len), len)?;
-        if end > len {
-            return Err(Error::Truncated {
-                needed: end,
-                available: len,
-            });
-        }
-        ranges.push(start..end);
-    }
-    Ok(ranges)
+    locate_each(superblock, manifest, len).into_iter().collect()
+}
+
+/// Where each of a store's segments sits, one answer per segment.
+///
+/// [`locate`] refuses the whole manifest when one descriptor in it is wrong,
+/// which is the right answer for a reader: a store that cannot be believed about
+/// where its segments are is a store nothing should be querying. It is the wrong
+/// answer for a repair, which exists to look at exactly that manifest and work
+/// out how much of it is still good, so this reports per descriptor and leaves
+/// the decision to the caller.
+///
+/// The check itself is the same one and lives here only, because a second copy
+/// of it somewhere else is a second thing to get wrong.
+#[must_use]
+pub fn locate_each(
+    superblock: &Superblock,
+    manifest: &Manifest,
+    len: usize,
+) -> Vec<Result<core::ops::Range<usize>>> {
+    manifest
+        .segments
+        .iter()
+        .map(|segment| {
+            if segment.offset < superblock.segments_offset {
+                return Err(Error::SectionOutOfRange {
+                    kind: 0,
+                    offset: segment.offset,
+                    length: segment.len,
+                });
+            }
+            let start = index_of(segment.offset, len)?;
+            let end = index_of(segment.offset.saturating_add(segment.len), len)?;
+            if end > len {
+                return Err(Error::Truncated {
+                    needed: end,
+                    available: len,
+                });
+            }
+            Ok(start..end)
+        })
+        .collect()
 }
 
 /// The bytes of every segment in a store, oldest first.

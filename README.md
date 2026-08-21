@@ -185,6 +185,30 @@ The same corpus indexed by two builds produces two identical dumps, and where th
 A dump prints terms and stored fields, which is to say it prints the corpus back out.
 Whatever rules the corpus came with apply to what comes out of here.
 
+## Getting a store back after a bad byte
+
+```sh
+./target/release/kura-cli repair /tmp/docs.kura
+./target/release/kura-cli repair /tmp/docs.kura --commit
+```
+
+A segment is immutable and holds no redundancy, so a segment with a wrong byte in it stays wrong and no tool is going to change that.
+What a store holds twice is its manifest, and a manifest is the list of which segments count, so there is exactly one repair available: commit a manifest that leaves out the segments that no longer read and keep the rest.
+
+```
+  segment 1 of 3         reads, 22 documents
+  segment 2 of 3         does not read, 1 checks failed, 6 documents
+  segment 3 of 3         reads, 1 documents
+
+  dropping 1 of 3 segments loses 6 of 29 documents
+```
+
+That trade is a loss, and the documents it costs were already unreachable before it ran, since a segment that does not decode was not answering queries either.
+What changes is that the rest of the store becomes usable again, which is the difference between losing part of a corpus and losing all of it.
+It prints what it would do and writes nothing until it is given `--commit`, and the segments it decides about are the ones `verify` calls damaged, using the same checks, so it never drops a segment that `verify` had just called good.
+
+It writes one manifest into the slot that is not the committed one, which is the path every ordinary commit takes, so the repair is itself recoverable: the manifest it replaced stays in the store until the commit after it.
+
 ## Calling it from C
 
 ```c

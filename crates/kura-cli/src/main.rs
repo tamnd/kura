@@ -1,6 +1,6 @@
 //! Command line access to a kura index.
 //!
-//! Seven commands, in three groups.
+//! Eight commands, in three groups.
 //!
 //! `index` builds an index out of a directory so there is something to ask
 //! questions of. `search` runs a query and prints what came back. `explain`
@@ -19,16 +19,20 @@
 //! file against judgments, and between them a ranking change stops being a
 //! matter of opinion. See [`eval`] for what the numbers mean.
 //!
-//! `verify` and `dump` are the third group, and they are for the file rather
-//! than for the answers. `verify` reads an index all the way through and says
-//! whether it is intact. `dump` prints what is in it, one record to a line, for
-//! the questions that start with somebody not believing what came back.
+//! `verify`, `dump` and `repair` are the third group, and they are for the file
+//! rather than for the answers. `verify` reads an index all the way through and
+//! says whether it is intact. `dump` prints what is in it, one record to a line,
+//! for the questions that start with somebody not believing what came back.
+//! `repair` is what comes after a `verify` that failed, and it does the one
+//! repair a store supports, which is committing a manifest that leaves out the
+//! segments that no longer read.
 //!
 //! There are no dependencies here for the same reason there are none in the
 //! engine. Argument parsing is forty lines and a crate is forever.
 
 mod dump;
 mod eval;
+mod repair;
 mod report;
 mod verify;
 
@@ -102,6 +106,7 @@ usage:
   kura-cli eval <qrels> <run>                score a run file against judgments
   kura-cli verify <index>                    read an index through and report what is wrong
   kura-cli dump <index>                      print what is in an index, one record to a line
+  kura-cli repair <store>                    drop the segments that no longer read
 
 options:
   -k <n>        how many results, for search and explain (default 10)
@@ -118,6 +123,7 @@ options:
   --documents   for dump, a line per stored field rather than a line per term
   --term <t>    for dump, only this term, which reads no others
   --limit <n>   for dump, stop after this many records
+  --commit      for repair, write the manifest rather than only say what it would be
 
 an <index> is either a single segment, which is what index writes by default,
 or a store holding any number of them, which is what --store writes into. Every
@@ -128,6 +134,11 @@ a dump is tab separated with a comment line naming its columns, and every line
 says which segment it came from. It prints terms and stored fields, which is to
 say it prints the corpus, so treat what comes out of it the way the corpus it
 came from has to be treated.
+
+a repair prints what it would do and writes nothing until it is given --commit,
+because what it does is throw documents away. It never touches a segment, only
+the manifest that names them, and the manifest it replaces stays in the store
+until the commit after it.
 
 formats:
   topics    one query per line, the identifier and the text separated by a tab
@@ -146,6 +157,7 @@ fn run() -> Result<(), Failure> {
         "eval" => evaluate(&rest),
         "verify" => check(&rest),
         "dump" => show(&rest),
+        "repair" => mend(&rest),
         "-h" | "--help" | "help" => {
             println!("{USAGE}");
             Ok(())
@@ -252,6 +264,42 @@ fn check(args: &[String]) -> Result<(), Failure> {
         return Err(Failure::Damaged(path.to_path_buf(), outcome.failures));
     }
     Ok(())
+}
+
+/// Drops the segments of a store that no longer read.
+///
+/// The exit code answers one question, which is whether the store is readable
+/// as it stands. A store with nothing wrong with it and a store that has just
+/// had its damage committed away both succeed. A dry run over a damaged store
+/// fails, because the report is accurate and nothing was fixed, and a script
+/// that ran this without `--commit` should not carry on as though it had. See
+/// [`repair`] for what the one repair is and why there is only one.
+fn mend(args: &[String]) -> Result<(), Failure> {
+    let mut positional = Vec::new();
+    let mut commit = false;
+    for arg in args {
+        match arg.as_str() {
+            "--commit" => commit = true,
+            other if other.starts_with("--") => {
+                return Err(Failure::usage(format!("unknown option {other}")));
+            }
+            other => positional.push(other),
+        }
+    }
+    let [path] = positional[..] else {
+        return Err(Failure::usage("wanted one store file"));
+    };
+    let path = Path::new(path);
+
+    let mut out = BufWriter::new(std::io::stdout());
+    let outcome = repair::repair(path, commit, now(), &mut out)
+        .map_err(|trouble| Failure::Store(path.to_path_buf(), trouble))?;
+    out.flush().map_err(Failure::Stdout)?;
+
+    if outcome.settled() {
+        return Ok(());
+    }
+    Err(Failure::Damaged(path.to_path_buf(), outcome.damaged))
 }
 
 /// Answers every query in a topics file and writes a run file.
