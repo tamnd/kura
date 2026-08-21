@@ -189,11 +189,18 @@ The Go source tree at go1.26.6, which is 10,888 text files and 106.4 MB, on an M
 
 Two things to read out of that.
 
-What a run holds is the budget plus one document, and one document on this tree is worth up to 6.3 MB.
+What a run holds is the budget plus one document, and one document on this tree is worth up to 6.0 MB.
 Every array with an entry per term grows by adding a block rather than by doubling, so nothing a term is counted in can take a step that depends on how much has been indexed already, and the largest step one document takes is the same at the end of a large corpus as at the start.
-The largest step over the whole tree is 6.3 MB and it is one file, `debug/buildinfo/testdata/go117/go117.base64`, which is 1.3 MB of base64 in which almost every token is a term nothing else in the tree holds.
-That is why the 8m row lands at 12.2 MB and the 32m row at 36.1 MB.
-The arrays used to double, and then the same run took a 8.9 MB step, an ordinary 100 KB source file could cost 4.7 MB on its own, and the step grew with the corpus rather than staying put.
+A run with a budget says which document that was and how much it added, because it is the only part of what a run holds that cannot be read off the rest of the report.
+
+```
+held at most 12.2 MB at once, 8.3 MB postings, 3.5 MB vocabulary, 365.3 KB stored fields, 4.0 KB lengths
+the most one document added was 6.0 MB, ./corpus/debug/buildinfo/testdata/go117/go117.base64, so a budget of 8.0 MB held 12.2 MB
+```
+
+That file is 1.3 MB of base64 in which almost every token is a term nothing else in the tree holds, and it costs that wherever in the run it lands.
+It is why the 8m row lands at 12.2 MB and the 32m row at 36.1 MB.
+The arrays used to double, and then the same run took an 8.9 MB step, an ordinary 100 KB source file could cost 4.7 MB on its own, and the step grew with the corpus rather than staying put.
 
 The process holds about 40 MB more than the writer says it holds, at every budget.
 That is the allocator's slack, the file being read, and the segment going down, and it is additive rather than proportional, so a machine with 200 MB to spare can be told 150m and be believed.
