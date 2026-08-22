@@ -772,7 +772,17 @@ impl Writer {
 /// The wide ceilings are read out before the narrow ones, because finishing the
 /// writer consumes it. The order the two sections go into the table is the order
 /// they are laid out on disk and nothing a reader depends on.
-fn add_ceilings(segment: &mut SegmentWriter, ceilings: bound::Writer) -> Result<()> {
+///
+/// Shared with [`crate::compact`] rather than written out twice, because the two
+/// widths and the rule about a segment with nothing to skip are one decision. A
+/// merge that made that decision on its own would write a segment the writer
+/// would not have written, and the first thing that would go wrong is that it
+/// would go wrong silently.
+///
+/// # Errors
+///
+/// Returns [`Error::TooManySections`] if the segment cannot take another one.
+pub(crate) fn add_ceilings(segment: &mut SegmentWriter, ceilings: bound::Writer) -> Result<()> {
     if ceilings.is_empty() {
         return Ok(());
     }

@@ -25,7 +25,7 @@
 use crate::bitmap::Bitmap;
 use crate::codec::{put_u32, put_u64};
 use crate::error::{Error, Result};
-use crate::index::{Reader, average, key_index};
+use crate::index::{Reader, add_ceilings, average, key_index};
 use crate::search::{B, K1};
 use crate::segment::{Segment, Writer as SegmentWriter, kind};
 use crate::{DocId, bound, length, posting, store, terms};
@@ -39,12 +39,13 @@ const GONE: DocId = DocId::MAX;
 /// the list is stated once so that adding a section to the format is a compile
 /// time visit to this module rather than a silent loss the next compaction
 /// causes.
-const CARRIED: [u16; 8] = [
+const CARRIED: [u16; 9] = [
     kind::TERMS,
     kind::POSTINGS,
     kind::NORMS,
     kind::ROUNDED,
     kind::BOUNDS,
+    kind::WIDE_BOUNDS,
     kind::FIELDS,
     kind::KEYS,
     kind::KEY_FILTER,
@@ -203,9 +204,7 @@ pub fn merge(sources: &[Source<'_>]) -> Result<Merged> {
     segment.add(kind::POSTINGS, blob)?;
     segment.add(kind::NORMS, norms)?;
     segment.add(kind::ROUNDED, rounded)?;
-    if !ceilings.is_empty() {
-        segment.add(kind::BOUNDS, ceilings.finish())?;
-    }
+    add_ceilings(&mut segment, ceilings)?;
     if let Some(fields) = fields(sources, &mapping)? {
         segment.add(kind::FIELDS, fields)?;
     }
@@ -741,5 +740,58 @@ mod tests {
             index.average_length()
         );
         assert_eq!(index.documents(), 300);
+    }
+
+    #[test]
+    fn a_merge_carries_the_ceilings_at_both_of_the_widths_a_segment_keeps_them() {
+        // The ceilings are kept twice, at a block and at a finer grain, and a
+        // merge that wrote one of them and not the other would produce a segment
+        // that answers correctly and skips less of the work it could have
+        // skipped. Nothing about a query would say so, which is why this asks
+        // the segment what sections it has rather than asking it a question.
+        let docs: Vec<&str> = core::iter::repeat_n("word word", 400).collect();
+        let bytes = build(&docs);
+        let source = Source::new(&bytes, None).expect("opens");
+        let merged = merged(&[source]);
+
+        let written = Segment::open(&bytes).expect("opens");
+        let folded = Segment::open(&merged).expect("opens");
+        let mut kinds: Vec<u16> = written.kinds().collect();
+        kinds.sort_unstable();
+        let mut carried: Vec<u16> = folded.kinds().collect();
+        carried.sort_unstable();
+        assert!(kinds.contains(&kind::BOUNDS));
+        assert!(kinds.contains(&kind::WIDE_BOUNDS));
+        assert_eq!(carried, kinds);
+        assert_eq!(
+            merged, bytes,
+            "a merge of one whole segment is that segment"
+        );
+    }
+
+    #[test]
+    fn every_section_kind_there_is_is_either_carried_or_refused_on_purpose() {
+        // The sections a merge has no way to carry yet. Being in here is a
+        // decision that a segment holding one is refused, which is the loud
+        // failure. The quiet one is a kind in neither list, which is a section
+        // this module has never heard of and would drop, and that is what this
+        // test is for.
+        const REFUSED: [u16; 5] = [
+            kind::VECTORS,
+            kind::ACL,
+            kind::COLUMNS,
+            kind::GRAPH,
+            kind::TOMBSTONES,
+        ];
+        for kind in kind::KNOWN {
+            assert!(
+                CARRIED.contains(&kind) || REFUSED.contains(&kind),
+                "nothing here says what a merge does with a section of kind {kind}"
+            );
+            assert!(
+                !(CARRIED.contains(&kind) && REFUSED.contains(&kind)),
+                "a section of kind {kind} is both carried and refused"
+            );
+        }
     }
 }
