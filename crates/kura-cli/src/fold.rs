@@ -75,7 +75,7 @@ pub fn fold(path: &Path, keep: usize, now: u64, out: &mut impl Write) -> Result<
         return Ok(None);
     }
 
-    perform(&mut store, 0..held, path, now, out).map(Some)
+    perform(&mut store, 0..held, None, path, now, out).map(Some)
 }
 
 /// Folds whichever run the policy says is due, or says that none is.
@@ -99,14 +99,15 @@ pub fn due(path: &Path, now: u64, out: &mut impl Write) -> Result<Option<Compact
         return Ok(None);
     };
     let policy = Policy::default();
+    let deleted = deletions(&store)?;
     said(out, "segments", store.manifest().segments.len() as u64)?;
     said(out, "documents", store.manifest().total)?;
     said(out, "  live", store.manifest().live)?;
     said(out, "file bytes", length(path))?;
     writeln!(out)?;
-    levels(&store, policy, out)?;
+    levels(&store, &deleted, policy, out)?;
 
-    let Some(job) = policy.choose(&store.manifest().segments) else {
+    let Some(job) = policy.choose_with(&store.manifest().segments, &deleted) else {
         writeln!(out)?;
         writeln!(out, "  nothing is due, so nothing was folded")?;
         return Ok(None);
@@ -114,13 +115,35 @@ pub fn due(path: &Path, now: u64, out: &mut impl Write) -> Result<Option<Compact
     writeln!(out)?;
     writeln!(
         out,
-        "  folding {} segments at level {}, {} bytes, because {}",
+        "  folding {} of them at level {}, {} bytes and {} of {} documents deleted,",
         job.run.len(),
         job.level,
         job.bytes,
+        job.dead,
+        job.docs
+    )?;
+    writeln!(
+        out,
+        "  into level {}, because {}",
+        job.into,
         job.reason.why()
     )?;
-    perform(&mut store, job.run, path, now, out).map(Some)
+    perform(&mut store, job.run, Some(job.into), path, now, out).map(Some)
+}
+
+/// How many documents each segment of a store has had deleted.
+///
+/// Counted out of the bitmaps rather than read off the manifest, because the
+/// manifest says how long a tombstone set is and not how many documents are in
+/// it, and a compressed bitmap of one deletion and a compressed bitmap of a
+/// thousand can be the same number of bytes.
+fn deletions(store: &Store) -> Result<Vec<u64>> {
+    let view = store.view()?;
+    let mut counts = Vec::with_capacity(view.len());
+    for at in 0..view.len() {
+        counts.push(view.deleted(at)?.map_or(0, |set| set.len() as u64));
+    }
+    Ok(counts)
 }
 
 /// Opens a store, or says why the file in front of it is not one.
@@ -146,7 +169,12 @@ fn opened(path: &Path, out: &mut impl Write) -> Result<Option<Store>> {
 /// It is printed whether or not anything is due, because a report that only
 /// spoke when it was folding would leave somebody asking why it was not folding
 /// with nothing to read.
-fn levels(store: &Store, policy: Policy, out: &mut impl Write) -> std::io::Result<()> {
+fn levels(
+    store: &Store,
+    deleted: &[u64],
+    policy: Policy,
+    out: &mut impl Write,
+) -> std::io::Result<()> {
     let segments = &store.manifest().segments;
     let deepest = segments.iter().map(|segment| segment.level).max();
     let Some(deepest) = deepest else {
@@ -156,18 +184,24 @@ fn levels(store: &Store, policy: Policy, out: &mut impl Write) -> std::io::Resul
     for level in 0..=deepest {
         let at: Vec<_> = segments
             .iter()
-            .filter(|segment| segment.level == level)
+            .enumerate()
+            .filter(|(_, segment)| segment.level == level)
             .collect();
         if at.is_empty() {
             continue;
         }
         let bytes: u64 = at
             .iter()
-            .map(|segment| {
+            .map(|(_, segment)| {
                 segment
                     .len
                     .saturating_add(u64::from(segment.tombstones_len))
             })
+            .sum();
+        let docs: u64 = at.iter().map(|(_, segment)| u64::from(segment.docs)).sum();
+        let dead: u64 = at
+            .iter()
+            .map(|(position, _)| deleted.get(*position).copied().unwrap_or(0))
             .sum();
         let counted = if at.len() == 1 { "segment" } else { "segments" };
         if level == 0 {
@@ -185,6 +219,16 @@ fn levels(store: &Store, policy: Policy, out: &mut impl Write) -> std::io::Resul
                 policy.capacity(level)
             )?;
         }
+        // Rounded up, because the rule fires at the share rather than past it,
+        // so the figure printed is the first count that would fold.
+        let due_at = docs
+            .saturating_mul(u64::from(policy.dead_share))
+            .saturating_add(99)
+            / 100;
+        writeln!(
+            out,
+            "               {dead:>10} of {docs} documents deleted, a rewrite is due at {due_at}"
+        )?;
     }
     Ok(())
 }
@@ -193,12 +237,13 @@ fn levels(store: &Store, policy: Policy, out: &mut impl Write) -> std::io::Resul
 fn perform(
     store: &mut Store,
     run: core::ops::Range<usize>,
+    into: Option<u32>,
     path: &Path,
     now: u64,
     out: &mut impl Write,
 ) -> Result<Compacted> {
     let start = Instant::now();
-    let done = store.compact(run, now, now)?;
+    let done = store.compact_into(run, into, now, now)?;
     let took = start.elapsed();
     writeln!(out)?;
     writeln!(out, "  {:<20} {:>12.2} s", "fold wall", took.as_secs_f32())?;
@@ -243,6 +288,7 @@ fn length(path: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kura_core::bitmap::Bitmap;
     use kura_core::index::Writer;
 
     /// A fixed time, so that nothing here depends on the clock.
@@ -388,6 +434,59 @@ mod tests {
         // And the one that came out of it is not due again.
         let mut out = Vec::new();
         assert!(due(&path, WHEN, &mut out).expect("asks").is_none());
+    }
+
+    #[test]
+    fn a_store_with_enough_of_it_deleted_is_rewritten_where_it_stands() {
+        // Two segments of five, four documents deleted between them, which is
+        // four in ten and over the share.
+        let path = a_store("deaddue", 2);
+        let mut store = Store::open(&path).expect("a store");
+        store
+            .delete(0, &Bitmap::from_sorted(&[0, 1, 2]), WHEN)
+            .expect("deleted");
+        store
+            .delete(1, &Bitmap::from_sorted(&[4]), WHEN)
+            .expect("deleted");
+        assert_eq!(store.manifest().live, 6);
+        drop(store);
+
+        let mut out = Vec::new();
+        let done = due(&path, WHEN, &mut out).expect("folds").expect("a fold");
+        assert_eq!(done.folded, 2);
+        assert_eq!(done.documents, 6);
+        assert_eq!(done.dropped, 4);
+        let report = String::from_utf8(out).expect("the report is text");
+        assert!(report.contains("pay for the rewrite"), "{report}");
+        assert!(report.contains("4 of 10 documents deleted"), "{report}");
+
+        let store = Store::open(&path).expect("a store");
+        assert_eq!(store.manifest().segments.len(), 1);
+        assert_eq!(store.manifest().live, 6);
+        assert_eq!(store.manifest().total, 6);
+        // A rewrite that dropped dead documents is not a level of growth, so
+        // the segment that came out of it is where the ones that went in were.
+        assert_eq!(store.manifest().segments[0].level, 0);
+        // And nothing is due of it now, because what it was folded for is gone.
+        let mut out = Vec::new();
+        assert!(due(&path, WHEN, &mut out).expect("asks").is_none());
+    }
+
+    #[test]
+    fn a_store_with_a_few_deleted_is_left_alone() {
+        // One in ten, which is under the share, so the dead weight stays where
+        // it is until there is enough of it to pay for the rewrite.
+        let path = a_store("deadfew", 2);
+        let mut store = Store::open(&path).expect("a store");
+        store
+            .delete(0, &Bitmap::from_sorted(&[3]), WHEN)
+            .expect("deleted");
+        drop(store);
+
+        let mut out = Vec::new();
+        assert!(due(&path, WHEN, &mut out).expect("asks").is_none());
+        let report = String::from_utf8(out).expect("the report is text");
+        assert!(report.contains("a rewrite is due at 3"), "{report}");
     }
 
     #[test]
