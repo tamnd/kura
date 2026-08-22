@@ -707,6 +707,69 @@ These numbers replace an earlier set that had the quiet median at 0.48 ms rather
 That measurement was not wrong about the store, it was measuring something else: nearly all of it was a reader hashing every byte of the store on the way in, which is the section below.
 It also had the folding taking the read tail down rather than leaving it alone, and that was the same artefact, because the reader with the most segments open was the reader with the most hashing to do.
 
+## What a query costs at a load somebody chose
+
+The section above has the reader asking as fast as it can, which is a load nobody runs at.
+A latency budget is a promise about what a query costs at a rate the operator picked, so the reader takes one:
+
+```sh
+cargo run --release --example serving -- ./src /var/lib/kura 1000 10000
+```
+
+Every argument that is a number is queries a second, and the whole measurement is run again at each of them.
+The reader holds to the rate rather than to the gap, so the hundredth query is due a hundred gaps after the first whatever the ninety ninth cost, and if the reader is behind it does not wait.
+That matters more than it sounds.
+A reader that sleeps for a gap, wakes, and starts its clock on waking is reporting the queries it managed and leaving out the ones it could not get to, and the ones it could not get to are the slow ones.
+So a run also prints what the client waited, measured from when a query was due rather than from when it started, and it says plainly when a condition did not hold the rate it was offered.
+
+The same corpus and the same machine as the section above, five runs of each, and each cell is the middle of the five:
+
+| offered | condition | segments at the end | median | p95 | p99 |
+| --- | --- | --- | --- | --- | --- |
+| 1,000 a second | quiet | 1 | 6.1 µs | 28.0 µs | 60.5 µs |
+| | writing | 13 | 25.9 µs | 98.1 µs | 384.8 µs |
+| | writing and folding | 6 | 33.5 µs | 101.2 µs | 479.8 µs |
+| 10,000 a second | quiet | 1 | 3.7 µs | 13.4 µs | 29.9 µs |
+| | writing | 14 | 15.1 µs | 49.5 µs | 139.8 µs |
+| | writing and folding | 6 | 18.8 µs | 54.6 µs | 152.5 µs |
+
+The first thing in it has nothing to do with writing.
+A query costs 6.1 µs when the reader asks a thousand times a second and 3.1 µs when it asks as fast as it can, against the same store with nothing else running.
+An idle reader pays twice what a busy one pays, because it comes back to a cold cache and a core it has been taken off, and every number in this file that was measured by a saturated reader is a floor rather than a service level.
+
+The rest of it says the same thing as the saturated run, which is the point of running it.
+Writing costs the reader three to four times at the median and five to six at p99.
+Folding beside the writing costs 25 to 30 percent at the median and lands inside the run to run spread at p99, where the five runs at 10,000 a second gave the folding condition 67.5, 137.9, 152.5, 193.0 and 349.6 µs against 114.3, 128.3, 139.8, 250.5 and 458.1 for the writing alone.
+
+Above about 50,000 a second one reader thread offering a rate stops being a measurement on this machine, since the sleeping and waking costs more than the query and the reader falls behind while the writers run.
+The wait is not worth reading too closely either.
+On this operating system a thread that asks to be woken in a hundred microseconds is woken about a third late, which is the timer and not the store, and the tail of the waiting moves by more between two runs of the quiet condition than it does between the conditions.
+
+## What it costs when there is no core to spare
+
+Everything folding costs a reader on the machine above is the core the keeper takes, and that machine has ten of them for four writers, a keeper and a reader.
+The case that would argue for a rate limit is the one with nothing spare, which is `threads=<n>` rather than a smaller machine:
+
+```sh
+cargo run --release --example serving -- ./src /var/lib/kura threads=10 10000
+```
+
+Ten writers on ten cores, 10,000 queries a second, five runs, each cell the middle of the five:
+
+| condition | segments at the end | median | p95 | p99 |
+| --- | --- | --- | --- | --- |
+| quiet | 1 | 4.8 µs | 14.4 µs | 27.2 µs |
+| writing | 15 | 9.9 µs | 50.9 µs | 200.4 µs |
+| writing and folding | 8 | 17.2 µs | 61.1 µs | 186.1 µs |
+
+So the cost of folding to a reader does grow when the cores run out, from 25 percent at the median with four writers to 74 percent with ten, and it is still not in the tail.
+The tail belongs to the writing at every load and every writer count tried here.
+
+That is worth stating as a conclusion rather than a table, because it is what a rate limit would have been built against.
+A compactor that yields when read p99 goes over a budget would never fire, on this machine, at any of these loads: p99 does not move when the folding starts.
+What moves is the median, by a few microseconds, and what moves it is a thread wanting a core.
+A limit that watched the median and paused the keeper would be buying back those microseconds by letting the segment count climb, and the section below is what a segment count costs.
+
 ## What a segment count costs a query
 
 The section above says a store of several segments answers more slowly than the same documents in one, and so does most of the rest of this file.
