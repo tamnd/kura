@@ -80,6 +80,7 @@
 //! writer will touch, and the space the older set is in comes back when a
 //! compaction rewrites the segment rather than when the newer set is written.
 
+use std::cell::Cell;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::Path;
@@ -178,6 +179,12 @@ pub struct Store {
     /// store, and the store may well be opened next by a process that wants
     /// something else.
     durability: Reach,
+    /// How many syncs this store has made since it was opened.
+    ///
+    /// A cell because syncing takes the store by shared reference, and a sync
+    /// that was counted is one that has already happened, so nothing reads this
+    /// while it moves.
+    syncs: Cell<u64>,
 }
 
 /// Where the segment region ends, according to a manifest.
@@ -275,6 +282,7 @@ impl Store {
             log,
             segments,
             durability: Reach::default(),
+            syncs: Cell::new(0),
         })
     }
 
@@ -318,6 +326,7 @@ impl Store {
             log,
             segments,
             durability: Reach::default(),
+            syncs: Cell::new(0),
         })
     }
 
@@ -388,8 +397,41 @@ impl Store {
     /// cannot be recovered from by trying again, since the platform is entitled
     /// to have thrown the writes away.
     pub fn sync(&self) -> Result<()> {
+        self.synced()?;
+        Ok(())
+    }
+
+    /// Syncs, and counts it.
+    ///
+    /// Every sync this store makes goes through here or through
+    /// [`synced_all`](Self::synced_all), which is what makes
+    /// [`syncs`](Self::syncs) the whole story rather than most of it.
+    fn synced(&self) -> Result<()> {
+        self.syncs.set(self.syncs.get().saturating_add(1));
         crate::durability::sync(&self.file, self.durability)?;
         Ok(())
+    }
+
+    /// The same for a write that made the file longer.
+    fn synced_all(&self) -> Result<()> {
+        self.syncs.set(self.syncs.get().saturating_add(1));
+        crate::durability::sync_all(&self.file, self.durability)?;
+        Ok(())
+    }
+
+    /// How many syncs this store has made since it was opened.
+    ///
+    /// A sync is the expensive part of a commit and the tables in
+    /// [`crate::durability`] say how expensive, so the number of them a piece of
+    /// work made is most of what explains how long it took. It is the number a
+    /// group commit exists to move, and the way to read it is the difference
+    /// across the work being measured.
+    ///
+    /// It counts calls made rather than calls that returned, since a sync that
+    /// failed waited for the drive exactly as one that worked did.
+    #[must_use]
+    pub fn syncs(&self) -> u64 {
+        self.syncs.get()
     }
 
     /// How far a sync of this store makes a write go.
@@ -469,7 +511,7 @@ impl Store {
         //
         // This is the sync a commit latency is measured across, and
         // `durability().call()` is its name.
-        crate::durability::sync(&self.file, self.durability)?;
+        self.synced()?;
         self.manifest = next;
         self.slot = slot;
         Ok(self.manifest.epoch)
@@ -585,6 +627,30 @@ impl Store {
         created: u64,
         write: impl FnOnce(&mut Appending<'_>) -> io::Result<()>,
     ) -> Result<Segment> {
+        let described = self.write_segment(docs, created, write)?;
+        // Everything and not just the data, because the file has grown and the
+        // length is as much a part of what has to survive as the bytes are. A
+        // sync that left the size behind would give back a store whose segment
+        // is inside a file that ends before it.
+        self.synced_all()?;
+        Ok(described)
+    }
+
+    /// The bytes of a segment, without the sync that makes them durable.
+    ///
+    /// Private, because a segment that is written and not synced is not a
+    /// segment anybody may commit, and the whole of what this file promises
+    /// rests on that order. The callers are the append above, which syncs
+    /// immediately, and [`publish_all`](Self::publish_all), which writes
+    /// everything a commit adds and then syncs once for all of it. One sync
+    /// covers every write to the file that came before it, so the second caller
+    /// keeps the same promise for less.
+    fn write_segment(
+        &mut self,
+        docs: u32,
+        created: u64,
+        write: impl FnOnce(&mut Appending<'_>) -> io::Result<()>,
+    ) -> Result<Segment> {
         let offset = self.segments;
         let mut appending = Appending {
             file: &self.file,
@@ -593,11 +659,6 @@ impl Store {
         };
         write(&mut appending)?;
         let len = appending.written;
-        // Everything and not just the data, because the file has grown and the
-        // length is as much a part of what has to survive as the bytes are. A
-        // sync that left the size behind would give back a store whose segment
-        // is inside a file that ends before it.
-        crate::durability::sync_all(&self.file, self.durability)?;
         // Only after the bytes are down. A cursor that moved first and then
         // failed to write would leave a gap that reads as a segment nobody
         // wrote, and the next append would put a real one after it.
@@ -638,6 +699,23 @@ impl Store {
     /// against a different segment, and [`Trouble::Io`] if the write or the sync
     /// fails. Nothing is committed either way.
     pub fn append_tombstones(&mut self, segment: &Segment, deleted: &Bitmap) -> Result<Segment> {
+        let next = self.write_tombstones(segment, deleted)?;
+        // An empty set wrote nothing, and a sync of nothing is a sync that cost
+        // what every other one costs.
+        if next.tombstones_len != 0 {
+            // Everything and not just the data, for the reason the segment
+            // append gives: the file has grown and its length has to survive
+            // with the bytes.
+            self.synced_all()?;
+        }
+        Ok(next)
+    }
+
+    /// The bytes of a set of deletions, without the sync that makes them
+    /// durable.
+    ///
+    /// Private for the reason [`write_segment`](Self::write_segment) is.
+    fn write_tombstones(&mut self, segment: &Segment, deleted: &Bitmap) -> Result<Segment> {
         if let Some(doc) = deleted.max()
             && doc >= segment.docs
         {
@@ -659,10 +737,6 @@ impl Store {
         deleted.write_to(&mut bytes);
         let offset = self.segments;
         write_at(&self.file, &bytes, offset)?;
-        // Everything and not just the data, for the reason the segment append
-        // gives: the file has grown and its length has to survive with the
-        // bytes.
-        crate::durability::sync_all(&self.file, self.durability)?;
         let len = bytes.len() as u64;
         self.segments = offset.saturating_add(len).next_multiple_of(u64::from(PAGE));
 
@@ -737,11 +811,16 @@ impl Store {
     /// it.
     ///
     /// Everything is on the platter before the manifest names any of it. The
-    /// segment is written and synced, then each bitmap is written and synced,
-    /// and only then does one manifest naming all of them go into the other slot
-    /// and get fsynced. A machine that stops anywhere in here comes back to the
-    /// store as it was, with some bytes in the segment region that nothing
-    /// points at, which is what the region being append only makes harmless.
+    /// segment and every bitmap are written, one sync puts all of them down, and
+    /// only then does a manifest naming them go into the other slot and get
+    /// fsynced. A machine that stops anywhere in here comes back to the store as
+    /// it was, with some bytes in the segment region that nothing points at,
+    /// which is what the region being append only makes harmless.
+    ///
+    /// Two syncs, whatever the commit holds. A sync covers every write to the
+    /// file that came before it, so the number of them a commit costs is the
+    /// number of orderings it needs and not the number of writes it makes: the
+    /// data before the manifest, and the manifest before the call returns.
     ///
     /// Passing `None` for the segment is a commit of deletions alone, which is
     /// what deleting several documents that happen to live in different segments
@@ -797,14 +876,37 @@ impl Store {
         deletions: &[(usize, Bitmap)],
         written: u64,
     ) -> Result<u64> {
-        // The segment being added answers to the position it is about to take,
-        // and there is nothing committed there to read a count back from.
+        self.publish_all(segment.into_iter().collect(), created, deletions, written)
+    }
+
+    /// [`publish`](Self::publish), with more than one segment in the one commit.
+    ///
+    /// The segments take the positions after the committed ones in the order
+    /// they are given, so a set of deletions naming the first of them names the
+    /// position one past the last committed segment. Which copy of a key wins is
+    /// decided by that order, exactly as it is between commits, so the last
+    /// segment in the list is the newest.
+    ///
+    /// This is what a group commit is made of. Several writers each build a
+    /// segment, and one commit puts all of them in the store for the two syncs
+    /// one of them would have cost. [`crate::ingest::commit_all`] is the caller
+    /// that works out whose document a key belongs to when two of those writers
+    /// used the same one.
+    ///
+    /// # Errors
+    ///
+    /// As [`publish`](Self::publish).
+    pub fn publish_all(
+        &mut self,
+        segments: Vec<(u32, impl FnOnce(&mut Appending<'_>) -> io::Result<()>)>,
+        created: u64,
+        deletions: &[(usize, Bitmap)],
+        written: u64,
+    ) -> Result<u64> {
+        // The segments being added answer to the positions they are about to
+        // take, and there is nothing committed there to read a count back from.
         let adding = self.manifest.segments.len();
-        let limit = if segment.is_some() {
-            adding + 1
-        } else {
-            adding
-        };
+        let limit = adding + segments.len();
         for (n, (at, _)) in deletions.iter().enumerate() {
             if deletions[..n].iter().any(|(earlier, _)| earlier == at) {
                 return Err(Trouble::Format(Error::RepeatedSegment { at: *at }));
@@ -819,30 +921,41 @@ impl Store {
         // batch should not have moved it.
         let mut before = Vec::with_capacity(deletions.len());
         for (at, _) in deletions {
-            before.push(if *at == adding {
+            before.push(if *at >= adding {
                 0
             } else {
                 self.committed_deletions(&self.manifest.segments[*at])?
             });
         }
 
+        let mut wrote = false;
         let mut manifest = self.manifest.clone();
-        if let Some((docs, write)) = segment {
-            let described = self.append_segment_with(docs, created, write)?;
+        for (docs, write) in segments {
+            let described = self.write_segment(docs, created, write)?;
+            wrote = true;
             manifest.segments.push(described);
             manifest.total = manifest.total.saturating_add(u64::from(docs));
             manifest.live = manifest.live.saturating_add(u64::from(docs));
         }
         for ((at, deleted), was) in deletions.iter().zip(before) {
             // Out of the manifest being built rather than the committed one, so
-            // that a set naming the segment this commit adds finds it.
+            // that a set naming a segment this commit adds finds it.
             let described = manifest.segments[*at];
-            let next = self.append_tombstones(&described, deleted)?;
+            let next = self.write_tombstones(&described, deleted)?;
+            wrote |= next.tombstones_len != 0;
             manifest.segments[*at] = next;
             manifest.live = manifest
                 .live
                 .saturating_add(was)
                 .saturating_sub(deleted.len() as u64);
+        }
+        // One sync for all of it, and it has to be here: the manifest about to
+        // be written names bytes that a machine losing power now would have to
+        // come back with. A commit that added nothing to the file has nothing
+        // to order and skips it, which is what a commit of an empty set of
+        // deletions is.
+        if wrote {
+            self.synced_all()?;
         }
         self.commit(manifest, written)
     }
@@ -2949,6 +3062,79 @@ mod tests {
         assert_eq!(view.deleted(1).expect("read").expect("a set").len(), 1);
         assert_eq!(view.deleted(2).expect("read"), None);
         assert_eq!(counted(&store), 21);
+    }
+
+    #[test]
+    fn a_commit_syncs_twice_whatever_it_carries() {
+        // The data before the manifest and the manifest before the call
+        // returns. Everything else a commit writes is covered by one of those
+        // two, so a commit of three things costs what a commit of one does.
+        let path = path("publishsyncs");
+        let mut store = stored(&path, &[10, 10]);
+        let (bytes, docs) = built(100, 4);
+        let before = store.syncs();
+        store
+            .publish(
+                Some((&bytes, docs)),
+                1_700_000_100,
+                &[
+                    (0, Bitmap::from_sorted(&[0, 1])),
+                    (1, Bitmap::from_sorted(&[9])),
+                ],
+                7,
+            )
+            .expect("published");
+        assert_eq!(store.syncs() - before, 2);
+
+        // Nothing was added to the file, so there is nothing to order the
+        // manifest after and the commit is the one sync.
+        let before = store.syncs();
+        store.publish(None, 0, &[], 8).expect("published");
+        assert_eq!(store.syncs() - before, 1);
+    }
+
+    #[test]
+    fn several_segments_arrive_in_one_commit_in_the_order_they_are_given() {
+        let path = path("publishall");
+        let mut store = stored(&path, &[10, 10]);
+        let epoch = store.manifest().epoch;
+        let (first, one) = built(100, 4);
+        let (second, two) = built(200, 3);
+        let segments: Vec<(u32, _)> = [(&first, one), (&second, two)]
+            .into_iter()
+            .map(|(bytes, docs)| {
+                (docs, move |into: &mut Appending<'_>| {
+                    io::Write::write_all(into, bytes)
+                })
+            })
+            .collect();
+        let before = store.syncs();
+        store
+            .publish_all(
+                segments,
+                1_700_000_100,
+                &[
+                    (0, Bitmap::from_sorted(&[0])),
+                    (3, Bitmap::from_sorted(&[1])),
+                ],
+                7,
+            )
+            .expect("published");
+
+        assert_eq!(store.syncs() - before, 2, "one commit, whatever is in it");
+        assert_eq!(store.manifest().epoch, epoch + 1);
+        assert_eq!(store.manifest().segments.len(), 4);
+        assert_eq!(store.manifest().total, 27);
+        assert_eq!(store.manifest().live, 25);
+        assert_eq!(store.manifest().segments[2].docs, one);
+        assert_eq!(store.manifest().segments[3].docs, two);
+
+        let view = store.view().expect("a view");
+        assert_eq!(view.deleted(0).expect("read").expect("a set").len(), 1);
+        assert_eq!(view.deleted(2).expect("read"), None);
+        assert_eq!(view.deleted(3).expect("read").expect("a set").len(), 1);
+        drop(view);
+        assert_eq!(counted(&store), 25);
     }
 
     #[test]

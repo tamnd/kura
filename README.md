@@ -265,7 +265,7 @@ That is the floor on how finely a single sync measurement can be read, and it is
 The honest call is free on the laptop, inside the noise of the weaker one, which is what makes it the default.
 It is not free everywhere and it is not free at any moment.
 The same laptop measured with three indexing runs' writes still going down gave the strongest reach a median of 5.47 ms, a p99 of 452 ms and a worst of 1.97 s, against a p99 of 6.31 ms for the weaker call on the same run, because asking the drive to empty its cache means waiting for whatever else is in it.
-That is an argument for making commits fewer rather than for making them weaker, which is the next piece of work.
+That is an argument for making commits fewer rather than for making them weaker, which is the section below.
 
 Measure your own with the example, pointed at the filesystem the store will live on, since the answer belongs to the device and not to the machine:
 
@@ -281,7 +281,49 @@ A run into a store says what its commits cost and which call made them durable:
 
 Those are flushes rather than one document commits.
 Each of them wrote about 8 MB of segment before it synced, so the four milliseconds of sync are lost in it, and the choice of reach made no measurable difference across three runs of each on the corpus below.
-The reach starts to matter when the commit is small, which is what group commit is for and what has not been built yet.
+The reach starts to matter when the commit is small, which is what the next section is about.
+
+### One commit for many writers
+
+A commit is two syncs, whatever it holds.
+The data goes down, one sync puts all of it on the platter, the manifest naming it goes into the slot nothing is reading, and a second sync makes that the store.
+Everything else a commit writes is covered by one of those two, so the number of times it waits for the drive is the number of orderings it needs rather than the number of writes it makes.
+
+A run says how many times it waited:
+
+```
+9 commits, median 13.6ms and worst 20.9ms, synced with F_FULLFSYNC which survives the power going
+waited for the drive 18 times, 2.0 per commit
+```
+
+That is the second pass over the Go source tree, where every document replaces one already in the store.
+Each of those commits writes a segment and a set of deletions for the segment the replaced documents were in, and it used to sync after each of them: 27 waits for the same nine commits, 3.0 per commit.
+The nine syncs that went are about a tenth of that run, which is under the spread of the drive on this laptop, so the count is the number to read and not the wall clock.
+
+The same property is what lets several writers share one commit.
+Each of them builds a batch, the batches that are ready go into the file together, one manifest names all of them, and the group pays what one of them would have.
+`commit_all` is that, and the example measures it, 128 commits of four documents each into a store of its own, on an idle M4 on APFS:
+
+| group | syncs | syncs per 1,000 documents | commits/s | median | p99 | worst |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 256 | 500.0 | 127 | 7.914 ms | 9.658 ms | 13.829 ms |
+| 2 | 128 | 250.0 | 260 | 7.548 ms | 12.731 ms | 12.731 ms |
+| 4 | 64 | 125.0 | 443 | 8.637 ms | 14.746 ms | 14.746 ms |
+| 8 | 32 | 62.5 | 1,069 | 7.341 ms | 8.935 ms | 8.935 ms |
+| 16 | 16 | 31.2 | 1,901 | 9.022 ms | 10.013 ms | 10.013 ms |
+| 32 | 8 | 15.6 | 3,465 | 9.324 ms | 9.949 ms | 9.949 ms |
+
+```sh
+cargo run --release --example group -- /var/lib/kura
+```
+
+Twenty seven times the commits a second for the same documents, the same segments and the same order.
+The column that matters as much is the median, which does not move: a group of thirty two costs one writer's latency, because the group is waiting for the same sync a single commit was waiting for anyway.
+The same run on the same laptop while it was busy gave 72 commits a second at a group of one and 1,839 at a group of thirty two, which is the same shape a quarter of the way down, since the sync is the whole of the cost and its spread belongs to the machine.
+
+What is not here yet is the thing that forms the group.
+Every write path in the engine takes the store by exclusive reference, so the writers that would arrive while a sync is in flight cannot exist yet, and a caller that has several batches ready hands them over itself.
+The shared writer is the next piece of work, and this is the half of it that had to be right first.
 
 The Go source tree at go1.26.6, which is 10,888 text files and 106.4 MB, on an M4 with the files already in page cache, `--memory 32m`, eight runs of the same command one after another:
 
