@@ -87,6 +87,7 @@ use std::path::Path;
 use crate::DocId;
 use crate::bitmap::Bitmap;
 use crate::compact;
+use crate::durability::Reach;
 use crate::error::Error;
 use crate::index::{Keys, Reader};
 use crate::manifest::{
@@ -172,6 +173,11 @@ pub struct Store {
     /// Where the next segment goes, which like the log runs ahead of the
     /// committed manifest between commits.
     segments: u64,
+    /// Which sync a commit makes. Not in the file, because it says what this
+    /// process wants of the hardware under it rather than anything about the
+    /// store, and the store may well be opened next by a process that wants
+    /// something else.
+    durability: Reach,
 }
 
 /// Where the segment region ends, according to a manifest.
@@ -250,8 +256,10 @@ impl Store {
         write_at(&file, &superblock.encode(), 0)?;
         write_at(&file, &manifest.encode()?, SLOT_A_OFFSET)?;
         // Everything, not just the data, because the length of the file is part
-        // of what has to survive here.
-        file.sync_all()?;
+        // of what has to survive here. At the strongest reach whatever the
+        // caller means to ask for later, since a store whose first manifest was
+        // lost is not a store at all and this happens once.
+        crate::durability::sync_all(&file, Reach::default())?;
         let log = Ring::new(
             superblock.wal_len,
             manifest.wal_head,
@@ -266,6 +274,7 @@ impl Store {
             slot: Slot::A,
             log,
             segments,
+            durability: Reach::default(),
         })
     }
 
@@ -308,6 +317,7 @@ impl Store {
             slot,
             log,
             segments,
+            durability: Reach::default(),
         })
     }
 
@@ -369,7 +379,8 @@ impl Store {
         Ok(self.log.taken(&placement))
     }
 
-    /// Puts everything appended since the last one on the platter.
+    /// Puts everything appended since the last one as far as
+    /// [`durability`](Self::durability) says.
     ///
     /// # Errors
     ///
@@ -377,8 +388,27 @@ impl Store {
     /// cannot be recovered from by trying again, since the platform is entitled
     /// to have thrown the writes away.
     pub fn sync(&self) -> Result<()> {
-        self.file.sync_data()?;
+        crate::durability::sync(&self.file, self.durability)?;
         Ok(())
+    }
+
+    /// How far a sync of this store makes a write go.
+    ///
+    /// [`Reach::call`] on it is the name to print beside a commit latency, and
+    /// two latencies with different names beside them are not comparable.
+    #[must_use]
+    pub const fn durability(&self) -> Reach {
+        self.durability
+    }
+
+    /// Asks for a different one from here on.
+    ///
+    /// The default is [`Reach::Platter`], which is what the commit
+    /// documentation promises. Asking for less is for a caller that has decided
+    /// what it is willing to lose, which is a decision worth making out loud
+    /// rather than by leaving a default alone.
+    pub const fn set_durability(&mut self, reach: Reach) {
+        self.durability = reach;
     }
 
     /// Frees the log up to `through`.
@@ -436,7 +466,10 @@ impl Store {
         // The data and not the metadata, because the file has not changed length
         // and nothing here depends on its timestamps. On the platforms that tell
         // the difference this is the cheaper of the two.
-        self.file.sync_data()?;
+        //
+        // This is the sync a commit latency is measured across, and
+        // `durability().call()` is its name.
+        crate::durability::sync(&self.file, self.durability)?;
         self.manifest = next;
         self.slot = slot;
         Ok(self.manifest.epoch)
@@ -564,7 +597,7 @@ impl Store {
         // length is as much a part of what has to survive as the bytes are. A
         // sync that left the size behind would give back a store whose segment
         // is inside a file that ends before it.
-        self.file.sync_all()?;
+        crate::durability::sync_all(&self.file, self.durability)?;
         // Only after the bytes are down. A cursor that moved first and then
         // failed to write would leave a gap that reads as a segment nobody
         // wrote, and the next append would put a real one after it.
@@ -629,7 +662,7 @@ impl Store {
         // Everything and not just the data, for the reason the segment append
         // gives: the file has grown and its length has to survive with the
         // bytes.
-        self.file.sync_all()?;
+        crate::durability::sync_all(&self.file, self.durability)?;
         let len = bytes.len() as u64;
         self.segments = offset.saturating_add(len).next_multiple_of(u64::from(PAGE));
 
@@ -1825,6 +1858,45 @@ mod tests {
             .recover(|record| found.push((record.kind, record.sequence, record.payload.to_vec())))
             .expect("recovered");
         found
+    }
+
+    #[test]
+    fn a_store_syncs_at_the_reach_that_survives_the_power_going_unless_told_otherwise() {
+        let path = path("reach-default");
+        let store = Store::create(&path, STORE, 1_700_000_000).expect("a store");
+        assert_eq!(store.durability(), Reach::Platter);
+    }
+
+    #[test]
+    fn a_store_commits_and_comes_back_at_every_reach() {
+        // What is being checked is that each of the three calls exists on this
+        // platform, is made, and returns without an error, since a reach that
+        // fails only when the store is real is a reach that fails in front of a
+        // user. What survives a power cut is not something a test can ask.
+        for (n, reach) in [Reach::Platter, Reach::Device, Reach::Ordered]
+            .into_iter()
+            .enumerate()
+        {
+            let path = path(&format!("reach-{n}"));
+            {
+                let mut store = Store::create(&path, STORE, 1_700_000_000).expect("a store");
+                store.set_durability(reach);
+                assert_eq!(store.durability(), reach);
+                let mut manifest = store.manifest().clone();
+                manifest.segments.push(segment(0));
+                manifest.live = 100;
+                manifest.total = 100;
+                store.commit(manifest, 4096).expect("committed");
+                store.append(wal::kind::UPSERT, &[7; 64]).expect("appended");
+                store.sync().expect("synced");
+            }
+            let store = Store::open(&path).expect("a store");
+            assert_eq!(store.manifest().live, 100, "at {reach:?}");
+            assert_eq!(store.manifest().segments.len(), 1, "at {reach:?}");
+            // Back at the default, because the reach is what this process wants
+            // of the hardware and not something the store remembers for it.
+            assert_eq!(store.durability(), Reach::Platter);
+        }
     }
 
     #[test]

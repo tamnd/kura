@@ -220,6 +220,16 @@ fn store(file: &[u8], out: &mut impl Write) -> io::Result<Outcome> {
     writeln!(out, "  with deleted {:>12}", manifest.total)?;
     writeln!(out, "  log          {:>12}", bytes(superblock.wal_len))?;
     outcome.failures += log(file, out)?;
+    // What a commit of this store on this machine would call, which is the
+    // string a commit latency has to be quoted with. It is a property of the
+    // build and the platform rather than of the file, so it is not read out of
+    // the store, and saying so is the point of printing it here.
+    writeln!(
+        out,
+        "  durability   {:>12}, survives {}",
+        kura_core::durability::Reach::default().call(),
+        kura_core::durability::Reach::default().promise()
+    )?;
     writeln!(out, "  segments     {:>12}", manifest.segments.len())?;
     // No share of the file here, unlike the sections inside a segment. Most of a
     // store's length is a log region that is reserved up front and sparse until
