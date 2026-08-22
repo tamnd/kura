@@ -130,8 +130,11 @@ fn measure(directory: &std::path::Path, threads: usize) -> Result<Run, String> {
         Store::create(&path, STORE, 1_700_000_000).map_err(|problem| problem.to_string())?;
     let writer = Writer::new(store).map_err(|problem| problem.to_string())?;
 
+    // Whatever happens in there, the store is removed before this returns. A
+    // store is a large file, and a run that stopped early and left one behind
+    // would be a run that filled the disk of anybody who tried a few of them.
     let started = Instant::now();
-    let times = std::thread::scope(|scope| {
+    let outcome = std::thread::scope(|scope| {
         let running: Vec<_> = (0..threads)
             .map(|thread| {
                 let writer = &writer;
@@ -146,19 +149,20 @@ fn measure(directory: &std::path::Path, threads: usize) -> Result<Run, String> {
                     .unwrap_or_else(|_| Err("a writer stopped".into()))
             })
             .collect::<Result<Vec<_>, String>>()
-    })?;
+    });
     let seconds = started.elapsed().as_secs_f64();
-
-    let run = Run {
-        syncs: writer.syncs(),
-        rounds: writer.rounds(),
-        members: writer.members(),
-        seconds,
-        times: times.into_iter().flatten().collect(),
-    };
+    let counted = (writer.syncs(), writer.rounds(), writer.members());
     drop(writer);
     std::fs::remove_file(&path).ok();
-    Ok(run)
+
+    let (syncs, rounds, members) = counted;
+    Ok(Run {
+        syncs,
+        rounds,
+        members,
+        seconds,
+        times: outcome?.into_iter().flatten().collect(),
+    })
 }
 
 /// One writer, preparing and handing over `each` batches in turn.
