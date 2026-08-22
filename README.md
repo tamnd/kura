@@ -898,6 +898,36 @@ Two honest limits on this.
 The p99 column does not agree with the median column and is noisy at both sizes, so what is claimed here is the median and not the tail.
 And the two rows do not start from the same floor, 10.0 µs against 6.1, which is why each is read against its own control and why the two percentages are compared rather than the two rows.
 
+## Whether the bytes cost the reader leaving or arriving
+
+By the byte leaves one more fork, and the two sides of it want different fixes.
+The bytes are on their way to a file, and the same bytes are about to be walked by a query that has never touched them.
+If the cost is the writing then the answer is somewhere in how the store hands bytes to the drive.
+If it is the reading then the answer is that the writer knows exactly which bytes it just wrote and the reader is about to walk them, which is a thing to do something about.
+
+One more row separates the two.
+It builds the same batches as the no commits row and writes each finished segment to a file of its own beside the store, commits none of them, and asks its questions of the same store that never changes.
+The same megabytes go somewhere instead of nowhere and nothing else about the two rows differs, so the two are read against each other whole rather than at a matched count.
+
+Ten runs kept out of thirty four, each cell the middle of the ten:
+
+| | median | p95 | p99 |
+| --- | --- | --- | --- |
+| threads, no commits | 8.25 µs | 22.75 µs | 35.70 µs |
+| threads, segments written aside | 8.50 µs | 21.60 µs | 37.55 µs |
+
+Two percent at the median, with eight of the ten runs between minus three and four.
+In microseconds the same megabytes reaching a file cost a query 0.25 µs where a commit holding them costs it 4.8, so the writing is about a twentieth of it and the rest is on the other side.
+Five of the ten runs were on a quiet machine and five were on one busy enough to stretch the ingest from 140 ms to 250, and the line reads the same in both halves, which is what a difference of nearly nothing should do.
+
+So a commit costs a reader by the bytes it wrote, and it is not the bytes leaving, it is the same bytes arriving in a segment no query has touched yet.
+Every other candidate is now out.
+The syncs are out, the view handover is out, the fixed part of a commit is out because the cost followed the bytes, and the write itself is out because the same bytes written somewhere the reader never looks cost it nothing.
+
+Two honest limits.
+The segment written aside goes out unbuffered and is never synced, so what that row pays is the write calls and the dirty pages rather than a flush, and it is only fair to compare it against a commit because the syncs were already measured and were nothing.
+And the tails move in both directions between the two rows, so what is claimed here is the median.
+
 ## What it costs when there is no core to spare
 
 Everything folding costs a reader on the machine above is the core the keeper takes, and that machine has ten of them for four writers, a keeper and a reader.
