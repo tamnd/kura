@@ -1162,6 +1162,11 @@ struct Folds {
     /// sampled rather than what the run reached, and zero on a run that folded
     /// in front of itself with nobody watching.
     highest: usize,
+    /// How many batches were read a second time because two folds went past
+    /// while they were being filled. A batch is carried through one fold, and
+    /// the store keeps one fold's record, so a batch that slept through two has
+    /// nothing to be shifted by and is filled again from the files it held.
+    overtaken: usize,
 }
 
 impl Folds {
@@ -1174,6 +1179,7 @@ impl Folds {
         self.stalled += other.stalled;
         self.beside += other.beside;
         self.highest = self.highest.max(other.highest);
+        self.overtaken += other.overtaken;
     }
 
     /// Prints what the folding cost, or nothing if there was none.
@@ -1214,6 +1220,17 @@ impl Folds {
                     "segment"
                 } else {
                     "segments"
+                }
+            );
+        }
+        if self.overtaken > 0 {
+            println!(
+                "{} {} filled twice, having been overtaken by two folds while it was being filled",
+                self.overtaken,
+                if self.overtaken == 1 {
+                    "batch"
+                } else {
+                    "batches"
                 }
             );
         }
@@ -1699,6 +1716,10 @@ fn shard<'a>(
 ) -> Result<Run<'a>, Failure> {
     let trouble = |trouble| Failure::Store(plan.out.clone(), trouble);
     let mut run = Run::default();
+    // The files a batch held when a fold overtook it, waiting to be read again
+    // against a view that fold is behind. Empty on every ordinary round.
+    let mut again: Vec<usize> = Vec::new();
+    let mut drained = false;
     loop {
         // Whatever the last commit published, which is what every other thread
         // is building against too. It costs no lock and no mapping of its own.
@@ -1711,8 +1732,30 @@ fn shard<'a>(
         run.steepest.emptied(batch.held().total());
 
         let mut pending = 0u64;
-        let mut drained = false;
-        loop {
+        let mut taken = Vec::new();
+        // A round that is putting a batch back together takes no new files.
+        // Nothing else would be wrong if it did, but the reason it is here is
+        // that folds were happening faster than this batch could be filled, and
+        // the answer to that is a smaller batch rather than the same one again.
+        let retrying = !again.is_empty();
+        // What the round before this one could not commit goes in first, and it
+        // does not count towards the run again: these bytes were read and
+        // reported the first time round.
+        for at in again.drain(..) {
+            let Some(file) = files.get(at) else { continue };
+            let Ok(Some(content)) = read_text(file) else {
+                continue;
+            };
+            let text = String::from_utf8_lossy(&content);
+            pending += content.len() as u64;
+            let path = file.to_string_lossy().into_owned();
+            batch
+                .add_keyed_with_fields(path.as_bytes(), &text, [(PATH_FIELD, path.as_bytes())])
+                .map_err(trouble)?;
+            taken.push(at);
+        }
+
+        while !drained && !retrying {
             let at = next.fetch_add(1, Ordering::Relaxed);
             let Some(file) = files.get(at) else {
                 drained = true;
@@ -1729,6 +1772,7 @@ fn shard<'a>(
             batch
                 .add_keyed_with_fields(path.as_bytes(), &text, [(PATH_FIELD, path.as_bytes())])
                 .map_err(trouble)?;
+            taken.push(at);
             run.saw(file, batch.held());
 
             if batch.is_full() || plan.flush_every.is_some_and(|budget| pending >= budget) {
@@ -1745,18 +1789,31 @@ fn shard<'a>(
             let size = prepared.size();
             let now = now();
             let committing = Instant::now();
-            writer.commit(prepared, now, now).map_err(trouble)?;
-            run.commits.push(committing.elapsed());
-            run.marks = Marks {
-                documents: read_documents,
-                merged: read_merged,
-                written: Some(residency::peak_resident()),
-            };
-            run.documents += documents;
-            run.replaced += replaced;
-            run.written += size;
+            match writer.commit(prepared, now, now) {
+                Ok(_) => {
+                    run.commits.push(committing.elapsed());
+                    run.marks = Marks {
+                        documents: read_documents,
+                        merged: read_merged,
+                        written: Some(residency::peak_resident()),
+                    };
+                    run.documents += documents;
+                    run.replaced += replaced;
+                    run.written += size;
+                }
+                // A fold is carried, and a second fold on top of the first is
+                // one record too many for the store to have kept. It costs this
+                // batch the analyser pass it just did, and nothing else: the
+                // files are still where they were and the next round reads them
+                // against a view that is current.
+                Err(Trouble::Format(kura_core::Error::StaleView { .. })) => {
+                    run.folds.overtaken += 1;
+                    again = taken;
+                }
+                Err(other) => return Err(trouble(other)),
+            }
         }
-        if drained {
+        if drained && again.is_empty() {
             return Ok(run);
         }
     }
