@@ -18,6 +18,16 @@
 //! that the store is still there and refuses otherwise, rather than writing a
 //! set of deletions that would undo whatever was committed in between.
 //!
+//! # Several batches at once
+//!
+//! A commit is two syncs and a sync is milliseconds, so a store taking small
+//! writes spends nearly all of its time waiting for the drive. [`commit_all`]
+//! is the answer to that: the batches that are ready go into the file together
+//! and one manifest names all of them, so the group pays what one of them would
+//! have. Which copy of a key wins is decided by the order the batches are given
+//! in, exactly as it is decided between commits, and the store that comes out is
+//! the one the same batches committed one at a time would have made.
+//!
 //! # The log
 //!
 //! A batch holds everything in memory until it commits, so a machine that stops
@@ -33,7 +43,8 @@
 //! it, which is what makes it something to do on every open rather than
 //! something to decide about.
 
-use std::collections::HashMap;
+use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::DocId;
 use crate::bitmap::Bitmap;
@@ -339,6 +350,7 @@ impl<'a> Batch<'a> {
         Ok(Prepared {
             segment,
             deletions,
+            keys: self.mine.into_iter().collect(),
             epoch: self.view.epoch(),
         })
     }
@@ -782,6 +794,19 @@ pub struct Prepared {
     /// segment. The last of them may name the segment above, which is a document
     /// the batch replaced with a later one of its own.
     pub deletions: Vec<(usize, Bitmap)>,
+    /// The key of every document in the segment that has one, with the document
+    /// it belongs to.
+    ///
+    /// The batch had these already and they move here rather than being copied,
+    /// so what they cost is holding them until the commit instead of until the
+    /// segment was built. They are what [`commit_all`] needs: two batches that
+    /// wrote the same key are two documents that both answer to it, and nothing
+    /// else in either of them says so.
+    ///
+    /// A batch committed on its own has no use for them. They are one pointer
+    /// and one length per key in a value that is about to be written to disk,
+    /// against the segment beside them, which is megabytes.
+    pub keys: Vec<(Box<[u8]>, DocId)>,
     /// The epoch of the view this was worked out from.
     pub epoch: u64,
 }
@@ -807,6 +832,128 @@ impl Prepared {
             .segment
             .map(|(built, docs)| (docs, move |into: &mut Appending<'_>| built.write_to(into)));
         store.publish_with(segment, created, &self.deletions, written)
+    }
+}
+
+/// Commits a group of prepared batches as one commit.
+///
+/// A commit costs two syncs and a sync is milliseconds, so a store taking small
+/// writes from several places at once spends nearly all of its time waiting for
+/// the drive, and every one of those waits is for the same drive. This is the
+/// answer to that: the batches that are ready go into the file together, one
+/// manifest names all of them, and the group pays what one of them would have.
+/// Nothing about the promise changes, because the sync that has to happen before
+/// the manifest is written happens whether the manifest names one segment or
+/// twenty.
+///
+/// The batches are committed in the order they are given, which is the order a
+/// key written by two of them is decided by. The last one to write a key is the
+/// one that answers to it and the copies before it are deleted, which is what a
+/// batch that writes the same key twice already does. Nothing else could be
+/// right: the group is one commit, and a store cannot answer one key with two
+/// documents.
+///
+/// Every batch has to have been prepared against the committed state. A batch
+/// prepared before some other commit landed is refused, as it is on its own and
+/// for the same reason. The caller holding the group is the one that knows how
+/// to answer that writer, which is why they are refused together here rather
+/// than one at a time.
+///
+/// # The log
+///
+/// This does not free it. A [`Logged`] batch commits through [`Pending`], which
+/// frees the log up to what that batch wrote and does it in the one order that
+/// works, and a group has no equivalent because the position to free is the
+/// furthest any of its members reached. So a group is of batches that were not
+/// logged, or of batches whose caller frees the log itself with
+/// [`Store::truncate_log`] before it calls this. A group that leaves records in
+/// the log naming documents its segments already hold is a store that puts them
+/// back on the next open, which for a keyed document is a rewrite and for one
+/// without a key is a second copy.
+///
+/// # Errors
+///
+/// Returns [`Trouble::Format`] with [`Error::StaleView`] if any of the batches
+/// was prepared against a state the store has moved on from, in which case
+/// nothing is committed, and [`Error::MissingSection`] if a batch names a
+/// segment of its own that it did not build. Otherwise as [`Store::publish_all`].
+pub fn commit_all(
+    store: &mut Store,
+    parts: Vec<Prepared>,
+    created: u64,
+    written: u64,
+) -> Result<u64> {
+    let committed = store.manifest().epoch;
+    for part in &parts {
+        if part.epoch != committed {
+            return Err(Trouble::Format(Error::StaleView {
+                read: part.epoch,
+                committed,
+            }));
+        }
+    }
+
+    // Where the next segment of the group lands. The batches were all worked
+    // out against the same state, so they all name their own segment as the
+    // position one past the last committed one, and each of them has to be told
+    // which position that turned out to be.
+    let base = store.manifest().segments.len();
+    let mut at = base;
+    let mut segments = Vec::with_capacity(parts.len());
+    let mut sets: BTreeMap<usize, Bitmap> = BTreeMap::new();
+    // Who wrote each key, and which of their documents it is.
+    let mut written_keys: HashMap<Box<[u8]>, (usize, DocId)> = HashMap::new();
+
+    for part in parts {
+        let position = if part.segment.is_some() {
+            Some(at)
+        } else {
+            None
+        };
+        for (target, set) in part.deletions {
+            let target = if target == base {
+                position.ok_or(Trouble::Format(Error::MissingSection { kind: 0 }))?
+            } else {
+                target
+            };
+            union(&mut sets, target, set);
+        }
+        for (key, doc) in part.keys {
+            let Some(position) = position else {
+                continue;
+            };
+            if let Some((was_in, was)) = written_keys.insert(key, (position, doc)) {
+                // The earlier copy is in a segment of this same commit and it
+                // stops answering the moment that segment appears, so the store
+                // never shows both.
+                let mut one = Bitmap::new();
+                one.insert(was);
+                union(&mut sets, was_in, one);
+            }
+        }
+        if let Some((built, docs)) = part.segment {
+            segments.push((docs, move |into: &mut Appending<'_>| built.write_to(into)));
+            at += 1;
+        }
+    }
+
+    let deletions: Vec<(usize, Bitmap)> = sets.into_iter().collect();
+    store.publish_all(segments, created, &deletions, written)
+}
+
+/// Adds a set of deletions to whatever the group already deletes from that
+/// segment.
+///
+/// A set is the whole answer for its segment, so two batches that each deleted
+/// something from the same one have to be joined rather than to take turns
+/// overwriting each other. Both of them read what the segment already hid, so
+/// the join is a union and not a merge with a rule.
+fn union(sets: &mut BTreeMap<usize, Bitmap>, at: usize, adding: Bitmap) {
+    match sets.entry(at) {
+        Entry::Occupied(mut held) => held.get_mut().union_with(&adding),
+        Entry::Vacant(spot) => {
+            spot.insert(adding);
+        }
     }
 }
 
@@ -1538,5 +1685,172 @@ mod tests {
         }
         assert_eq!(before, keys.len(), "an untorn log gives everything back");
         let _ = std::fs::remove_file(&source);
+    }
+
+    /// Builds a batch against the store as it stands and stops short of
+    /// committing it, which is what a writer waiting for a group holds.
+    fn prepare(store: &Store, documents: &[(&[u8], &str)]) -> Prepared {
+        let view = store.view().expect("a view");
+        let mut batch = Batch::over(&view).expect("a batch");
+        for (key, text) in documents {
+            batch.add_keyed(key, text).expect("a document");
+        }
+        batch.finish().expect("prepared")
+    }
+
+    #[test]
+    fn batches_committed_as_a_group_are_all_in_the_store_at_the_same_epoch() {
+        let path = path("group");
+        let mut store = empty(&path);
+        let was = store.manifest().epoch;
+        let group = vec![
+            prepare(&store, &[(b"a", "the first quarter ledger")]),
+            prepare(&store, &[(b"b", "the second quarter ledger")]),
+            prepare(&store, &[(b"c", "the third quarter ledger")]),
+        ];
+        let epoch = commit_all(&mut store, group, 1_700_000_001, 1).expect("committed");
+
+        assert_eq!(epoch, was + 1, "a group is one commit");
+        assert_eq!(count(&store, "ledger"), 3);
+        assert_eq!(store.manifest().segments.len(), 3);
+        assert_eq!(store.manifest().live, 3);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_group_costs_the_syncs_one_commit_costs() {
+        let path = path("group-syncs");
+        let mut store = empty(&path);
+        let group: Vec<Prepared> = (0..8u8)
+            .map(|n| prepare(&store, &[(&[n], "the quarter ledger")]))
+            .collect();
+
+        let before = store.syncs();
+        commit_all(&mut store, group, 1_700_000_001, 1).expect("committed");
+        let group_cost = store.syncs() - before;
+
+        let before = store.syncs();
+        write(&mut store, &[(b"z", "one more ledger")]);
+        let one_cost = store.syncs() - before;
+
+        assert_eq!(one_cost, 2, "a commit is the data and then the manifest");
+        assert_eq!(
+            group_cost, one_cost,
+            "eight commits in a group wait for the drive as often as one does"
+        );
+        assert_eq!(count(&store, "ledger"), 9);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_key_two_batches_of_a_group_wrote_answers_with_the_later_one() {
+        let path = path("group-key");
+        let mut store = empty(&path);
+        let group = vec![
+            prepare(&store, &[(b"a", "the first quarter ledger")]),
+            prepare(&store, &[(b"a", "the second quarter ledger")]),
+        ];
+        commit_all(&mut store, group, 1_700_000_001, 1).expect("committed");
+
+        assert_eq!(count(&store, "ledger"), 1, "one key is one document");
+        assert_eq!(count(&store, "second"), 1);
+        assert_eq!(count(&store, "first"), 0);
+        assert_eq!(store.manifest().live, 1);
+        assert_eq!(store.manifest().total, 2);
+        let view = store.view().expect("a view");
+        assert_eq!(
+            view.document(b"a")
+                .expect("the key index reads")
+                .map(|(at, _)| at),
+            Some(1),
+            "the key answers with the later batch"
+        );
+        drop(view);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn two_batches_of_a_group_replacing_documents_in_one_segment_both_take_effect() {
+        let path = path("group-replace");
+        let mut store = empty(&path);
+        write(
+            &mut store,
+            &[
+                (b"a", "the first quarter ledger"),
+                (b"b", "the second quarter ledger"),
+            ],
+        );
+        let group = vec![
+            prepare(&store, &[(b"a", "the first quarter report")]),
+            prepare(&store, &[(b"b", "the second quarter report")]),
+        ];
+        commit_all(&mut store, group, 1_700_000_002, 2).expect("committed");
+
+        assert_eq!(count(&store, "report"), 2);
+        assert_eq!(count(&store, "ledger"), 0, "both replacements are deleted");
+        assert_eq!(store.manifest().live, 2);
+        assert_eq!(store.manifest().total, 4);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_batch_prepared_before_a_commit_takes_the_whole_group_with_it() {
+        let path = path("group-stale");
+        let mut store = empty(&path);
+        let stale = prepare(&store, &[(b"a", "the first quarter ledger")]);
+        write(&mut store, &[(b"b", "the second quarter ledger")]);
+        let fresh = prepare(&store, &[(b"c", "the third quarter ledger")]);
+
+        let epoch = store.manifest().epoch;
+        let refused = commit_all(&mut store, vec![stale, fresh], 1_700_000_002, 2);
+        assert!(
+            matches!(refused, Err(Trouble::Format(Error::StaleView { .. }))),
+            "a batch that read a store that has moved on is refused, and got {refused:?}"
+        );
+        assert_eq!(store.manifest().epoch, epoch, "nothing was committed");
+        assert_eq!(count(&store, "ledger"), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_batch_that_wrote_its_own_key_twice_keeps_its_own_answer_in_a_group() {
+        let path = path("group-twice");
+        let mut store = empty(&path);
+        let mut group = Vec::new();
+        group.push(prepare(&store, &[(b"a", "the first quarter ledger")]));
+        let view = store.view().expect("a view");
+        let mut batch = Batch::over(&view).expect("a batch");
+        batch
+            .add_keyed(b"b", "the second quarter ledger")
+            .expect("added");
+        batch
+            .add_keyed(b"b", "the third quarter ledger")
+            .expect("added");
+        group.push(batch.finish().expect("prepared"));
+        drop(view);
+        commit_all(&mut store, group, 1_700_000_001, 1).expect("committed");
+
+        assert_eq!(count(&store, "ledger"), 2);
+        assert_eq!(count(&store, "second"), 0, "the copy it replaced itself");
+        assert_eq!(count(&store, "third"), 1);
+        assert_eq!(count(&store, "first"), 1);
+        assert_eq!(store.manifest().live, 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_group_of_nothing_leaves_the_store_where_it_was() {
+        let path = path("group-empty");
+        let mut store = empty(&path);
+        write(&mut store, &[(b"a", "the first quarter ledger")]);
+        let segments = store.manifest().segments.len();
+        let epoch = store.manifest().epoch;
+
+        commit_all(&mut store, Vec::new(), 1_700_000_002, 2).expect("committed");
+
+        assert_eq!(store.manifest().segments.len(), segments);
+        assert_eq!(store.manifest().epoch, epoch + 1, "still a commit");
+        assert_eq!(count(&store, "ledger"), 1);
+        let _ = std::fs::remove_file(&path);
     }
 }

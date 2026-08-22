@@ -1023,6 +1023,8 @@ struct Run<'a> {
     commits: Vec<Duration>,
     /// What the run paid to keep the store it was writing to in shape.
     folds: Folds,
+    /// How many times the run waited for the drive.
+    syncs: u64,
     peak: Held,
     steepest: Steepest<'a>,
     marks: Marks,
@@ -1123,6 +1125,17 @@ impl<'a> Run<'a> {
             sorted[sorted.len() - 1],
             reach.call(),
             reach.promise()
+        );
+        // Two per commit and one per fold, which is what a commit costs however
+        // much is in it. It is here because it is the number that explains the
+        // one above it: a sync is milliseconds and everything else on this line
+        // is microseconds.
+        let per = self.syncs * 10 / u64::try_from(sorted.len()).unwrap_or(1).max(1);
+        println!(
+            "waited for the drive {} times, {}.{} per commit",
+            self.syncs,
+            per / 10,
+            per % 10
         );
     }
 
@@ -1234,6 +1247,7 @@ fn into_store<'a>(plan: &Plan, files: &'a [PathBuf], run: &mut Run<'a>) -> Resul
         keep_up(&mut store, plan, run)?;
     }
     run.segments = store.manifest().segments.len();
+    run.syncs = store.syncs();
     Ok(())
 }
 
