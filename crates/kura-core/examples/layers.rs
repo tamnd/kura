@@ -29,17 +29,17 @@
 //! Asking is the query itself against a searcher that is already open, which is
 //! the part no amount of caching removes.
 //!
-//! Opening turns out not to grow with the segment count at all, and the reason
-//! is worth the extra column in the table. [`kura_core::file::View::reader`]
-//! goes through [`kura_core::segment::Segment::open`], which hashes every
-//! section against the digest in its table before handing back a reader. That
-//! costs what the segment holds rather than what the query wants, and the bytes
-//! a rung holds are the same however many segments they are cut into, so the
-//! whole ladder pays about the same. The unchecked column opens the same
-//! segments through
-//! [`kura_core::segment::Segment::open_without_checksum`] and is the same
-//! structural parse without the hashing, which is what the difference between
-//! the two columns is measuring.
+//! The first run of this found that opening did not grow with the segment count
+//! at all, because [`kura_core::file::View::reader`] went through
+//! [`kura_core::segment::Segment::open`], which hashes every section against the
+//! digest in its table before handing back a reader. That costs what the segment
+//! holds rather than what the query wants, and the bytes a rung holds are the
+//! same however many segments they are cut into, so the whole ladder paid the
+//! same 900 microseconds against a query of 2. It does not any more, and the
+//! unchecked column is what is left of that: it opens the same segments through
+//! [`kura_core::segment::Segment::open_without_checksum`] directly, so the two
+//! columns now agree and a run where they stop agreeing is a run where the
+//! hashing has come back.
 //!
 //! The file size is in the table because the ladder is built by folding, and a
 //! fold appends the segment it made rather than replacing the ones it read, so
@@ -150,9 +150,8 @@ fn run(corpus: &Path, directory: &Path) -> Result<(), String> {
             floor.opening
         );
         println!(
-            "opening the same segment without checking its digests is {:.1} µs, which is {:.0} times less, so what an open costs is hashing bytes the query never reads",
-            floor.unchecked,
-            floor.opening / floor.unchecked
+            "opening the same segment straight through open_without_checksum is {:.1} µs, and the two agreeing is what says no digest is being hashed on the query path",
+            floor.unchecked
         );
     }
     Ok(())
