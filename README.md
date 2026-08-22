@@ -829,6 +829,41 @@ The middle query of the folding condition walked six segments and the middle que
 What it buys is the store it leaves behind, seven segments rather than thirteen, and the reader that pays for it is the one asking questions during the run.
 That is a fair trade over a long ingest and it is not a free one, and a run that only reported the segment count at the end would have made it look free.
 
+## Which part of a query the writing reaches
+
+A query in these tables is four things and they are counted as one: taking a view of the store, opening a reader over each segment in it, building a searcher over those readers, and running the search.
+The same command will time the four separately, which is a different question from the one above and is run separately because it means four more clock reads inside something that takes a few microseconds:
+
+```sh
+cargo run --release --example serving -- ./src /var/lib/kura readers=4 parts 50000
+```
+
+Same corpus and machine, five runs, each cell the middle of the five:
+
+| the median of | taking the view | opening the readers | building the searcher | running the query |
+| --- | --- | --- | --- | --- |
+| quiet | 0.04 µs | 0.58 µs | 0.00 µs | 2.71 µs |
+| writing | 0.08 µs | 3.17 µs | 0.04 µs | 7.08 µs |
+| writing and folding | 0.08 µs | 3.62 µs | 0.04 µs | 8.67 µs |
+
+| and of p99 | taking the view | opening the readers | building the searcher | running the query |
+| --- | --- | --- | --- | --- |
+| quiet | 0.25 µs | 2.42 µs | 0.04 µs | 11.50 µs |
+| writing | 0.33 µs | 16.79 µs | 0.04 µs | 42.38 µs |
+| writing and folding | 0.29 µs | 15.62 µs | 0.04 µs | 40.50 µs |
+
+Two of the four are free and stay free.
+Taking a view is 40 nanoseconds with nothing writing and 80 with four writers committing as fast as they can fill batches, and building a searcher over readers that are already open does not appear in the numbers at all.
+That is worth saying plainly because the view handover was the first suspect for what a commit costs a reader, and it is not it.
+
+The other two are where the writing lands, and they do not grow by the same amount or in the same way.
+Opening the readers is 447 percent more under a concurrent write at the median and 594 percent more at p99.
+Running the query is 161 percent more at the median and 268 at p99.
+In microseconds rather than percentages the search is still the larger addition, 4.37 against 2.59 at the median, but opening the readers is the one that multiplies, and it is pure overhead: it is the work of getting ready to answer rather than answering.
+
+Both of them touch segment bytes and neither of the free two does, which is the shape to take into the next round of this.
+The four clock reads cost nothing measurable, incidentally: the quiet row's median is 3.3 µs here and 3.3 µs in the table above it, taken without them.
+
 ## What it costs when there is no core to spare
 
 Everything folding costs a reader on the machine above is the core the keeper takes, and that machine has ten of them for four writers, a keeper and a reader.
