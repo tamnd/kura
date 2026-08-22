@@ -218,7 +218,59 @@ The test for it copies a store, zeroes the log from every 4 KiB boundary in the 
 ```
   log              128.0 MB
     8871 records to replay, 68.9 MB
+  durability    F_FULLFSYNC, survives the power going
 ```
+
+That last line is the one to read before believing any of the others.
+
+### Which call, and what it does not promise
+
+Saying a returned commit survives a power cut is a claim about a platform call, and the obvious call does not mean the same thing everywhere.
+On macOS an `fsync` returns once the write has been handed to the drive, and the drive is entitled to hold it in a volatile cache and acknowledge it anyway, so a power cut at that moment loses it.
+`F_FULLFSYNC` is the call that asks the drive to empty that cache.
+On Linux and on Windows the ordinary call already asks for the flush and there is nothing stronger to ask for.
+
+A commit latency measured with the weaker call on one platform and compared against the stronger call on another is not a comparison, so the call is named beside the number everywhere it is reported.
+The engine takes the strongest of the three by default, and the other two are there to be asked for out loud:
+
+```sh
+./target/release/kura-cli index ./corpus -o /tmp/docs.kura --store --durability device
+```
+
+What the three cost, 500 syncs each after a 4 KiB write, on an idle M4 on APFS:
+
+| reach | call | median | p99 | max | syncs/s | survives |
+| --- | --- | --- | --- | --- | --- | --- |
+| platter | `F_FULLFSYNC` | 3.86 ms | 4.90 ms | 11.94 ms | 259 | the power going |
+| device | `fsync` | 3.89 ms | 6.01 ms | 7.16 ms | 257 | the process dying, not the power going |
+| ordered | `F_BARRIERFSYNC` | 0.81 ms | 1.24 ms | 1.84 ms | 1,233 | nothing, but nothing written after it lands first |
+
+And on a four core Linux box on ext4 over SATA, where all three are one call:
+
+| reach | call | median | p99 | max | syncs/s |
+| --- | --- | --- | --- | --- | --- |
+| any | `fdatasync` | 13.71 ms | 115.26 ms | 239.62 ms | 73 |
+
+The honest call is free on the laptop, inside the noise of the weaker one, which is what makes it the default.
+It is not free everywhere and it is not free at any moment.
+The same laptop measured with three indexing runs' writes still going down gave the strongest reach a median of 5.47 ms, a p99 of 452 ms and a worst of 1.97 s, against a p99 of 6.31 ms for the weaker call on the same run, because asking the drive to empty its cache means waiting for whatever else is in it.
+That is an argument for making commits fewer rather than for making them weaker, which is the next piece of work.
+
+Measure your own with the example, pointed at the filesystem the store will live on, since the answer belongs to the device and not to the machine:
+
+```sh
+cargo run --release --example sync -- /var/lib/kura
+```
+
+A run into a store says what its commits cost and which call made them durable:
+
+```
+2 commits, median 37.6ms and worst 37.6ms, synced with F_FULLFSYNC which survives the power going
+```
+
+Those are flushes rather than one document commits.
+Each of them wrote about 8 MB of segment before it synced, so the four milliseconds of sync are lost in it, and the choice of reach made no measurable difference across three runs of each on the corpus below.
+The reach starts to matter when the commit is small, which is what group commit is for and what has not been built yet.
 
 The Go source tree at go1.26.6, which is 10,888 text files and 106.4 MB, on an M4 with the files already in page cache, `--memory 32m`, eight runs of the same command one after another:
 

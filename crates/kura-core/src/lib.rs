@@ -24,6 +24,8 @@ pub mod bound;
 pub mod checksum;
 pub mod codec;
 pub mod compact;
+#[cfg(feature = "fs")]
+pub mod durability;
 pub mod error;
 pub mod explain;
 #[cfg(feature = "fs")]

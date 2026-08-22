@@ -51,6 +51,7 @@ use std::time::{Duration, Instant};
 
 use kura_core::analysis::Analyzer;
 use kura_core::bitmap::Bitmap;
+use kura_core::durability::Reach;
 use kura_core::file::{Store, Trouble};
 use kura_core::index::{Held, Reader, Writer};
 use kura_core::ingest::{self, Logged};
@@ -131,6 +132,10 @@ options:
   --store       for index, add a segment to a store rather than write a bare one
   --memory <size>       for index, start a new segment once the writer holds this much
   --flush-every <size>  for index, start a new segment once this much text has gone in
+  --durability <reach>  for index into a store, what a commit survives:
+                platter, the power going, which is the default
+                device, the process dying but not the power going
+                ordered, nothing, but nothing written after it lands first
   --total       for explain, walk for the total as well as the page
   --depth <n>   how deep a run file goes, for topics (default 1000)
   --tag <name>  what the run file calls this run (default kura)
@@ -791,6 +796,12 @@ struct Plan {
     into_store: bool,
     flush_every: Option<u64>,
     memory: Option<u64>,
+    /// How far a commit of this run makes its writes go.
+    ///
+    /// Here rather than assumed, because the answer costs a factor of four on
+    /// some hardware and none at all on other hardware, and the only way to
+    /// find out which kind is in the machine is to be able to run it both ways.
+    durability: Reach,
 }
 
 impl Plan {
@@ -801,6 +812,7 @@ impl Plan {
         let mut into_store = false;
         let mut flush_every: Option<u64> = None;
         let mut memory: Option<u64> = None;
+        let mut durability = Reach::default();
         let mut at = 0;
         while at < args.len() {
             match args[at].as_str() {
@@ -818,6 +830,13 @@ impl Plan {
                         .get(at)
                         .ok_or_else(|| Failure::usage("--memory wants a size"))?;
                     memory = Some(size(value)?);
+                }
+                "--durability" => {
+                    at += 1;
+                    let value = args
+                        .get(at)
+                        .ok_or_else(|| Failure::usage("--durability wants a reach"))?;
+                    durability = reach(value)?;
                 }
                 "-o" => {
                     at += 1;
@@ -842,6 +861,12 @@ impl Plan {
         if memory.is_some() && !into_store {
             return Err(Failure::usage("--memory needs --store to flush into"));
         }
+        if durability != Reach::default() && !into_store {
+            // A bare index is written and closed rather than committed, so
+            // there is no commit here for the reach to be about, and accepting
+            // the flag would be agreeing to something that does not happen.
+            return Err(Failure::usage("--durability needs --store to commit into"));
+        }
         // A writer holds the compressor's match table before it has been given
         // anything, so a budget under that is a segment per document rather than
         // a small run, and somebody who asked for a kilobyte meant a megabyte.
@@ -865,7 +890,24 @@ impl Plan {
             into_store,
             flush_every,
             memory,
+            durability,
         })
+    }
+}
+
+/// Reads a reach, or says which ones there are.
+///
+/// The names are what the writes survive rather than what the platform calls
+/// them, because the call has a different name on every platform and what it
+/// promises does not.
+fn reach(value: &str) -> Result<Reach, Failure> {
+    match value {
+        "platter" => Ok(Reach::Platter),
+        "device" => Ok(Reach::Device),
+        "ordered" => Ok(Reach::Ordered),
+        other => Err(Failure::usage(format!(
+            "--durability takes platter, device or ordered, not {other}"
+        ))),
     }
 }
 
@@ -894,6 +936,10 @@ struct Run<'a> {
     /// How many documents the log had no room for, which is a run whose batches
     /// are larger than the ring the store was made with.
     unlogged: u64,
+    /// How long each commit took, kept one by one rather than summed, because
+    /// the spread is the whole question and a total hides it. There are as many
+    /// of these as the run had flushes, which is a handful.
+    commits: Vec<Duration>,
     peak: Held,
     steepest: Steepest<'a>,
     marks: Marks,
@@ -910,6 +956,41 @@ impl<'a> Run<'a> {
             self.peak = held;
         }
         self.steepest.saw(file, held.total());
+    }
+
+    /// Prints what the run's commits cost and which call made them durable.
+    ///
+    /// The call is named because a commit latency without it is not a number
+    /// anybody can compare against another engine's, and the two calls a
+    /// platform offers can differ by a factor of four while promising quite
+    /// different things.
+    ///
+    /// The median and the worst rather than a mean, since the point of asking
+    /// is the worst one.
+    ///
+    /// These are flushes and not one document commits. Each of them wrote a
+    /// whole segment before it synced, so the number here is bounded by how
+    /// much the batch was holding rather than by what the sync costs.
+    fn tell_commits(&self, reach: Reach) {
+        if self.commits.is_empty() {
+            println!("no commits, and one would sync with {}", reach.call());
+            return;
+        }
+        let mut sorted = self.commits.clone();
+        sorted.sort_unstable();
+        println!(
+            "{} {}, median {:.1?} and worst {:.1?}, synced with {} which survives {}",
+            sorted.len(),
+            if sorted.len() == 1 {
+                "commit"
+            } else {
+                "commits"
+            },
+            sorted[sorted.len() / 2],
+            sorted[sorted.len() - 1],
+            reach.call(),
+            reach.promise()
+        );
     }
 
     /// Prints the paragraph a run ends with.
@@ -944,6 +1025,7 @@ impl<'a> Run<'a> {
                 );
             }
             println!();
+            self.tell_commits(plan.durability);
         }
         tell_held(self.peak);
         if let Some(budget) = plan.memory {
@@ -992,7 +1074,7 @@ fn index(args: &[String]) -> Result<(), Failure> {
 /// as the batch before it left it, and every batch is one commit that adds the
 /// new documents and hides the ones they replace together.
 fn into_store<'a>(plan: &Plan, files: &'a [PathBuf], run: &mut Run<'a>) -> Result<(), Failure> {
-    let mut store = open_store(&plan.out)?;
+    let mut store = open_store(&plan.out, plan.durability)?;
     // Before a document of this run goes in. The log holds whatever the run
     // before this one had taken and not committed, and those documents belong in
     // the store before it is asked to replace any of them, or a file indexed
@@ -1101,7 +1183,9 @@ fn one_batch<'a>(
     // vector first cost 20.6 MB on a corpus whose segment came to 14.3 MB, which
     // is a copy of the largest thing this program makes for the length of one
     // call.
+    let committing = Instant::now();
     prepared.commit(now, now).map_err(trouble)?;
+    run.commits.push(committing.elapsed());
     run.marks = Marks {
         documents: read_documents,
         merged: read_merged,
@@ -1195,14 +1279,16 @@ fn fresh(memory: Option<u64>) -> Writer {
 /// Once for the run rather than once a batch. A store is a file and opening it
 /// reads and checks the manifest, which is work that says the same thing every
 /// time it is done.
-fn open_store(path: &Path) -> Result<Store, Failure> {
+fn open_store(path: &Path, durability: Reach) -> Result<Store, Failure> {
     let now = now();
-    if path.exists() {
+    let mut store = if path.exists() {
         Store::open(path)
     } else {
         Store::create_with_log(path, identity(path, now), now, LOG_LEN)
     }
-    .map_err(|trouble| Failure::Store(path.to_path_buf(), trouble))
+    .map_err(|trouble| Failure::Store(path.to_path_buf(), trouble))?;
+    store.set_durability(durability);
+    Ok(store)
 }
 
 /// Writes one segment to a path of its own, with no store around it.
@@ -2154,6 +2240,61 @@ mod tests {
         assert!(Plan::read(&args(&["--store", "--memory", "4096"])).is_err());
         // And the size itself still has to be a size.
         assert!(Plan::read(&args(&["--store", "--memory"])).is_err());
+    }
+
+    #[test]
+    fn a_run_says_which_reach_it_wants_and_the_default_is_the_strongest() {
+        let args = |extra: &[&str]| {
+            let mut args = vec!["corpus".to_string(), "-o".to_string(), "out".to_string()];
+            args.extend(extra.iter().map(|part| (*part).to_string()));
+            args
+        };
+        let plan = Plan::read(&args(&["--store"])).expect("a plan");
+        assert_eq!(plan.durability, Reach::Platter);
+
+        for (name, wanted) in [
+            ("platter", Reach::Platter),
+            ("device", Reach::Device),
+            ("ordered", Reach::Ordered),
+        ] {
+            let plan = Plan::read(&args(&["--store", "--durability", name])).expect("a plan");
+            assert_eq!(plan.durability, wanted, "for {name}");
+        }
+
+        // A name nobody has, a name with nothing after it, and a reach asked
+        // for on a run that has no commit to make.
+        assert!(Plan::read(&args(&["--store", "--durability", "eventually"])).is_err());
+        assert!(Plan::read(&args(&["--store", "--durability"])).is_err());
+        assert!(Plan::read(&args(&["--durability", "device"])).is_err());
+    }
+
+    #[test]
+    fn a_run_at_a_weaker_reach_writes_the_same_store() {
+        // The reach says how far a write goes on the way out, not what goes.
+        // Two stores built the same way at two reaches that differ in what they
+        // survive have to be the same store, or the flag is doing something it
+        // does not say it does.
+        let dir = scratch_dir("reaches");
+        let corpus = documents(&dir.join("corpus"), 0, 24);
+        let mut bytes = Vec::new();
+        for name in ["platter", "device", "ordered"] {
+            let out = dir.join(format!("{name}.kura"));
+            let args = vec![
+                corpus.display().to_string(),
+                "-o".to_string(),
+                out.display().to_string(),
+                "--store".to_string(),
+                "--durability".to_string(),
+                name.to_string(),
+            ];
+            index(&args).unwrap_or_else(|_| panic!("indexed at {name}"));
+            let store = Store::open(&out).expect("a store");
+            assert_eq!(store.manifest().live, 24, "at {name}");
+            let view = store.view().expect("a view");
+            bytes.push(view.bytes(0).expect("a segment").to_vec());
+        }
+        assert_eq!(bytes[0], bytes[1], "platter and device wrote differently");
+        assert_eq!(bytes[1], bytes[2], "device and ordered wrote differently");
     }
 
     #[test]
