@@ -51,6 +51,8 @@ pub mod terms;
 pub mod upsert;
 pub mod vector;
 pub mod wal;
+#[cfg(feature = "fs")]
+pub mod writer;
 pub mod xxh3;
 
 pub use error::{Error, Result};

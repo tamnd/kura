@@ -342,9 +342,40 @@ A batch prepared against the current state has nothing above it and pays for non
 What is still refused is a compaction, which folds a run of segments into one and moves every position after it.
 Nothing else moves a segment, so nothing else refuses a batch.
 
-What is not here yet is the thing that forms the group.
-Every write path in the engine takes the store by exclusive reference, so the writers that would arrive while a sync is in flight cannot exist yet, and a caller that has several batches ready hands them over itself.
-The shared writer is the next piece of work, and these are the halves of it that had to be right first.
+The thing that forms the group is `Writer`, which is a store several threads can commit into.
+Each of them asks it for a view, builds a batch against that view, and hands it over.
+Whoever finds nobody committing takes everything that is waiting, its own batch included, and commits all of it at once, and everybody else waits for the answer.
+Nobody lingers hoping for company.
+A commit is one sync of latency and nothing else, so a leader that waited for more batches would be making a lone writer slower for nothing, and the window that costs nobody anything is the length of the sync already in flight.
+Under load that window fills on its own.
+
+The view is handed out rather than taken from the store, so preparing a batch never waits for the drive, and preparing is the expensive half of ingest.
+That view is usually a commit or two behind, which is exactly what the join above makes harmless.
+
+Sixteen threads, 512 batches of four documents between them, on an M4 on APFS:
+
+| threads | documents/s | syncs | syncs per 1,000 documents | average group | median | p99 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 501 | 1,024 | 500.0 | 1.0 | 7.795 ms | 14.752 ms |
+| 2 | 376 | 1,024 | 500.0 | 1.0 | 15.935 ms | 95.888 ms |
+| 4 | 970 | 512 | 250.0 | 2.0 | 15.778 ms | 24.114 ms |
+| 8 | 1,811 | 256 | 125.0 | 4.0 | 15.939 ms | 28.926 ms |
+| 16 | 3,813 | 128 | 62.5 | 8.0 | 15.998 ms | 21.907 ms |
+
+```sh
+cargo run --release --example writers -- /var/lib/kura
+```
+
+The group comes out at half the thread count at every step, and that is not an accident of the machine.
+The threads a commit releases spend the next commit preparing their next batch and queue for the one after it, so the writers settle into two cohorts that take turns leading.
+Half the threads is therefore the number to expect, and the cost per document falls with it while the median wait stays where a single commit put it.
+
+The two thread row is the one worth reading carefully, because half of two is one.
+The pair alternate, neither ever joins the other, and each waits behind the other's commit for no gain: the same throughput as one thread for twice the latency.
+That is the honest floor of taking the queue as it stands, and it is what a small linger would fix if a real workload ever asks for it.
+
+The compaction that refuses a batch refuses that batch and not the group it arrived in.
+The leader checks each one against the store it is about to commit into, tells the one a fold moved that it was moved, and commits the rest.
 
 The Go source tree at go1.26.6, which is 10,888 text files and 106.4 MB, on an M4 with the files already in page cache, `--memory 32m`, eight runs of the same command one after another:
 

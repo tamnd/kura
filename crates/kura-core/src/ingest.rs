@@ -847,6 +847,24 @@ impl Prepared {
     pub fn commit(self, store: &mut Store, created: u64, written: u64) -> Result<u64> {
         commit_all(store, vec![self], created, written)
     }
+
+    /// Whether this can still be committed into that store.
+    ///
+    /// True unless a compaction has folded one of the segments the batch counted
+    /// positions into. Everything else that can have happened since is joined
+    /// onto rather than refused, which is what [`commit_all`] does.
+    ///
+    /// A caller holding one batch has no use for this, because committing it
+    /// says the same thing and says it with a reason attached. A caller holding
+    /// several has: one batch that cannot go in is not a reason to refuse the
+    /// others, and this is how they are told apart before the commit rather than
+    /// by it.
+    #[must_use]
+    pub fn fits(&self, store: &Store) -> bool {
+        let segments = &store.manifest().segments;
+        self.base <= segments.len()
+            && crate::manifest::layout(&segments[..self.base]) == self.layout
+    }
 }
 
 /// Commits a group of prepared batches as one commit.
@@ -920,9 +938,7 @@ pub fn commit_all(
     let committed = store.manifest().segments.len();
     let epoch = store.manifest().epoch;
     for part in &parts {
-        if part.base > committed
-            || crate::manifest::layout(&store.manifest().segments[..part.base]) != part.layout
-        {
+        if !part.fits(store) {
             return Err(Trouble::Format(Error::StaleView {
                 read: part.epoch,
                 committed: epoch,
