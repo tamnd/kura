@@ -53,6 +53,18 @@
 //! to order the writes rather than to finish them, so it ramps the same way and
 //! differs in the syncs and nothing else.
 //!
+//! What the syncs leave over is the rest of a commit, and there are two kinds
+//! of thing it could be. One kind is paid once per commit however large it was:
+//! extending the mapping, taking the lock, handing the view over. The other is
+//! paid by the byte: a segment written a moment ago is being read for the first
+//! time, where a store sitting still has been read a quarter of a million times
+//! by the time its median query runs. So one more row commits the same way with
+//! a fraction of the documents in each batch, over the same fraction of the
+//! files so that the store still ends the round with the same segments in it,
+//! and it is read against a control built the way it was rather than the way
+//! the writing row was. Two subtractions, each of a row against its own
+//! control, and what is read is the two of them against each other.
+//!
 //! The count all this is held at is what the middle query of the writing
 //! condition walked rather than what the store held when the round was over, and
 //! the two are not close. A writing condition that finishes at thirteen segments
@@ -181,6 +193,16 @@ const READERS: usize = 1;
 /// Small, so that commits happen often enough over the run for a reader to be
 /// asking questions between them rather than during one long one.
 const BUDGET: u64 = 4 * 1024 * 1024;
+
+/// What the small batch condition divides both the documents a commit holds and
+/// the file list by.
+///
+/// Dividing both is what keeps the row readable against the writing row. Fewer
+/// documents a commit alone would leave the same corpus in eight times as many
+/// segments, and a reader walking eight times as many of them is a heavier
+/// reader, which is a second difference between the two rows and the whole
+/// point of the condition is that there is only one.
+const FRACTION: usize = 8;
 
 /// How many documents to hold back from the first pass for the writing to add.
 ///
@@ -411,6 +433,23 @@ fn conditions(
         load,
     )?;
     loosely.tell("writing, ordered only");
+    // An eighth of the files, taken every eighth rather than the first eighth
+    // of them, so that the batches hold the same spread of the corpus as the
+    // writing row and are smaller rather than different.
+    let thinned: Vec<PathBuf> = rest.iter().step_by(FRACTION).cloned().collect();
+    let most = (rest.len() / writing.segments.max(1) / FRACTION).max(1);
+    let smaller = rounds(
+        base,
+        directory,
+        "smaller",
+        queries,
+        Doing::Smaller {
+            files: &thinned,
+            most,
+        },
+        load,
+    )?;
+    smaller.tell("writing, smaller batches");
 
     if load.parts {
         // The rows below this one are the decomposition of the writing row and
@@ -422,6 +461,7 @@ fn conditions(
             ("writing", &writing),
             ("writing and folding", &folding),
             ("writing, ordered only", &loosely),
+            ("writing, smaller batches", &smaller),
         ]);
         return Ok(());
     }
@@ -442,7 +482,31 @@ fn conditions(
         writing.wrote_in().unwrap_or_default(),
     )?;
 
-    report(&quiet, &writing, &folding, &loosely, &apart, load);
+    let tight = without_commits(
+        base,
+        directory,
+        queries,
+        &thinned,
+        load,
+        Matched {
+            each: most,
+            segments: smaller.walked(),
+            pace: smaller.wrote_in().unwrap_or_default(),
+        },
+    )?;
+    report(
+        &quiet,
+        &writing,
+        &folding,
+        &loosely,
+        &Small {
+            row: &smaller,
+            control: tight.as_ref(),
+            each: most,
+        },
+        &apart,
+        load,
+    );
     Ok(())
 }
 
@@ -493,6 +557,7 @@ fn report(
     writing: &Answered,
     folding: &Answered,
     loosely: &Answered,
+    smaller: &Small<'_>,
     apart: &Apart,
     load: Load,
 ) {
@@ -545,6 +610,24 @@ fn report(
         );
     }
     commits("the syncs", writing, loosely, writing.walked());
+    // The one that tells a cost per byte from a cost per commit. It is the same
+    // subtraction as the line above the syncs, done a second time with a
+    // fraction of the documents in each commit, so what is read is not the two
+    // rows against each other but the two subtractions against each other.
+    if let Some(control) = smaller.control {
+        commits(
+            &format!("the commits, at {} documents each", smaller.each),
+            smaller.row,
+            control,
+            control.segments,
+        );
+    }
+    if let (Some(all), Some(small)) = (writing.wrote_in(), smaller.row.wrote_in()) {
+        println!(
+            "the smaller batches went over an eighth of the files in {small:.2?} against the {all:.2?} the writing took over all of them, and left {} segments against {}",
+            smaller.row.segments, writing.segments,
+        );
+    }
     if let (Some(all), Some(ordered)) = (writing.wrote_in(), loosely.wrote_in()) {
         println!(
             "the same writing with the syncs turned into barriers took {ordered:.2?} against {all:.2?}, and left {} segments against {}",
@@ -561,6 +644,7 @@ fn report(
             ("writing", Some(writing)),
             ("writing and folding", Some(folding)),
             ("writing, ordered only", Some(loosely)),
+            ("writing, smaller batches", Some(smaller.row)),
             ("quiet, all of it", Some(settled)),
             ("quiet, spread out", spread.as_ref()),
             ("threads, no commits", busy.as_ref()),
@@ -629,7 +713,7 @@ fn commits(what: &str, writing: &Answered, without: &Answered, segments: usize) 
         .collect::<Vec<_>>()
         .join(", ");
     println!(
-        "read at the {segments} segments both of them walked, over the {} queries of the writing row and the {} of the row without them, {what} cost {said} percent",
+        "read at the {segments} segments both of them walked, over the {} queries of the row that has them and the {} of the row without them, {what} cost {said} percent",
         counted.0, counted.1,
     );
 }
@@ -648,6 +732,30 @@ struct Apart {
     /// The same store as [`Self::spread`], with the writer threads reading the
     /// same files and building the same segments and committing none of them.
     busy: Option<Answered>,
+}
+
+/// The small batch row and the row it is read against.
+struct Small<'a> {
+    /// The writing condition with a fraction of the documents in each commit.
+    row: &'a Answered,
+    /// The same batches over the same files with the commits taken out.
+    ///
+    /// Nothing when the small batch row came to one segment, since there is
+    /// then no count for the two of them to be read at.
+    control: Option<&'a Answered>,
+    /// How many documents a batch of that row took.
+    each: usize,
+}
+
+/// What a control row has to match for the row it stands in for.
+#[derive(Clone, Copy)]
+struct Matched {
+    /// How many documents a batch takes before it is finished.
+    each: usize,
+    /// The segment count the store is brought to before the queries start.
+    segments: usize,
+    /// How long the row it stands in for took over the same files.
+    pace: Duration,
 }
 
 /// The rows the writing row is taken apart against.
@@ -678,7 +786,7 @@ fn taken_apart(
     pace: Duration,
 ) -> Result<Apart, String> {
     let many = directory.join("kura-serving-mid.kura");
-    let (added, count) = midway(base, &many, rest, segments)?;
+    let (added, count) = midway(base, &many, rest, usize::MAX, segments)?;
     let one = directory.join("kura-serving-mid-one.kura");
     folded(&many, &one, 1)?;
     let settled = rounds(&one, directory, "settled", queries, Doing::Nothing, load)?;
@@ -694,7 +802,11 @@ fn taken_apart(
             directory,
             "busy",
             queries,
-            Doing::Busy { files: rest, pace },
+            Doing::Busy {
+                files: rest,
+                pace,
+                most: usize::MAX,
+            },
             load,
         )?;
         churning.tell("threads, no commits");
@@ -800,11 +912,12 @@ fn fill(path: &Path, files: &[PathBuf]) -> Result<(Vec<String>, u64), String> {
 /// the stores they are measured against, where there is nothing to race with
 /// and one thread is the simplest thing that works.
 fn index_into(store: &mut Store, files: &[PathBuf], saw: impl FnMut(&str)) -> Result<(), String> {
-    index_into_with(store, files, BUDGET, usize::MAX, saw).map(|_| ())
+    index_into_with(store, files, BUDGET, usize::MAX, usize::MAX, saw).map(|_| ())
 }
 
 /// The same thing with the batch size given rather than taken from [`BUDGET`],
-/// and a cap on how many batches it commits.
+/// a cap on how many documents a batch takes, and a cap on how many batches it
+/// commits.
 ///
 /// Returns how many files it got through, which is the whole of `files` unless
 /// the cap stopped it.
@@ -812,6 +925,7 @@ fn index_into_with(
     store: &mut Store,
     files: &[PathBuf],
     budget: u64,
+    each: usize,
     most: usize,
     mut saw: impl FnMut(&str),
 ) -> Result<usize, String> {
@@ -820,6 +934,7 @@ fn index_into_with(
     while at < files.len() && committed < most {
         let view = store.view().map_err(|problem| problem.to_string())?;
         let mut batch = Batch::with_budget(&view, budget).map_err(|problem| problem.to_string())?;
+        let mut held = 0;
         while at < files.len() {
             let path = &files[at];
             at += 1;
@@ -829,7 +944,8 @@ fn index_into_with(
             batch
                 .add_keyed(key.as_bytes(), &text)
                 .map_err(|problem| problem.to_string())?;
-            if batch.is_full() {
+            held += 1;
+            if batch.is_full() || held >= each {
                 break;
             }
         }
@@ -866,6 +982,7 @@ fn midway(
     base: &Path,
     path: &Path,
     files: &[PathBuf],
+    each: usize,
     segments: usize,
 ) -> Result<(usize, usize), String> {
     std::fs::remove_file(path).ok();
@@ -876,10 +993,49 @@ fn midway(
         &mut store,
         files,
         BUDGET,
+        each,
         segments.saturating_sub(held),
         |_| (),
     )?;
     Ok((added, store.manifest().segments.len()))
+}
+
+/// The same store the small batch condition queries, with the writer threads
+/// beside it building the same batches and committing none of them.
+///
+/// This is what the small batch row is read against, and it is built the way
+/// the row it stands in for was built rather than the way the writing row was,
+/// because a control that matched the writing row would differ from the row it
+/// is subtracted from in the batch size as well as in the commits.
+fn without_commits(
+    base: &Path,
+    directory: &Path,
+    queries: &[String],
+    files: &[PathBuf],
+    load: Load,
+    matched: Matched,
+) -> Result<Option<Answered>, String> {
+    let many = directory.join("kura-serving-tight-mid.kura");
+    let (added, count) = midway(base, &many, files, matched.each, matched.segments)?;
+    if count < 2 {
+        std::fs::remove_file(&many).ok();
+        return Ok(None);
+    }
+    let churning = rounds(
+        &many,
+        directory,
+        "tight",
+        queries,
+        Doing::Busy {
+            files,
+            pace: matched.pace,
+            most: matched.each,
+        },
+        load,
+    )?;
+    churning.tell(&format!("small threads, no commits, {added} more"));
+    std::fs::remove_file(&many).ok();
+    Ok(Some(churning))
 }
 
 /// Copies a store and folds it down to a segment count.
@@ -1093,12 +1249,33 @@ enum Doing<'a> {
         files: &'a [PathBuf],
         /// How long the writing condition took over the same files.
         pace: Duration,
+        /// How many documents a batch takes before it is thrown away, so that
+        /// the threads finish a batch as often as the row they stand in for.
+        most: usize,
     },
     /// The writer threads adding the files as fast as they can fill batches,
     /// with nothing folding, so the segment count climbs for the whole round.
     Writing(&'a [PathBuf]),
     /// The same, with a keeper beside them.
     Folding(&'a [PathBuf]),
+    /// The same as [`Doing::Writing`] with the batches an eighth of the
+    /// documents over an eighth of the files, so that a commit writes a
+    /// fraction of the bytes and the store still ends the round with the same
+    /// segments in it.
+    ///
+    /// Read against the writing condition at a segment count both of them
+    /// walked, which is the only way to read any two of these against each
+    /// other, this holds the number of commits a query has lived through the
+    /// same and changes how much each of them wrote. If what a commit costs a
+    /// reader follows the bytes it added, this is cheaper by about that
+    /// fraction. If it follows the commit, the two are the same.
+    Smaller {
+        /// The files the threads work through, an eighth of the writing row's.
+        files: &'a [PathBuf],
+        /// How many documents a batch takes before it commits, an eighth of
+        /// what a batch of the writing row held.
+        most: usize,
+    },
     /// The same as [`Doing::Writing`], with the store asking the drive to order
     /// the writes rather than to finish them.
     ///
@@ -1120,7 +1297,8 @@ impl<'a> Doing<'a> {
             Doing::Busy { files, .. }
             | Doing::Writing(files)
             | Doing::Folding(files)
-            | Doing::Loosely(files) => Some(files),
+            | Doing::Loosely(files)
+            | Doing::Smaller { files, .. } => Some(files),
         }
     }
 
@@ -1145,8 +1323,17 @@ impl<'a> Doing<'a> {
     fn commits(self) -> bool {
         matches!(
             self,
-            Doing::Writing(_) | Doing::Folding(_) | Doing::Loosely(_)
+            Doing::Writing(_) | Doing::Folding(_) | Doing::Loosely(_) | Doing::Smaller { .. }
         )
+    }
+
+    /// How much text goes into a batch before it is handed over.
+    /// How many documents a batch takes before it commits.
+    fn most(self) -> usize {
+        match self {
+            Doing::Smaller { most, .. } | Doing::Busy { most, .. } => most,
+            _ => usize::MAX,
+        }
     }
 
     /// Whether a keeper runs beside them.
@@ -1231,9 +1418,7 @@ fn measure(
             let running: Vec<_> = (0..load.threads)
                 .map(|_| {
                     let (writer, next) = (&writer, &next);
-                    scope.spawn(move || {
-                        add(writer, files, next, doing.commits(), started, doing.pace())
-                    })
+                    scope.spawn(move || add(writer, files, next, doing, started))
                 })
                 .collect();
             for handle in running {
@@ -1384,10 +1569,10 @@ fn add(
     writer: &Writer,
     files: &[PathBuf],
     next: &AtomicUsize,
-    commit: bool,
+    doing: Doing<'_>,
     began: Instant,
-    pace: Option<Duration>,
 ) -> Result<(), String> {
+    let (commit, most, pace) = (doing.commits(), doing.most(), doing.pace());
     let mut again: Vec<usize> = Vec::new();
     let mut drained = false;
     loop {
@@ -1417,7 +1602,7 @@ fn add(
                 .add_keyed(key.as_bytes(), &text)
                 .map_err(|problem| problem.to_string())?;
             taken.push(at);
-            if batch.is_full() {
+            if batch.is_full() || taken.len() >= most {
                 break;
             }
         }
