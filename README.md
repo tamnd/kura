@@ -199,7 +199,27 @@ A lookup asks the key index of every segment in turn, so the cost of one grows w
 
 What it does cost is the file.
 The documents that were replaced are still in the segments they were written into, so the store grows by a segment a run: 74.4 MB after four runs and 140.7 MB after eight, with 10,888 live documents and 87,104 written throughout.
-Reclaiming that is compaction, which is not here yet.
+Reclaiming that is compaction.
+Half of it is here: `kura_core::compact::merge` folds segments into one holding their live documents, and the example beside it does that to a whole store and checks the result answers what the store answered.
+On the sixteen segment store the eight runs above left, 139.0 MB of segments holding 87,104 documents of which 10,888 are live:
+
+```
+cargo run --release --example compact -- /tmp/docs.kura
+```
+
+```
+merge wall                  0.36 s
+merge rate                 29885 docs/s
+merged documents           10888
+  left behind              76216
+merged terms              400588
+merged bytes            16497406
+  of the sources           11.9 %
+```
+
+The dictionary is the part that shrinks furthest, from 3,679,160 entries across the sixteen segments to 400,588, because fifteen of every sixteen copies of a term were held only by documents somebody had already deleted.
+The merge held 37.5 MB of its own beyond the mapped file, which is the segment it was building.
+What is not here yet is the commit that swaps the merged segment into the store in place of the segments it came from, so the store still grows by a segment a run.
 
 A run without `--store` writes a single segment and keys nothing, because a file is not a store and there is nothing in it to replace.
 

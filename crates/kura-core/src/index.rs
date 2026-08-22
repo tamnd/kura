@@ -795,7 +795,7 @@ fn add_ceilings(segment: &mut SegmentWriter, ceilings: bound::Writer) -> Result<
 ///
 /// Returns [`Error::Overflow`] if the keys together are more than a four byte
 /// offset can address, which is four gigabytes of key in one segment.
-fn key_index(mut named: Vec<(Box<[u8]>, DocId)>) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+pub(crate) fn key_index(mut named: Vec<(Box<[u8]>, DocId)>) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
     if named.is_empty() {
         return Ok(None);
     }
