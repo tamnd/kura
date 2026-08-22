@@ -167,14 +167,23 @@ pub enum Error {
         at: usize,
     },
 
-    /// A batch worked out what to delete from a view of the store that is no
-    /// longer the committed one.
+    /// A batch counted positions into segments the store no longer holds where
+    /// it held them.
     ///
-    /// A batch replacing documents holds a set of deletions per segment, and a
-    /// set is the whole answer for its segment, so it is only right about the
-    /// store it read. Committing it against a store that has moved since would
-    /// undo whatever the commit in between deleted. The batch has to be built
-    /// again on a view of where the store is now.
+    /// A batch replacing documents names a segment by its position, so it is
+    /// only right about a store whose segments are still where it found them. A
+    /// compaction is what moves them: it folds a run into one segment and
+    /// everything after that run shifts down. A batch prepared before one has to
+    /// be built again on a view of where the store is now.
+    ///
+    /// A commit that only appended a segment or only deleted a document is not
+    /// this. Nothing moved, and the batch is joined onto what happened rather
+    /// than refused, which is what lets several writers prepare at once and
+    /// commit together.
+    ///
+    /// The epochs below are what the refusal is reported with. They are not what
+    /// it is decided by, so a batch refused here can carry an epoch one behind
+    /// the store or twenty.
     StaleView {
         /// The epoch the batch read.
         read: u64,
@@ -399,7 +408,8 @@ impl fmt::Display for Error {
             Self::StaleView { read, committed } => {
                 write!(
                     f,
-                    "this batch was built on epoch {read} and the store is at {committed}"
+                    "this batch was built on epoch {read}, and the store is at {committed} \
+                     with its segments somewhere else"
                 )
             }
             Self::NoSuchDocument { doc, documents } => {

@@ -755,6 +755,51 @@ pub fn tombstones_each(
         .collect()
 }
 
+/// A number that stops being the same when a run of segments stops being the
+/// segments it was.
+///
+/// A batch worked out against a view carries positions into that view, so what
+/// it says can only be committed into a store whose segments are still where
+/// they were. Comparing this over the segments the batch saw answers that in one
+/// comparison, without holding a copy of the descriptors to compare against.
+///
+/// It is made of where each segment starts, how long it is, how many documents
+/// it holds and the digest of its footer, and of nothing else. The tombstone
+/// fields are left out deliberately: a set of deletions written after a batch
+/// was prepared moves no segment and invalidates no position, and a batch
+/// prepared before an unrelated delete is one that should still commit. What it
+/// does catch is a compaction, which replaces a run of segments with one and
+/// moves everything after it.
+///
+/// Segments appended after the run this covers do not reach it either, which is
+/// the other half of what makes it useful: a batch is about the segments it saw
+/// and has nothing to say about the ones that arrived later.
+///
+/// This is not a checksum and nothing durable depends on it. It never goes into
+/// the file, it is compared only against another one made in the same process
+/// from the same code, and the worst a collision does is let a commit through
+/// that a rebuilt batch would have made identical anyway.
+#[must_use]
+pub fn layout(segments: &[Segment]) -> u64 {
+    // FNV-1a, because this runs over a kilobyte at most and wants no state and
+    // no allocation.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for segment in segments {
+        for field in [
+            segment.offset,
+            segment.len,
+            u64::from(segment.docs),
+            segment.footer,
+        ] {
+            for byte in field.to_le_bytes() {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+    }
+    hash
+}
+
 /// The bytes of every segment in a store, oldest first.
 ///
 /// [`front`] and [`locate`] together, for a caller that has the whole store
@@ -1231,6 +1276,49 @@ mod tests {
         let each = tombstones_each(&block, &state, bytes.len());
         assert!(each[0].is_err());
         assert_eq!(each[1].as_ref().expect("the second"), &None);
+    }
+
+    #[test]
+    fn a_layout_is_blind_to_deletions_and_not_to_anything_else() {
+        let segments = [segment(0), segment(1), segment(2)];
+        let was = layout(&segments);
+
+        let mut deleted = segments;
+        deleted[1].tombstones_offset = 900_000;
+        deleted[1].tombstones_len = 64;
+        deleted[1].generation += 1;
+        deleted[1].first_live = 7;
+        assert_eq!(
+            layout(&deleted),
+            was,
+            "a set of deletions written since moves no segment"
+        );
+
+        let mut promoted = segments;
+        promoted[2].level += 1;
+        assert_eq!(layout(&promoted), was, "and neither does a level");
+
+        let mut folded = [segment(0), segment(9)];
+        folded[1].offset = segments[1].offset;
+        assert_ne!(
+            layout(&folded),
+            layout(&segments[..2]),
+            "a different segment in the same place is a different layout"
+        );
+        assert_ne!(layout(&segments[..2]), was, "and so is a shorter run");
+    }
+
+    #[test]
+    fn a_layout_of_the_run_a_batch_saw_survives_what_arrives_after_it() {
+        // What lets a batch prepared two commits ago still commit. It counted
+        // positions into the first two segments, and the third arriving says
+        // nothing about those.
+        let segments = [segment(0), segment(1), segment(2)];
+        assert_eq!(layout(&segments[..2]), layout(&segments[..2]));
+        assert_eq!(
+            layout(&segments[..2]),
+            layout(&[segment(0), segment(1), segment(5)][..2])
+        );
     }
 
     #[test]

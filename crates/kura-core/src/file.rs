@@ -1446,6 +1446,20 @@ impl View {
         self.segments.is_empty()
     }
 
+    /// A number that says these segments are still where this view found them.
+    ///
+    /// The epoch says whether anything at all has been committed since. This
+    /// says the narrower thing a writer actually needs, which is whether the
+    /// positions it wrote down still mean what they meant, and it goes on
+    /// saying yes across a commit that only appended or only deleted.
+    ///
+    /// See [`crate::manifest::layout`] for what it is made of and what it is
+    /// blind to on purpose.
+    #[must_use]
+    pub fn layout(&self) -> u64 {
+        crate::manifest::layout(&self.segments)
+    }
+
     /// What the manifest said about the segments.
     #[must_use]
     pub fn described(&self) -> &[Segment] {
@@ -1633,7 +1647,28 @@ impl Lookup<'_> {
     /// when the handle is made, and moving that read to where it is used is a
     /// change this signature should survive.
     pub fn document(&self, key: &[u8]) -> Result<Option<(usize, DocId)>> {
-        for at in (0..self.keys.len()).rev() {
+        self.document_from(key, 0)
+    }
+
+    /// The same, looking only at the segments from `from` onwards.
+    ///
+    /// This is for a writer that resolved its keys against a view and is
+    /// committing into a store that has been committed to since. Everything it
+    /// knew about is below `from` and it has already decided what to do with
+    /// that. What it does not know about is the segments above, and a key of
+    /// its own that one of them holds is a document it is replacing without
+    /// having been able to see it.
+    ///
+    /// Answering nothing where the newest copy above `from` is deleted is the
+    /// same rule [`document`](Self::document) follows, and it is right here for
+    /// the same reason: a key whose newest document is gone is a key nothing
+    /// holds, and there is nothing above `from` left to delete.
+    ///
+    /// # Errors
+    ///
+    /// As [`document`](Self::document).
+    pub fn document_from(&self, key: &[u8], from: usize) -> Result<Option<(usize, DocId)>> {
+        for at in (from.min(self.keys.len())..self.keys.len()).rev() {
             let Some(keys) = self.keys[at].as_ref() else {
                 continue;
             };

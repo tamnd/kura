@@ -352,6 +352,8 @@ impl<'a> Batch<'a> {
             deletions,
             keys: self.mine.into_iter().collect(),
             epoch: self.view.epoch(),
+            base: self.view.len(),
+            layout: self.view.layout(),
         })
     }
 
@@ -803,12 +805,28 @@ pub struct Prepared {
     /// wrote the same key are two documents that both answer to it, and nothing
     /// else in either of them says so.
     ///
-    /// A batch committed on its own has no use for them. They are one pointer
-    /// and one length per key in a value that is about to be written to disk,
-    /// against the segment beside them, which is megabytes.
+    /// A batch committed against the state it was prepared against, on its own,
+    /// has no use for them. They are one pointer and one length per key in a
+    /// value that is about to be written to disk, against the segment beside
+    /// them, which is megabytes.
     pub keys: Vec<(Box<[u8]>, DocId)>,
     /// The epoch of the view this was worked out from.
+    ///
+    /// Nothing decides anything from this. It is what a refusal is reported
+    /// with, because the epoch is the number a person reading the message has
+    /// somewhere else to compare against.
     pub epoch: u64,
+    /// How many segments that view held.
+    ///
+    /// Which is the position this batch's own segment answered to when the
+    /// deletions were worked out, and the position above which the store holds
+    /// segments this batch never saw.
+    pub base: usize,
+    /// What those segments were, as one number.
+    ///
+    /// This is what says whether the positions above still mean anything. See
+    /// [`crate::manifest::layout`].
+    pub layout: u64,
 }
 
 impl Prepared {
@@ -816,22 +834,18 @@ impl Prepared {
     ///
     /// # Errors
     ///
-    /// Returns [`Trouble::Format`] with [`Error::StaleView`] if the store has
-    /// been committed to since the batch read it, because the deletions are then
-    /// about a store that no longer exists and committing them would undo
-    /// whatever that commit did. Otherwise as [`Store::publish`].
+    /// Returns [`Trouble::Format`] with [`Error::StaleView`] if the segments the
+    /// batch was prepared against are not still the segments the store holds,
+    /// because the positions in it are then about a store that no longer exists.
+    /// Otherwise as [`Store::publish`].
+    ///
+    /// A commit that landed in between is not that. Appending a segment or
+    /// deleting a document moves nothing this batch named, and a batch is joined
+    /// onto what happened rather than refused. [`commit_all`] is where that
+    /// happens, and this is one batch handed to it, so that a batch on its own
+    /// and a batch in a group are the same thing committed the same way.
     pub fn commit(self, store: &mut Store, created: u64, written: u64) -> Result<u64> {
-        let committed = store.manifest().epoch;
-        if committed != self.epoch {
-            return Err(Trouble::Format(Error::StaleView {
-                read: self.epoch,
-                committed,
-            }));
-        }
-        let segment = self
-            .segment
-            .map(|(built, docs)| (docs, move |into: &mut Appending<'_>| built.write_to(into)));
-        store.publish_with(segment, created, &self.deletions, written)
+        commit_all(store, vec![self], created, written)
     }
 }
 
@@ -853,11 +867,28 @@ impl Prepared {
 /// right: the group is one commit, and a store cannot answer one key with two
 /// documents.
 ///
-/// Every batch has to have been prepared against the committed state. A batch
-/// prepared before some other commit landed is refused, as it is on its own and
-/// for the same reason. The caller holding the group is the one that knows how
-/// to answer that writer, which is why they are refused together here rather
-/// than one at a time.
+/// # Batches that were prepared a commit or two ago
+///
+/// A batch does not have to have been prepared against the state it is
+/// committed into, and under a shared writer almost none of them are: a writer
+/// that arrives while a sync is in flight prepares against the state before that
+/// sync's commit, because that is the only state there is to prepare against.
+///
+/// What such a batch carries is joined onto what happened while it was away.
+/// Its deletions are unioned with what each segment hides now rather than
+/// replacing it, which is the correct whole answer and not an approximation of
+/// one, because tombstones only grow between commits. Its own segment's position
+/// is remapped from the position it was prepared at. And its keys are looked up
+/// again in the segments that appeared since, so a key some other commit wrote
+/// in the meantime ends up with one live document and it is this batch's.
+///
+/// A batch prepared against the current state has no segments above it and pays
+/// for none of that.
+///
+/// What is refused is a compaction, which replaces a run of segments with one
+/// and moves every position after it. That is what the layout number on a
+/// prepared batch is for, and it is a narrower question than the epoch: it goes
+/// on being the same across a commit that only appended or only deleted.
 ///
 /// # The log
 ///
@@ -874,66 +905,87 @@ impl Prepared {
 /// # Errors
 ///
 /// Returns [`Trouble::Format`] with [`Error::StaleView`] if any of the batches
-/// was prepared against a state the store has moved on from, in which case
-/// nothing is committed, and [`Error::MissingSection`] if a batch names a
-/// segment of its own that it did not build. Otherwise as [`Store::publish_all`].
+/// was prepared against segments the store no longer holds where it held them,
+/// in which case nothing is committed, and [`Error::MissingSection`] if a batch
+/// names a segment of its own that it did not build. Otherwise as
+/// [`Store::publish_all`].
 pub fn commit_all(
     store: &mut Store,
     parts: Vec<Prepared>,
     created: u64,
     written: u64,
 ) -> Result<u64> {
-    let committed = store.manifest().epoch;
+    // Where the next segment of the group lands, and the line between the
+    // segments a batch could have seen and the ones that arrived after it.
+    let committed = store.manifest().segments.len();
+    let epoch = store.manifest().epoch;
     for part in &parts {
-        if part.epoch != committed {
+        if part.base > committed
+            || crate::manifest::layout(&store.manifest().segments[..part.base]) != part.layout
+        {
             return Err(Trouble::Format(Error::StaleView {
                 read: part.epoch,
-                committed,
+                committed: epoch,
             }));
         }
     }
 
-    // Where the next segment of the group lands. The batches were all worked
-    // out against the same state, so they all name their own segment as the
-    // position one past the last committed one, and each of them has to be told
-    // which position that turned out to be.
-    let base = store.manifest().segments.len();
-    let mut at = base;
+    let mut at = committed;
     let mut segments = Vec::with_capacity(parts.len());
     let mut sets: BTreeMap<usize, Bitmap> = BTreeMap::new();
     // Who wrote each key, and which of their documents it is.
     let mut written_keys: HashMap<Box<[u8]>, (usize, DocId)> = HashMap::new();
 
-    for part in parts {
-        let position = if part.segment.is_some() {
-            Some(at)
+    {
+        let view = store.view()?;
+        // Only for the batches that were prepared before something else
+        // committed. A group where every batch is current asks nothing of this
+        // and does not open it.
+        let lookup = if parts.iter().any(|part| part.base < committed) {
+            Some(view.lookup()?)
         } else {
             None
         };
-        for (target, set) in part.deletions {
-            let target = if target == base {
-                position.ok_or(Trouble::Format(Error::MissingSection { kind: 0 }))?
+
+        for part in parts {
+            let position = if part.segment.is_some() {
+                Some(at)
             } else {
-                target
+                None
             };
-            union(&mut sets, target, set);
-        }
-        for (key, doc) in part.keys {
-            let Some(position) = position else {
-                continue;
-            };
-            if let Some((was_in, was)) = written_keys.insert(key, (position, doc)) {
-                // The earlier copy is in a segment of this same commit and it
-                // stops answering the moment that segment appears, so the store
-                // never shows both.
-                let mut one = Bitmap::new();
-                one.insert(was);
-                union(&mut sets, was_in, one);
+            let base = part.base;
+            for (target, set) in part.deletions {
+                let target = if target == base {
+                    position.ok_or(Trouble::Format(Error::MissingSection { kind: 0 }))?
+                } else {
+                    target
+                };
+                union(&mut sets, &view, committed, target, &set)?;
             }
-        }
-        if let Some((built, docs)) = part.segment {
-            segments.push((docs, move |into: &mut Appending<'_>| built.write_to(into)));
-            at += 1;
+            for (key, doc) in part.keys {
+                let Some(position) = position else {
+                    continue;
+                };
+                // A copy in a segment that arrived after this batch read the
+                // store. The batch could not have known about it, and the
+                // document it is writing now is the newer of the two.
+                if let Some(lookup) = lookup.as_ref()
+                    && base < committed
+                    && let Some((was_in, was)) = lookup.document_from(&key, base)?
+                {
+                    union(&mut sets, &view, committed, was_in, &one(was))?;
+                }
+                if let Some((was_in, was)) = written_keys.insert(key, (position, doc)) {
+                    // The earlier copy is in a segment of this same commit and
+                    // it stops answering the moment that segment appears, so
+                    // the store never shows both.
+                    union(&mut sets, &view, committed, was_in, &one(was))?;
+                }
+            }
+            if let Some((built, docs)) = part.segment {
+                segments.push((docs, move |into: &mut Appending<'_>| built.write_to(into)));
+                at += 1;
+            }
         }
     }
 
@@ -941,20 +993,50 @@ pub fn commit_all(
     store.publish_all(segments, created, &deletions, written)
 }
 
-/// Adds a set of deletions to whatever the group already deletes from that
-/// segment.
+/// A set holding one document.
+fn one(doc: DocId) -> Bitmap {
+    let mut set = Bitmap::new();
+    set.insert(doc);
+    set
+}
+
+/// Adds a set of deletions to whatever this commit already deletes from that
+/// segment, on top of what the segment hides already.
 ///
 /// A set is the whole answer for its segment, so two batches that each deleted
 /// something from the same one have to be joined rather than to take turns
-/// overwriting each other. Both of them read what the segment already hid, so
-/// the join is a union and not a merge with a rule.
-fn union(sets: &mut BTreeMap<usize, Bitmap>, at: usize, adding: Bitmap) {
+/// overwriting each other, and the join is a union because deletions only ever
+/// grow between commits.
+///
+/// The first set for a committed segment is seeded with what that segment hides
+/// now. A batch prepared a commit ago read a smaller set than that, and
+/// committing what it read as the whole answer would put back whatever the
+/// commit in between deleted. Segments this commit is adding have nothing to
+/// seed from and start empty.
+///
+/// # Errors
+///
+/// Returns a decoding error if the set a segment already holds cannot be read.
+fn union(
+    sets: &mut BTreeMap<usize, Bitmap>,
+    view: &crate::file::View,
+    committed: usize,
+    at: usize,
+    adding: &Bitmap,
+) -> Result<()> {
     match sets.entry(at) {
-        Entry::Occupied(mut held) => held.get_mut().union_with(&adding),
+        Entry::Occupied(mut held) => held.get_mut().union_with(adding),
         Entry::Vacant(spot) => {
-            spot.insert(adding);
+            let mut whole = if at < committed {
+                view.deleted(at)?.unwrap_or_default()
+            } else {
+                Bitmap::new()
+            };
+            whole.union_with(adding);
+            spot.insert(whole);
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1147,11 +1229,13 @@ mod tests {
     }
 
     #[test]
-    fn a_batch_built_on_a_view_the_store_has_moved_past_is_refused() {
+    fn a_batch_built_on_a_view_the_store_has_moved_past_joins_what_happened() {
         // Two batches replacing the same document. The second one worked out
-        // what to delete before the first one committed, and its set says
-        // nothing about what the first one deleted, so committing it would put
-        // that document back.
+        // what to delete before the first one committed, so its set says nothing
+        // about what the first one deleted and its key was resolved against a
+        // store that did not hold the first one's copy yet. It commits anyway,
+        // and afterwards the key answers once, with the batch that committed
+        // last.
         let path = path("stale");
         let mut store = empty(&path);
         write(&mut store, &[(b"a", "the first ledger")]);
@@ -1162,14 +1246,15 @@ mod tests {
         let prepared = batch.finish().expect("prepared");
 
         write(&mut store, &[(b"a", "the third ledger")]);
-        let outcome = prepared.commit(&mut store, 1, 1);
-        assert!(matches!(
-            outcome,
-            Err(Trouble::Format(Error::StaleView { .. }))
-        ));
-        assert_eq!(count(&store, "ledger"), 1);
-        assert_eq!(count(&store, "third"), 1);
-        assert_eq!(count(&store, "second"), 0);
+        prepared.commit(&mut store, 1, 1).expect("committed");
+        assert_eq!(
+            count(&store, "ledger"),
+            1,
+            "one document answers to the key"
+        );
+        assert_eq!(count(&store, "second"), 1, "the one committed last");
+        assert_eq!(count(&store, "third"), 0, "the one it replaced");
+        assert_eq!(count(&store, "first"), 0, "and the one before that");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1794,21 +1879,26 @@ mod tests {
     }
 
     #[test]
-    fn a_batch_prepared_before_a_commit_takes_the_whole_group_with_it() {
+    fn a_group_of_batches_prepared_at_different_times_all_commit() {
+        // The shape a shared writer makes on purpose. One batch was prepared
+        // before a commit landed and one after it, and they go in together.
         let path = path("group-stale");
         let mut store = empty(&path);
-        let stale = prepare(&store, &[(b"a", "the first quarter ledger")]);
+        let older = prepare(&store, &[(b"a", "the first quarter ledger")]);
         write(&mut store, &[(b"b", "the second quarter ledger")]);
-        let fresh = prepare(&store, &[(b"c", "the third quarter ledger")]);
+        let newer = prepare(&store, &[(b"c", "the third quarter ledger")]);
 
         let epoch = store.manifest().epoch;
-        let refused = commit_all(&mut store, vec![stale, fresh], 1_700_000_002, 2);
-        assert!(
-            matches!(refused, Err(Trouble::Format(Error::StaleView { .. }))),
-            "a batch that read a store that has moved on is refused, and got {refused:?}"
+        commit_all(&mut store, vec![older, newer], 1_700_000_002, 2).expect("committed");
+        assert_eq!(
+            store.manifest().epoch,
+            epoch + 1,
+            "one commit for the group"
         );
-        assert_eq!(store.manifest().epoch, epoch, "nothing was committed");
-        assert_eq!(count(&store, "ledger"), 1);
+        assert_eq!(count(&store, "ledger"), 3);
+        assert_eq!(count(&store, "first"), 1);
+        assert_eq!(count(&store, "second"), 1);
+        assert_eq!(count(&store, "third"), 1);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1834,6 +1924,99 @@ mod tests {
         assert_eq!(count(&store, "second"), 0, "the copy it replaced itself");
         assert_eq!(count(&store, "third"), 1);
         assert_eq!(count(&store, "first"), 1);
+        assert_eq!(store.manifest().live, 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_batch_prepared_before_a_delete_does_not_put_that_document_back() {
+        // The failure this whole shape exists to avoid, across a commit rather
+        // than inside one. The batch holds the whole answer for segment zero as
+        // it stood when it was prepared, which is one document deleted. A commit
+        // in between deleted another one from the same segment. Committing what
+        // the batch holds as the whole answer would put that one back.
+        let path = path("stale-delete");
+        let mut store = empty(&path);
+        write(
+            &mut store,
+            &[
+                (b"a", "the first quarter ledger"),
+                (b"b", "the second quarter ledger"),
+                (b"c", "the third quarter ledger"),
+            ],
+        );
+
+        let prepared = prepare(&store, &[(b"a", "the first quarter report")]);
+        write(&mut store, &[(b"b", "the second quarter report")]);
+        prepared.commit(&mut store, 1_700_000_002, 2).expect("in");
+
+        assert_eq!(count(&store, "report"), 2);
+        assert_eq!(count(&store, "second"), 1, "the replacement, not both");
+        assert_eq!(count(&store, "ledger"), 1, "only the one nobody touched");
+        assert_eq!(store.manifest().live, 3);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_batch_prepared_before_a_compaction_is_refused() {
+        // The one case a join cannot answer. A fold puts a different segment
+        // where the batch counted positions, so what it says about position one
+        // is about bytes that are not there any more.
+        let path = path("stale-fold");
+        let mut store = empty(&path);
+        write(&mut store, &[(b"a", "the first quarter ledger")]);
+        write(&mut store, &[(b"b", "the second quarter ledger")]);
+        let prepared = prepare(&store, &[(b"c", "the third quarter ledger")]);
+
+        store.compact(0..2, 1_700_000_002, 2).expect("folded");
+        let epoch = store.manifest().epoch;
+        let refused = prepared.commit(&mut store, 1_700_000_003, 3);
+        assert!(
+            matches!(refused, Err(Trouble::Format(Error::StaleView { .. }))),
+            "a batch that counted positions a fold moved is refused, and got {refused:?}"
+        );
+        assert_eq!(store.manifest().epoch, epoch, "nothing was committed");
+        assert_eq!(count(&store, "ledger"), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_compaction_above_what_a_batch_saw_does_not_refuse_it() {
+        // The other side of the same check. The fold is of segments that arrived
+        // after the batch read the store, so every position the batch named is
+        // still the segment it named, and there is nothing to refuse.
+        let path = path("fold-above");
+        let mut store = empty(&path);
+        write(&mut store, &[(b"a", "the first quarter ledger")]);
+        let prepared = prepare(&store, &[(b"d", "the fourth quarter ledger")]);
+        write(&mut store, &[(b"b", "the second quarter ledger")]);
+        write(&mut store, &[(b"c", "the third quarter ledger")]);
+        store.compact(1..3, 1_700_000_002, 2).expect("folded");
+
+        prepared.commit(&mut store, 1_700_000_003, 3).expect("in");
+        assert_eq!(count(&store, "ledger"), 4);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_key_a_batch_never_saw_written_answers_with_the_batch() {
+        // The batch is writing a key that did not exist when it was prepared, so
+        // it has no deletion for it and cannot have one. The copy a commit in
+        // between wrote is found again at the commit and deleted there.
+        let path = path("stale-key");
+        let mut store = empty(&path);
+        write(&mut store, &[(b"a", "the first quarter ledger")]);
+
+        let prepared = prepare(&store, &[(b"b", "the second quarter report")]);
+        write(&mut store, &[(b"b", "the second quarter ledger")]);
+        prepared.commit(&mut store, 1_700_000_002, 2).expect("in");
+
+        let view = store.view().expect("a view");
+        let found = view.document(b"b").expect("the key index reads");
+        assert!(found.is_some(), "the key answers");
+        drop(view);
+        assert_eq!(count(&store, "second"), 1, "with one document");
+        assert_eq!(count(&store, "report"), 1, "and it is the batch's");
         assert_eq!(store.manifest().live, 2);
         let _ = std::fs::remove_file(&path);
     }
