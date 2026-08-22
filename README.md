@@ -405,7 +405,7 @@ It scales to eight threads, which is where the ceiling stops improving, and it s
 
 The four thread row is slower than it used to be and it is worth saying why.
 It was 297 ms and it left four segments; it is 451 ms and it leaves one.
-Four segments is a store that answers 20 to 30 percent slower than the same documents in one, for as long as it stays that way, so the run was quietly handing its own saving to every query afterwards.
+Four segments is a store that answers about twice as slowly as the same documents in one, for as long as it stays that way, so the run was quietly handing its own saving to every query afterwards.
 `--threads` now changes how long the run takes and not the shape of the store it leaves, which was the point of the flag.
 The old behaviour is still there under `--no-fold`, and `kura-cli compact` is what folds afterwards for anybody who would rather choose the moment.
 
@@ -657,6 +657,41 @@ The fold takes the store for as long as it runs, but a reader does not take the 
 On this machine and this corpus that trade comes out in the reader's favour, and a rate limit tuned to protect the read path would be protecting it from the wrong thing.
 
 What folding costs is the ingest: 199.7 ms with nothing folding against 253.1 ms with a keeper beside it, medians of five rounds, for a store that ends at six segments rather than fourteen.
+
+## What a segment count costs a query
+
+The section above says a store of several segments answers more slowly than the same documents in one, and so does most of the rest of this file.
+It has been asserted from the shape of the code, which is not a number.
+
+```sh
+cargo run --release --example layers -- ./src /var/lib/kura
+```
+
+The corpus is indexed once into a store of many segments, and then a copy of that store is folded down to each of a series of counts, so every rung holds exactly the same documents and differs only in how many segments they are spread across.
+The queries are picked the same way the serving example picks them.
+
+The Go source tree at go1.26.6, 10,750 documents indexed into 22 segments and folded down from there, on an M4 of ten cores, 200 asks of each query at each rung:
+
+| segments | live | opening | opening unchecked | median | p95 | p99 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 16 MB | 872.9 µs | 0.8 µs | 2.1 µs | 2.9 µs | 2.9 µs |
+| 2 | 16 MB | 890.7 µs | 1.0 µs | 3.3 µs | 10.8 µs | 11.2 µs |
+| 4 | 16 MB | 911.5 µs | 1.2 µs | 4.1 µs | 12.5 µs | 13.2 µs |
+| 8 | 17 MB | 942.4 µs | 1.9 µs | 6.0 µs | 9.7 µs | 10.8 µs |
+| 16 | 19 MB | 1050.6 µs | 3.2 µs | 10.3 µs | 16.5 µs | 16.8 µs |
+
+The query itself behaves the way the claim says.
+Four segments is twice the median of one and sixteen is five times it, so the cost is roughly a fixed amount per segment on top of the work the query would do anyway.
+Earlier text here put four segments at 20 to 30 percent slower than one, which was too kind to it, and that line has been corrected.
+
+The other column is the surprise, and it is much the larger number.
+Opening a reader over a one segment store costs 873 µs, which is four hundred times the query it is opened for, and it barely moves as the segment count climbs.
+The reason is that opening a segment hashes every section in it against the digest in its table before handing back a reader, so an open costs what the store holds rather than what the query wants.
+Sixteen megabytes at about 19 GB/s is 870 µs, and the bytes are the same at every rung because the rungs are the same documents.
+The unchecked column is the same structural parse with the digests left alone, and it is under a microsecond at one segment and 3.2 µs at sixteen, which is the per segment cost the rung is actually meant to be showing.
+
+That number is most of the 0.48 ms quiet median in the section above, where the store holds half as many bytes and so pays about half as much.
+It is being fixed rather than explained away, and until it is, a caller that holds one searcher open across queries pays it once instead of once a query.
 
 ## Bounding what an index run holds at once
 
