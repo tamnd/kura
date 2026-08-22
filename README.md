@@ -339,8 +339,10 @@ Now it is joined onto what happened instead.
 Its deletions are unioned with what each segment hides now, its own segment's position is remapped, and its keys are looked up again in the segments that arrived while it was being built, so a key two writers used ends up with one live document and it belongs to whoever committed last.
 A batch prepared against the current state has nothing above it and pays for none of that.
 
-What is still refused is a compaction, which folds a run of segments into one and moves every position after it.
-Nothing else moves a segment, so nothing else refuses a batch.
+A compaction moves more than a commit does, because it folds a run of segments into one and every document in that run is either renumbered or dropped.
+That used to be the end of a batch that was prepared before it.
+Now the fold writes down where everything went and the batch is carried through it: a deletion naming a folded segment becomes a deletion naming the merged one with every identifier put through the mapping, a deletion naming a segment above the run moves down by however many positions the run lost, and a document the merge did not carry is one that was already deleted, so the deletion the batch holds for it has already happened.
+The store keeps the record of one fold and the next fold replaces it, so what is still refused is a batch that two folds went past, and the answer to that is to build it again.
 
 The thing that forms the group is `Writer`, which is a store several threads can commit into.
 Each of them asks it for a view, builds a batch against that view, and hands it over.
@@ -374,8 +376,8 @@ The two thread row is the one worth reading carefully, because half of two is on
 The pair alternate, neither ever joins the other, and each waits behind the other's commit for no gain: the same throughput as one thread for twice the latency.
 That is the honest floor of taking the queue as it stands, and it is what a small linger would fix if a real workload ever asks for it.
 
-The compaction that refuses a batch refuses that batch and not the group it arrived in.
-The leader checks each one against the store it is about to commit into, tells the one a fold moved that it was moved, and commits the rest.
+The leader checks each batch against the store it is about to commit into, carries the ones a fold moved through it, and commits them with the rest.
+A batch it cannot carry is answered on its own rather than costing the group its commit.
 
 ### Threads that fill batches at once
 
@@ -407,7 +409,8 @@ What the two columns together say is that above four threads the run is bounded 
 Two things are different above one thread and the run says both.
 There is no log, because a record goes into the ring as its document arrives and the ring is reached through the store, which one thread at a time holds, so a run that stops loses whatever it had not committed rather than leaving it for the next run to put back.
 Part of the gap between the first row and the second is that: the single threaded run wrote 83.8 MB into the log on the way past, and the same corpus into a bare segment with no store and no log takes 873 ms.
-And the folding happens once at the end rather than as the run goes, because a fold moves the segments that the batches in flight counted positions into and would refuse every one of them at once.
+And the folding happens once at the end rather than as the run goes, which is where the 146 ms above comes from.
+A fold in the middle of the run is no longer the problem it was, because the batches in flight are carried through it now rather than refused, and what is left is deciding when to start one without taking the thread that would have been indexing.
 
 `--memory` is per thread, so eight threads at 128m is a gigabyte.
 That is the peak resident column growing while the wall clock falls, and it is the thing to set before turning the count up on a machine that has other work on it.

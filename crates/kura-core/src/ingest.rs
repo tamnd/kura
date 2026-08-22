@@ -49,7 +49,7 @@ use std::collections::{BTreeMap, HashMap};
 use crate::DocId;
 use crate::bitmap::Bitmap;
 use crate::error::Error;
-use crate::file::{Appending, Lookup, Result, Store, Trouble, View};
+use crate::file::{Appending, Fold, Lookup, Result, Store, Trouble, View};
 use crate::index::{self, Held};
 use crate::segment::Writer as SegmentWriter;
 use crate::upsert::{self, Upsert};
@@ -340,9 +340,10 @@ impl<'a> Batch<'a> {
             let built = index::Writer::build(vec![self.writer]).map_err(Trouble::Format)?;
             // The segment this commit adds answers to the position it is about
             // to take, which is where a key used twice in one batch puts the
-            // copy that lost.
+            // copy that lost. Which position that is depends on what else is in
+            // the commit, so it is named rather than numbered.
             if !self.superseded.is_empty() {
-                deletions.push((self.view.len(), self.superseded));
+                deletions.push((MINE, self.superseded));
             }
             Some((built, docs))
         };
@@ -776,6 +777,20 @@ pub fn replay(store: &mut Store, created: u64, written: u64) -> Result<Replayed>
     })
 }
 
+/// The segment a batch is adding, as a deletion names it.
+///
+/// A batch that used the same key twice deletes the earlier copy out of its own
+/// segment, and that segment has no position until the commit decides one: it
+/// depends on how many other batches are in the same commit and on how many
+/// segments the store holds by then. So it is named rather than numbered, and
+/// [`commit_all`] is where the name becomes a position.
+///
+/// It used to be numbered, as the position the batch would have taken if it had
+/// been committed on its own into the store it was prepared against. That was
+/// the same number as [`Prepared::base`], which meant a batch could not be moved
+/// down through a fold without the two meanings coming apart.
+pub const MINE: usize = usize::MAX;
+
 /// A batch that has been turned into a segment and a set of deletions.
 ///
 /// Made by [`Batch::finish`]. It is a value with nothing borrowed in it, so the
@@ -791,8 +806,9 @@ pub struct Prepared {
     /// a copy of the largest thing an index run makes.
     pub segment: Option<(SegmentWriter, u32)>,
     /// What to delete, per segment, each set being the whole answer for its
-    /// segment. The last of them may name the segment above, which is a document
-    /// the batch replaced with a later one of its own.
+    /// segment. One of them may name [`MINE`], which is a document the batch
+    /// replaced with a later one of its own and so is deleted out of the segment
+    /// the batch is itself adding.
     pub deletions: Vec<(usize, Bitmap)>,
     /// The key of every document in the segment that has one, with the document
     /// it belongs to.
@@ -866,6 +882,10 @@ impl Prepared {
     /// positions into. Everything else that can have happened since is joined
     /// onto rather than refused, which is what [`commit_all`] does.
     ///
+    /// A batch that a fold moved is not one this says yes to. It is one
+    /// [`through`](Self::through) can make into one, and [`commit_all`] tries
+    /// that before it refuses anything.
+    ///
     /// A caller holding one batch has no use for this, because committing it
     /// says the same thing and says it with a reason attached. A caller holding
     /// several has: one batch that cannot go in is not a reason to refuse the
@@ -876,6 +896,73 @@ impl Prepared {
         let segments = &store.manifest().segments;
         self.base <= segments.len()
             && crate::manifest::layout(&segments[..self.base]) == self.layout
+    }
+
+    /// Moves everything this names down through a fold that landed under it.
+    ///
+    /// The one thing that used to refuse a batch outright. A fold replaces a run
+    /// of segments with one, so a position inside the run becomes the position
+    /// of the replacement and a position above it moves down, and the documents
+    /// inside the run are numbered again. All three are things the fold knew as
+    /// it went and wrote down.
+    ///
+    /// A document the fold did not carry is dropped from the set rather than
+    /// moved. That is not a loss: the fold left it behind because it was already
+    /// deleted, so the deletion this batch is carrying has already happened.
+    ///
+    /// What this batch had seen shrinks to the front of the run, whatever it had
+    /// seen before. Everything from there up is treated as new, so its keys are
+    /// looked up again in the merged segment and in whatever else has arrived.
+    /// The merged segment holds documents this batch never saw and may well hold
+    /// a copy of a key it is writing, so that is the answer rather than a
+    /// conservative version of one.
+    ///
+    /// Returns false, and changes nothing, if this batch is not one from before
+    /// that fold.
+    #[must_use]
+    pub fn through(&mut self, fold: &Fold) -> bool {
+        if !fold.covers(self.base, self.layout) {
+            return false;
+        }
+        let (start, end, shrank) = (fold.run.start, fold.run.end, fold.shrank());
+        let mut moved = Vec::with_capacity(self.deletions.len());
+        for (target, set) in core::mem::take(&mut self.deletions) {
+            if target == MINE || target < start {
+                moved.push((target, set));
+            } else if target >= end {
+                moved.push((target - shrank, set));
+            } else if let Some(into) = fold.into {
+                let mut carried = Bitmap::new();
+                for doc in &set {
+                    if let Some(now) = fold.moved.of(target - start, doc) {
+                        carried.insert(now);
+                    }
+                }
+                if !carried.is_empty() {
+                    moved.push((into, carried));
+                }
+            }
+        }
+        // Two sets that named different segments in the run name the merged one
+        // now, and a deletion is one set per segment.
+        moved.sort_unstable_by_key(|(target, _)| *target);
+        self.deletions = moved.into_iter().fold(
+            Vec::new(),
+            |mut kept: Vec<(usize, Bitmap)>, (target, set)| {
+                match kept.last_mut() {
+                    Some((last, held)) if *last == target => held.union_with(&set),
+                    _ => kept.push((target, set)),
+                }
+                kept
+            },
+        );
+        self.base = start;
+        // The segments below the run are the segments they were. A fold moves
+        // nothing under itself, an append moves nothing at all, and a deletion
+        // is not part of a layout, so the prefix the fold wrote down is still
+        // what the store's prefix of that length comes to.
+        self.layout = fold.prefixes[start];
+        true
     }
 }
 
@@ -941,7 +1028,7 @@ impl Prepared {
 /// [`Store::publish_all`].
 pub fn commit_all(
     store: &mut Store,
-    parts: Vec<Prepared>,
+    mut parts: Vec<Prepared>,
     created: u64,
     written: u64,
 ) -> Result<u64> {
@@ -949,7 +1036,16 @@ pub fn commit_all(
     // segments a batch could have seen and the ones that arrived after it.
     let committed = store.manifest().segments.len();
     let epoch = store.manifest().epoch;
-    for part in &parts {
+    for part in &mut parts {
+        if part.fits(store) {
+            continue;
+        }
+        // A fold is the one thing that moves what a batch named, and the fold
+        // that did it wrote down what it moved, so the batch goes through it
+        // rather than being told to start again.
+        if let Some(fold) = store.folded() {
+            let _ = part.through(fold);
+        }
         if !part.fits(store) {
             return Err(Trouble::Format(Error::StaleView {
                 read: part.epoch,
@@ -983,7 +1079,7 @@ pub fn commit_all(
             };
             let base = part.base;
             for (target, set) in part.deletions {
-                let target = if target == base {
+                let target = if target == MINE {
                     position.ok_or(Trouble::Format(Error::MissingSection { kind: 0 }))?
                 } else {
                     target
@@ -1986,25 +2082,147 @@ mod tests {
     }
 
     #[test]
-    fn a_batch_prepared_before_a_compaction_is_refused() {
-        // The one case a join cannot answer. A fold puts a different segment
-        // where the batch counted positions, so what it says about position one
-        // is about bytes that are not there any more.
-        let path = path("stale-fold");
+    fn a_batch_prepared_before_a_compaction_goes_through_it() {
+        // The case a join could not answer until the fold started writing down
+        // what it moved. A fold puts a different segment where the batch counted
+        // positions, so what the batch says about position one is about bytes
+        // that are not there any more, and what it needs is the fold's own
+        // account of where they went.
+        let path = path("through-fold");
         let mut store = empty(&path);
         write(&mut store, &[(b"a", "the first quarter ledger")]);
         write(&mut store, &[(b"b", "the second quarter ledger")]);
         let prepared = prepare(&store, &[(b"c", "the third quarter ledger")]);
 
         store.compact(0..2, 1_700_000_002, 2).expect("folded");
+        prepared
+            .commit(&mut store, 1_700_000_003, 3)
+            .expect("a batch a fold moved still commits");
+
+        assert_eq!(store.manifest().live, 3);
+        assert_eq!(count(&store, "ledger"), 3);
+        assert_eq!(count(&store, "third"), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_batch_that_deletes_out_of_a_folded_segment_deletes_the_document_it_moved_to() {
+        // The part that is not arithmetic on positions. The batch replaces a
+        // document that is in a segment the fold rewrote, so the identifier it
+        // wrote down is the one that document had in a segment that is gone. If
+        // the number went through unchanged it would delete whatever happens to
+        // be numbered that in the merged segment, which is a different document.
+        let path = path("through-fold-delete");
+        let mut store = empty(&path);
+        write(
+            &mut store,
+            &[
+                (b"a", "the first quarter ledger"),
+                (b"b", "the second quarter ledger"),
+            ],
+        );
+        write(
+            &mut store,
+            &[
+                (b"c", "the third quarter ledger"),
+                (b"d", "the fourth quarter ledger"),
+            ],
+        );
+        // Document one of segment one, which the fold will number three.
+        let prepared = prepare(&store, &[(b"d", "the fourth quarter report")]);
+
+        store.compact(0..2, 1_700_000_002, 2).expect("folded");
+        prepared
+            .commit(&mut store, 1_700_000_003, 3)
+            .expect("a batch a fold moved still commits");
+
+        assert_eq!(store.manifest().live, 4);
+        assert_eq!(count(&store, "fourth"), 1, "one copy of the one replaced");
+        assert_eq!(count(&store, "report"), 1);
+        assert_eq!(count(&store, "ledger"), 3, "and the three nobody touched");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_batch_that_deletes_a_document_a_fold_left_behind_is_still_committed() {
+        // The document the batch is replacing was deleted by somebody else
+        // between the batch reading it and the fold running, so the fold did not
+        // carry it and there is nothing to move the deletion to. That is not a
+        // refusal and not a loss: the deletion the batch was carrying is one
+        // that has already happened.
+        let path = path("through-fold-gone");
+        let mut store = empty(&path);
+        write(
+            &mut store,
+            &[
+                (b"a", "the first quarter ledger"),
+                (b"b", "the second quarter ledger"),
+            ],
+        );
+        write(&mut store, &[(b"c", "the third quarter ledger")]);
+        let prepared = prepare(&store, &[(b"b", "the second quarter report")]);
+
+        // Somebody else replaces it first, and then the fold leaves the copy
+        // the batch is talking about behind.
+        write(&mut store, &[(b"b", "the second quarter summary")]);
+        store.compact(0..3, 1_700_000_003, 3).expect("folded");
+        prepared
+            .commit(&mut store, 1_700_000_004, 4)
+            .expect("a batch a fold moved still commits");
+
+        assert_eq!(store.manifest().live, 3);
+        assert_eq!(count(&store, "second"), 1, "one copy answers to that key");
+        assert_eq!(count(&store, "report"), 1, "and it is the newest");
+        assert_eq!(count(&store, "summary"), 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_batch_from_before_two_folds_is_refused() {
+        // A store remembers one fold, which is the one that batches in flight
+        // when it happened have to be moved through. A batch older than that has
+        // no account of where it went and is told so rather than guessed at.
+        let path = path("two-folds");
+        let mut store = empty(&path);
+        write(&mut store, &[(b"a", "the first quarter ledger")]);
+        write(&mut store, &[(b"b", "the second quarter ledger")]);
+        let prepared = prepare(&store, &[(b"c", "the third quarter ledger")]);
+
+        store.compact(0..2, 1_700_000_002, 2).expect("folded");
+        write(&mut store, &[(b"d", "the fourth quarter ledger")]);
+        store.compact(0..2, 1_700_000_003, 3).expect("folded again");
+
         let epoch = store.manifest().epoch;
+        let refused = prepared.commit(&mut store, 1_700_000_004, 4);
+        assert!(
+            matches!(refused, Err(Trouble::Format(Error::StaleView { .. }))),
+            "a batch from before the fold the store remembers is refused, and got {refused:?}"
+        );
+        assert_eq!(store.manifest().epoch, epoch, "nothing was committed");
+        assert_eq!(count(&store, "ledger"), 3);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_store_told_to_forget_a_fold_refuses_the_batches_it_would_have_moved() {
+        // What forgetting costs, stated as a test so that a caller reaching for
+        // it knows what it is agreeing to.
+        let path = path("forgotten-fold");
+        let mut store = empty(&path);
+        write(&mut store, &[(b"a", "the first quarter ledger")]);
+        write(&mut store, &[(b"b", "the second quarter ledger")]);
+        let prepared = prepare(&store, &[(b"c", "the third quarter ledger")]);
+
+        store.compact(0..2, 1_700_000_002, 2).expect("folded");
+        assert!(store.folded().is_some());
+        store.forget_fold();
+        assert!(store.folded().is_none());
+
         let refused = prepared.commit(&mut store, 1_700_000_003, 3);
         assert!(
             matches!(refused, Err(Trouble::Format(Error::StaleView { .. }))),
-            "a batch that counted positions a fold moved is refused, and got {refused:?}"
+            "a batch whose fold was forgotten is refused, and got {refused:?}"
         );
-        assert_eq!(store.manifest().epoch, epoch, "nothing was committed");
-        assert_eq!(count(&store, "ledger"), 2);
         let _ = std::fs::remove_file(&path);
     }
 

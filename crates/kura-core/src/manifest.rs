@@ -781,20 +781,51 @@ pub fn tombstones_each(
 /// that a rebuilt batch would have made identical anyway.
 #[must_use]
 pub fn layout(segments: &[Segment]) -> u64 {
-    // FNV-1a, because this runs over a kilobyte at most and wants no state and
-    // no allocation.
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut hash = EMPTY;
     for segment in segments {
-        for field in [
-            segment.offset,
-            segment.len,
-            u64::from(segment.docs),
-            segment.footer,
-        ] {
-            for byte in field.to_le_bytes() {
-                hash ^= u64::from(byte);
-                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-            }
+        hash = carry(hash, segment);
+    }
+    hash
+}
+
+/// The layout of every prefix of a run, from the empty one to the whole of it.
+///
+/// `prefixes(segments)[k]` is `layout(&segments[..k])`, so the vector is one
+/// longer than the run. A fold keeps one of these of the segments it replaced,
+/// which is what lets it tell a batch prepared before it, whatever prefix that
+/// batch happened to see, from a batch prepared after.
+///
+/// Built in one pass rather than by calling [`layout`] for every prefix, which
+/// would be the same work a thousand times over.
+#[must_use]
+pub fn prefixes(segments: &[Segment]) -> Vec<u64> {
+    let mut all = Vec::with_capacity(segments.len() + 1);
+    let mut hash = EMPTY;
+    all.push(hash);
+    for segment in segments {
+        hash = carry(hash, segment);
+        all.push(hash);
+    }
+    all
+}
+
+/// What [`layout`] of nothing comes to.
+const EMPTY: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// Takes one more segment into a layout.
+///
+/// FNV-1a, because this runs over a kilobyte at most and wants no state and no
+/// allocation.
+fn carry(mut hash: u64, segment: &Segment) -> u64 {
+    for field in [
+        segment.offset,
+        segment.len,
+        u64::from(segment.docs),
+        segment.footer,
+    ] {
+        for byte in field.to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         }
     }
     hash

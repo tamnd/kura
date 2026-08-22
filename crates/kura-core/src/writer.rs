@@ -299,15 +299,22 @@ impl Writer {
         let mut going = Vec::with_capacity(taken.len());
         let mut created = 0;
         let mut written = 0;
-        for waiting in taken {
+        for mut waiting in taken {
+            // A fold moved what this batch counted positions into, and the fold
+            // wrote down what it moved, so the batch goes through it. Only a
+            // batch from before a fold the store no longer remembers is left,
+            // and that is about this batch rather than about the group, so the
+            // group goes in without it.
+            if !waiting.part.fits(&store)
+                && let Some(fold) = store.folded()
+            {
+                let _ = waiting.part.through(fold);
+            }
             if waiting.part.fits(&store) {
                 created = created.max(waiting.created);
                 written = written.max(waiting.written);
                 going.push(waiting);
             } else {
-                // A compaction moved what it counted positions into. That is
-                // about this batch and not about the group, so the group goes
-                // in without it.
                 answers.push((
                     waiting.ticket,
                     Answer::Failed(Trouble::Format(Error::StaleView {
@@ -646,10 +653,11 @@ mod tests {
     }
 
     #[test]
-    fn a_batch_a_compaction_moved_is_refused_on_its_own() {
-        // The one refusal left, and the thing worth checking is that it is one
-        // batch's answer and not the group's. The batch beside it in the queue
-        // counted no positions a fold touched, so it goes in.
+    fn a_batch_a_compaction_moved_goes_in_with_the_group() {
+        // A fold used to be the one thing a leader had to answer a batch about
+        // rather than commit it. Now the fold says where everything went and the
+        // leader moves the batch through it, so a fold that lands between a
+        // thread preparing and a thread handing over costs nothing.
         let path = path("folded");
         let writer = empty(&path);
         write(&writer, &[(b"a", "the first quarter ledger")]);
@@ -662,13 +670,106 @@ mod tests {
             .expect("folded");
         let fresh = prepare(&writer, &[(b"d", "the fourth quarter ledger")]);
 
+        writer
+            .commit(stale, 1_700_000_003, 3)
+            .expect("the batch the fold moved went in");
+        writer.commit(fresh, 1_700_000_003, 3).expect("committed");
+        assert_eq!(count(&writer, "ledger"), 4, "both of them went in");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_batch_from_before_a_fold_the_store_forgot_is_refused_on_its_own() {
+        // The refusal that is left, and the thing worth checking is that it is
+        // one batch's answer rather than the group's. The batch beside it in the
+        // queue counted no positions a fold touched, so it goes in.
+        let path = path("forgotten");
+        let writer = empty(&path);
+        write(&writer, &[(b"a", "the first quarter ledger")]);
+        write(&writer, &[(b"b", "the second quarter ledger")]);
+        let stale = prepare(&writer, &[(b"c", "the third quarter ledger")]);
+
+        {
+            let mut store = writer.store();
+            store.compact(0..2, 1_700_000_002, 2).expect("folded");
+            store.forget_fold();
+        }
+        let fresh = prepare(&writer, &[(b"d", "the fourth quarter ledger")]);
+
         let refused = writer.commit(stale, 1_700_000_003, 3);
         assert!(
             matches!(refused, Err(Trouble::Format(Error::StaleView { .. }))),
-            "the batch the fold moved is refused, and got {refused:?}"
+            "the batch with nothing to move it is refused, and got {refused:?}"
         );
         writer.commit(fresh, 1_700_000_003, 3).expect("committed");
         assert_eq!(count(&writer, "ledger"), 3, "the fresh one went in");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_fold_running_beside_the_threads_leaves_every_document_live() {
+        // The case the rest of this was for. A store that folds only when the
+        // writing stops is a store that grows a segment per commit while it is
+        // busy, so the fold has to be able to land in the middle. Eight threads
+        // fill, a ninth folds the bottom of the manifest over and over, and each
+        // thread rewrites one key of its own every round so that the deletions a
+        // fold has to carry are there to carry.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const THREADS: usize = 8;
+        const EACH: usize = 8;
+
+        let path = path("folding");
+        let writer = empty(&path);
+        let done = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for thread in 0..THREADS {
+                let writer = &writer;
+                let done = &done;
+                scope.spawn(move || {
+                    for round in 0..EACH {
+                        let key = format!("{thread}-{round}");
+                        let carry = format!("{thread}-carry");
+                        let text = format!("document {round} of writer {thread} says ledger");
+                        let documents = [
+                            (key.as_bytes(), text.as_str()),
+                            (carry.as_bytes(), text.as_str()),
+                        ];
+                        loop {
+                            let prepared = prepare(writer, &documents);
+                            // A batch a second fold overtook is refused, and
+                            // the answer to that is the one a caller gives.
+                            match writer.commit(prepared, 1_700_000_001, 1) {
+                                Ok(_) => break,
+                                Err(Trouble::Format(Error::StaleView { .. })) => (),
+                                Err(other) => panic!("{other:?}"),
+                            }
+                        }
+                    }
+                    done.fetch_add(1, Ordering::Release);
+                });
+            }
+            let writer = &writer;
+            let done = &done;
+            scope.spawn(move || {
+                while done.load(Ordering::Acquire) < THREADS {
+                    if writer.view().len() >= 3 {
+                        writer
+                            .store()
+                            .compact(0..2, 1_700_000_002, 2)
+                            .expect("folded");
+                    }
+                    std::thread::yield_now();
+                }
+            });
+        });
+
+        let wrote = u64::try_from(THREADS * (EACH + 1)).expect("small");
+        assert_eq!(
+            count(&writer, "ledger"),
+            wrote,
+            "every round of every thread, and one live copy of each carried key"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

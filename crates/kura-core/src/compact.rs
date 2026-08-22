@@ -106,6 +106,48 @@ pub fn carries(segment: &Segment<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Where the documents of the segments a merge replaced ended up in it.
+///
+/// A merge numbers the live documents of its sources in order, so a document
+/// that goes in with one identifier comes out with another, and anything that
+/// named the old one is talking about a store that no longer exists. Mostly
+/// nothing did: a segment names its own documents and a merge rewrites it whole.
+/// What does is a batch that was prepared before the merge and deletes a
+/// document out of one of the segments it folded, which is every batch in flight
+/// when a compaction lands.
+///
+/// This is what the merge worked out on its way through, kept rather than
+/// dropped, so that such a batch can be moved along with the documents it names
+/// instead of being refused. It costs four bytes per document of the sources,
+/// against a merge that was already holding the whole merged segment, so it is
+/// the smaller half of something that has already happened.
+#[derive(Debug, Clone, Default)]
+pub struct Moved {
+    /// One vector per source, old identifier to new, [`GONE`] for the documents
+    /// the merge did not carry.
+    into: Vec<Vec<DocId>>,
+}
+
+impl Moved {
+    /// Where the document that was `doc` in the source at `source` is now, or
+    /// `None` if the merge left it behind because it was already deleted.
+    ///
+    /// `None` for a document that is not in that source at all, and for a source
+    /// that was not in the merge, because both of those are the same question
+    /// asked about a document this merge is not carrying.
+    #[must_use]
+    pub fn of(&self, source: usize, doc: DocId) -> Option<DocId> {
+        let moved = *self.into.get(source)?.get(doc as usize)?;
+        (moved != GONE).then_some(moved)
+    }
+
+    /// How many segments went into the merge.
+    #[must_use]
+    pub fn sources(&self) -> usize {
+        self.into.len()
+    }
+}
+
 /// One segment, written out of several.
 #[derive(Debug)]
 pub struct Merged {
@@ -121,6 +163,12 @@ pub struct Merged {
     /// documents were the last holders of, which is the part of a merge that
     /// makes the dictionary smaller rather than just the postings.
     pub terms: u32,
+    /// Where the documents of the sources ended up.
+    ///
+    /// Kept because a batch prepared before the merge names documents by the
+    /// identifiers they had in the segments it folded, and this is what turns
+    /// those into the ones they have now.
+    pub moved: Moved,
 }
 
 /// Writes one segment holding the live documents of all the sources.
@@ -217,6 +265,7 @@ pub fn merge(sources: &[Source<'_>]) -> Result<Merged> {
         documents,
         dropped,
         terms,
+        moved: Moved { into: mapping },
     })
 }
 
