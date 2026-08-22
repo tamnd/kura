@@ -775,14 +775,33 @@ impl<'a, 'b> Searcher<'a, 'b> {
         let bound = lists.heads[0].bound;
         let scale = lists.scale;
         let mut scratch = Scratch::new();
-        for &step in &order_by_ceiling(ceilings) {
-            let quantum = ceilings[step as usize];
+        // The list was opened by advancing onto its first block, so that block is
+        // decoded and sitting in the cursor before the walk picks anything. It is
+        // scored here rather than in its place in the order, because the page is
+        // empty at this point and so the threshold is zero, which no ceiling
+        // falls under. A block the walk would take anyway, whose decode is
+        // already paid for, and taking it first only raises the threshold the
+        // rest of the order breaks against. Leaving it to its place in the order
+        // would mean decoding it a second time when the cursor has moved on.
+        let opened = lists.cursors[0].block();
+        {
+            let (docs, freqs) = lists.cursors[0].block_postings();
+            let scores = scratch.score(index, docs, freqs, norm, idf, self.k1);
+            offer(index, *base, docs, scores, top, tally);
+        }
+        for &step in &ceilings.order() {
+            if step as usize == opened {
+                continue;
+            }
+            let Some(fraction) = ceilings.get(step as usize) else {
+                continue;
+            };
             // `bound` is the term's `idf * (k1 + 1)`, which is what it
             // contributes when the saturation is one, so a saturation ceiling
             // scales it directly. Clamped at one because the correction for a
             // different average length can push a ceiling past the most a term
             // can ever contribute.
-            let ceiling = bound * (bound::ceiling(quantum) * scale).min(1.0);
+            let ceiling = bound * (fraction * scale).min(1.0);
             // Under the bar rather than at it. A document scoring exactly what
             // the worst hit scores still gets on the page when its identifier
             // is lower, and this walk does not visit documents in that order,
@@ -950,7 +969,9 @@ impl<'a, 'b> Searcher<'a, 'b> {
                 // the section existed. Both fall back on the looser bound.
                 lists
                     .ceilings
-                    .push(ceilings.map_or(&[][..], |ceilings| ceilings.get(offset)));
+                    .push(ceilings.map_or_else(bound::Ceilings::default, |ceilings| {
+                        ceilings.ceilings(offset)
+                    }));
             }
             if !lists.is_empty() {
                 shards.push(Shard { index, base, lists });
@@ -1062,7 +1083,7 @@ struct Lists<'a> {
     counts: Vec<u32>,
     /// What each list's blocks can score at best, one byte a block, or empty for
     /// a list the segment has none for.
-    ceilings: Vec<&'a [u8]>,
+    ceilings: Vec<bound::Ceilings<'a>>,
     /// What a stored ceiling has to be multiplied by to hold at the average
     /// length this query is scoring against, which is the store's and not this
     /// segment's. One whenever the two agree.
@@ -1167,14 +1188,14 @@ impl Lists<'_> {
     fn block_bound(&self, at: usize, k1: f32, floor: f32) -> f32 {
         let frequency = self.cursors[at].block_max_frequency() as f32;
         let loose = self.heads[at].idf * (frequency * (k1 + 1.0)) / (frequency + floor);
-        let Some(&quantum) = self.ceilings[at].get(self.cursors[at].block()) else {
+        let Some(fraction) = self.ceilings[at].get(self.cursors[at].block()) else {
             return loose;
         };
         // `bound` is the term's `idf * (k1 + 1)`, which is what it contributes
         // when the saturation is one, so a saturation ceiling scales it directly.
         // Clamped at one because the correction for a different average length
         // can push a ceiling past the most a term can ever contribute.
-        let tight = self.heads[at].bound * (bound::ceiling(quantum) * self.scale).min(1.0);
+        let tight = self.heads[at].bound * (fraction * self.scale).min(1.0);
         loose.min(tight)
     }
 
@@ -1253,43 +1274,6 @@ fn offer<T: Tally>(
         }
     }
     tally.scored_many(live);
-}
-
-/// The blocks of one list, ordered by their ceiling, largest first.
-///
-/// A counting sort rather than a comparison sort, because the thing being sorted
-/// on is a byte. Two passes over the blocks and one over the two hundred and
-/// fifty six buckets, against the block count times its logarithm a comparison
-/// sort would cost on a list of a few thousand blocks.
-///
-/// Ties keep the blocks in document order, which is not needed for the answer to
-/// be right but does mean a walk over blocks that all look alike reads the file
-/// forwards rather than at random.
-fn order_by_ceiling(ceilings: &[u8]) -> Vec<u32> {
-    let mut counts = [0u32; 256];
-    for &quantum in ceilings {
-        counts[quantum as usize] += 1;
-    }
-    // Running total from the top down, so the bucket of the largest ceiling
-    // starts at nothing and each one after it starts where the last ended.
-    let mut at = 0u32;
-    let mut start = [0u32; 256];
-    for quantum in (0..256).rev() {
-        start[quantum] = at;
-        at += counts[quantum];
-    }
-    let mut order = vec![0u32; ceilings.len()];
-    for (block, &quantum) in ceilings.iter().enumerate() {
-        let slot = &mut start[quantum as usize];
-        // The counting pass above is what makes every subscript here one the
-        // vector has, and a block count that fits a list this build opened is a
-        // block count that fits a u32.
-        if let Some(place) = order.get_mut(*slot as usize) {
-            *place = u32::try_from(block).unwrap_or(u32::MAX);
-        }
-        *slot += 1;
-    }
-    order
 }
 
 /// The first list whose cumulative bound could beat the threshold.
@@ -2106,11 +2090,13 @@ mod tests {
         );
         // One term is walked a block at a time in the order the ceilings put the
         // blocks in, so nothing advances a document at a time and every step is
-        // the walk naming a block. Every posting in a block it reads is scored,
-        // and the block the cursor unpacked when the list was opened is the only
-        // one that can be decoded without being scored.
+        // the walk naming a block. The block the list opened on is the one it
+        // does not have to name, because opening the list is what decoded it,
+        // so there is a seek for every block read but that one. Every posting in
+        // every block it reads is scored, which is what says no block was
+        // decoded twice.
         assert_eq!(counters.advances, 0);
-        assert_eq!(counters.seeks, counters.blocks_decoded);
+        assert_eq!(counters.seeks + 1, counters.blocks_decoded);
         assert_eq!(counters.documents_scored, counters.postings_decoded);
     }
 
@@ -2580,23 +2566,6 @@ mod tests {
                 hit.doc
             );
         }
-    }
-
-    #[test]
-    fn the_blocks_come_back_largest_ceiling_first_and_ties_in_document_order() {
-        let order = order_by_ceiling(&[3, 200, 7, 200, 0, 255]);
-        assert_eq!(order, [5, 1, 3, 2, 0, 4]);
-        assert_eq!(order_by_ceiling(&[]), Vec::<u32>::new());
-        assert_eq!(order_by_ceiling(&[9]), [0]);
-        // Every block once and none of them twice, which is what the walk
-        // relies on to score every document in a block it does not prune.
-        let ceilings: Vec<u8> = (0..1_000u32)
-            .map(|i| u8::try_from((i * 37) % 256).expect("a remainder of 256 is a byte"))
-            .collect();
-        let mut seen = order_by_ceiling(&ceilings);
-        assert_eq!(seen.len(), 1_000);
-        seen.sort_unstable();
-        assert!(seen.iter().copied().eq(0..1_000));
     }
 
     #[test]

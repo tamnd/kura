@@ -155,6 +155,9 @@ pub mod kind {
     /// How long each document is, in one byte apiece, which is what scoring
     /// reads when it is there.
     pub const ROUNDED: u16 = 13;
+    /// The block ceilings again, two bytes apiece instead of one, which is what
+    /// pruning reads when it is there.
+    pub const WIDE_BOUNDS: u16 = 14;
 }
 
 /// Builds a segment.
@@ -721,6 +724,7 @@ pub const fn name(kind: u16) -> Option<&'static str> {
         kind::KEYS => Some("keys"),
         kind::KEY_FILTER => Some("key filter"),
         kind::ROUNDED => Some("rounded"),
+        kind::WIDE_BOUNDS => Some("wide bounds"),
         _ => None,
     }
 }
@@ -758,6 +762,7 @@ mod tests {
         assert_eq!(name(kind::NORMS), Some("norms"));
         assert_eq!(name(kind::BOUNDS), Some("bounds"));
         assert_eq!(name(kind::ROUNDED), Some("rounded"));
+        assert_eq!(name(kind::WIDE_BOUNDS), Some("wide bounds"));
         // Not an error, because a reader skips a section it has never heard of
         // and a tool printing the table should say so rather than hide it.
         assert_eq!(name(4_242), None);

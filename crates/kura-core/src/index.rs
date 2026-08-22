@@ -749,11 +749,7 @@ impl Writer {
         segment.add(kind::POSTINGS, blob)?;
         segment.add(kind::NORMS, norms)?;
         segment.add(kind::ROUNDED, rounded)?;
-        // A segment whose every list is shorter than a block has nothing to skip,
-        // and an empty section would cost a row in the table to say so.
-        if !ceilings.is_empty() {
-            segment.add(kind::BOUNDS, ceilings.finish())?;
-        }
+        add_ceilings(&mut segment, ceilings)?;
         if let (true, Some(store)) = (stored, store) {
             segment.add(kind::FIELDS, store.finish()?)?;
         }
@@ -766,6 +762,23 @@ impl Writer {
         }
         Ok(segment)
     }
+}
+
+/// Adds the block ceilings to a segment, at both of the widths they are kept at.
+///
+/// A segment whose every list is shorter than a block has nothing to skip, and an
+/// empty section would cost a row in the table to say so, so it gets neither.
+///
+/// The wide ceilings are read out before the narrow ones, because finishing the
+/// writer consumes it. The order the two sections go into the table is the order
+/// they are laid out on disk and nothing a reader depends on.
+fn add_ceilings(segment: &mut SegmentWriter, ceilings: bound::Writer) -> Result<()> {
+    if ceilings.is_empty() {
+        return Ok(());
+    }
+    let wide = ceilings.wide().to_vec();
+    segment.add(kind::BOUNDS, ceilings.finish())?;
+    segment.add(kind::WIDE_BOUNDS, wide)
 }
 
 /// Turns the keys the parts were given into the two sections a segment carries,
@@ -1258,7 +1271,13 @@ impl<'a> Reader<'a> {
         // out, and so does a segment whose lists are all shorter than a block, so
         // its absence is an ordinary case rather than a damaged file.
         let bounds = match segment.section(kind::BOUNDS) {
-            Some(bytes) => Some(bound::Reader::new(bytes)?),
+            // The wide ceilings are the same numbers at a finer grain, and they
+            // are checked against the narrow ones for size on the way in, so a
+            // section that is not this segment's is left where it is.
+            Some(bytes) => Some(
+                bound::Reader::new(bytes)?
+                    .with_wide(segment.section(kind::WIDE_BOUNDS).unwrap_or_default()),
+            ),
             None => None,
         };
         Ok(Self {

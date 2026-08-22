@@ -153,6 +153,7 @@ The dictionary and the stored fields are intact, the postings are not, and that 
 | 11 | keys | the primary key of each document that has one, sorted, with the document number beside it |
 | 12 | key filter | a bloom filter over those keys, so a segment that does not hold a key can say so without the table being read |
 | 13 | rounded | how long each document is again, in one byte apiece, which is what scoring divides by when the segment carries it |
+| 14 | wide bounds | the same ceilings as kind 10 at two bytes a block instead of one, which is what pruning compares against when the segment carries it |
 
 A section may be absent, and an absent section is not the same as an empty one.
 A term dictionary with no terms is a fact about the segment.
@@ -166,15 +167,21 @@ A segment with one and not the other is refused rather than read.
 ## Sections that are worked out from other sections
 
 Most sections hold something only the writer knew.
-The bounds and the rounded lengths do not.
-Every byte in either is a function of the postings and the lengths that are already in the file, so a segment written before those kinds existed is not missing data, it is missing a calculation.
+The bounds, the wide bounds and the rounded lengths do not.
+Every byte in any of them is a function of the postings and the lengths that are already in the file, so a segment written before those kinds existed is not missing data, it is missing a calculation.
 
 That distinction is what lets a kind be added without moving the version.
 A reader that has never heard of kind 10 returns the same hits as one that has, because the section only ever says which work can be skipped and never which document wins.
+A reader that has never heard of kind 14 prunes from the byte in kind 10, which is the same ceiling rounded up further, so it reads more blocks and returns the same page.
 A reader that has never heard of kind 13 divides by the four byte length instead of the byte, which moves a score by well under a percent and can in principle reorder two documents that were already scoring within that of each other.
-Neither is a refusal.
+None of them is a refusal.
 
-The two have to stay sound together, and the rule that keeps them so is that the bounds are worked out from the exact lengths even though the scorer divides by the rounded ones.
+Kind 14 is the only section with no directory of its own.
+It is the payload of kind 10 again with two bytes where that has one, in the same order over the same terms, so a term whose ceilings are at `start..end` in kind 10 is at `2 * start..2 * end` in kind 14 and a directory would be twelve bytes a term for something already on disk.
+What stands in for one is the length: a reader takes kind 14 only when it is exactly twice the payload of kind 10, and ignores it otherwise.
+That matters more here than it would elsewhere, because a ceiling read out of a section belonging to some other segment is a bound that does not hold, and a bound that does not hold drops results rather than returning wrong ones.
+
+The bounds and the rounded lengths have to stay sound together, and the rule that keeps them so is that the bounds are worked out from the exact lengths even though the scorer divides by the rounded ones.
 Rounding a length goes upwards and a longer document scores lower, so a ceiling from the exact length bounds the rounded score as well as the exact one.
 Rounding on the way into the bounds would give a slightly tighter ceiling that only holds for a reader that rounds too, and a build that has never heard of kind 13 still reads kind 10.
 
