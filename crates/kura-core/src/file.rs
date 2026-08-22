@@ -1595,6 +1595,16 @@ impl View {
     /// deletions is then not a step anybody can forget. A reader that came from
     /// here cannot answer with a document the store says is gone.
     ///
+    /// The digests are not checked, for the same reason
+    /// [`lookup`](Self::lookup) does not check them: they cost a read of the
+    /// whole segment, which is what the store holds rather than what the query
+    /// wants. Measured on a sixteen megabyte store, checking them is 873
+    /// microseconds and not checking them is 0.8, against a query of 2. The
+    /// structure is still checked, the footer included, so every slice a reader
+    /// from here hands out is inside the mapping, and a store that wants its
+    /// contents proved has [`crate::segment::Segment::verify`] and the tool's
+    /// verify pass for that.
+    ///
     /// # Errors
     ///
     /// Returns [`Trouble::Format`] if there is no such segment, if the bytes are
@@ -1603,7 +1613,7 @@ impl View {
     /// pointing at a bitmap belonging to something else.
     pub fn reader(&self, at: usize) -> Result<Reader<'_>> {
         let bytes = self.bytes(at).ok_or(Error::MissingSection { kind: 0 })?;
-        let segment = crate::segment::Segment::open(bytes)?;
+        let segment = crate::segment::Segment::open_without_checksum(bytes)?;
         let reader = Reader::open(&segment)?;
         match self.deleted(at)? {
             Some(deleted) => Ok(reader.hiding(deleted)?),
@@ -2434,6 +2444,55 @@ mod tests {
         let reader = crate::index::Reader::open(&segment).expect("a reader");
         assert_eq!(reader.documents(), 40);
         assert_eq!(view.described()[0].docs, 40);
+    }
+
+    #[test]
+    fn a_reader_opens_without_reading_the_whole_segment_through() {
+        // Opening a reader skips the digests, because checking them costs a
+        // read of every byte in the segment on a path a server takes once a
+        // query. This pins both halves of that trade so that neither can be
+        // changed by accident: a flipped byte the digests would have caught no
+        // longer stops a reader opening, and the segment's own verify still
+        // catches it for the tool whose job is to ask.
+        let path = path("unhashed");
+
+        // The byte is found rather than guessed, because where the sections
+        // begin depends on what the writer produced. What is wanted is one
+        // inside a section, so that the structure and the table survive it and
+        // only the section digest does not.
+        let (bytes, _) = built(0, 40);
+        let at = (0..bytes.len())
+            .find(|&at| {
+                let mut copy = bytes.clone();
+                copy[at] ^= 0x40;
+                let Ok(segment) = crate::segment::Segment::open_without_checksum(&copy) else {
+                    return false;
+                };
+                segment.verify().is_err()
+                    && crate::index::Reader::open(&segment)
+                        .is_ok_and(|reader| reader.documents() == 40)
+            })
+            .expect("a byte the digests catch and the structure does not");
+
+        let store = stored(&path, &[40]);
+        let offset = store.manifest().segments[0].offset;
+        drop(store);
+        damage(
+            &path,
+            offset + u64::try_from(at).expect("a test segment is small"),
+        );
+
+        let store = Store::open(&path).expect("a store");
+        let view = store.view().expect("a view");
+        let reader = view.reader(0).expect("a reader, digests unread");
+        assert_eq!(reader.documents(), 40);
+
+        let segment = crate::segment::Segment::open_without_checksum(view.bytes(0).expect("bytes"))
+            .expect("the structure is intact");
+        assert!(
+            segment.verify().is_err(),
+            "the digests still catch what the reader walked past"
+        );
     }
 
     #[test]

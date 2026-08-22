@@ -39,6 +39,13 @@
 //! running the query. A server that held one searcher open would pay less than
 //! this and would be answering out of date. The segment count is in that cost,
 //! which is the point.
+//!
+//! The slowest query of a round is not reported, though it used to be. Now that
+//! a query is a few microseconds, the largest number in a million of them is the
+//! scheduler taking the core away rather than the store doing anything, and it
+//! came out at 1.8, 15.2 and 17.5 milliseconds across three runs of the same
+//! thing. A number that moves by ten times between identical runs is not
+//! measuring the thing it is printed beside.
 
 // Every cast here feeds a printed number that is already approximate.
 #![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
@@ -149,8 +156,8 @@ fn run(corpus: &Path, directory: &Path) -> Result<(), String> {
     );
     println!();
     println!(
-        "{:<22} {:>8} {:>7} {:>10} {:>10} {:>10} {:>10}",
-        "condition", "queries", "segs", "median", "p95", "p99", "worst"
+        "{:<22} {:>9} {:>7} {:>11} {:>11} {:>11}",
+        "condition", "queries", "segs", "median", "p95", "p99"
     );
 
     let quiet = rounds(&base, directory, "quiet", &queries, None)?;
@@ -298,17 +305,17 @@ impl Answered {
         Some(sorted[sorted.len() / 2])
     }
 
-    /// The middle of the times, in milliseconds.
+    /// The middle of the times, in microseconds.
     fn median(&self) -> f64 {
         self.at(50)
     }
 
-    /// The ninety ninth percentile, in milliseconds.
+    /// The ninety ninth percentile, in microseconds.
     fn p99(&self) -> f64 {
         self.at(99)
     }
 
-    /// The time at a percentile, in milliseconds.
+    /// The time at a percentile, in microseconds.
     fn at(&self, percentile: usize) -> f64 {
         if self.times.is_empty() {
             return 0.0;
@@ -321,14 +328,13 @@ impl Answered {
     /// Prints it.
     fn tell(&self, name: &str) {
         println!(
-            "{:<22} {:>8} {:>7} {:>8.3}ms {:>8.3}ms {:>8.3}ms {:>8.3}ms",
+            "{:<22} {:>9} {:>7} {:>8.1} µs {:>8.1} µs {:>8.1} µs",
             name,
             self.times.len(),
             self.segments,
             self.median(),
             self.at(95),
             self.p99(),
-            self.at(100),
         );
     }
 }
@@ -440,7 +446,7 @@ fn ask(writer: &Writer, queries: &[String], stop: &AtomicBool) -> Result<Vec<f64
             let _ = searcher
                 .search(query, 10)
                 .map_err(|problem| problem.to_string())?;
-            times.push(started.elapsed().as_secs_f64() * 1000.0);
+            times.push(started.elapsed().as_secs_f64() * 1_000_000.0);
         }
     }
     Ok(times)

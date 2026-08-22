@@ -641,22 +641,30 @@ A server holding one searcher open would pay less than this and would be answeri
 
 The Go source tree at go1.26.6, 11,496 files of which 5,748 are indexed first and 5,748 written while the queries run, on an M4 of ten cores, five rounds of each condition with the times pooled:
 
-| condition | queries | segments at the end | median | p95 | p99 | worst |
-| --- | --- | --- | --- | --- | --- | --- |
-| quiet | 9,400 | 1 | 0.480 ms | 0.728 ms | 0.854 ms | 16.9 ms |
-| writing | 965 | 14 | 0.848 ms | 2.136 ms | 3.260 ms | 20.1 ms |
-| writing and folding | 1,135 | 6 | 0.976 ms | 2.059 ms | 2.965 ms | 9.9 ms |
+| condition | queries | segments at the end | median | p95 | p99 |
+| --- | --- | --- | --- | --- | --- |
+| quiet | 1,960,000 | 1 | 3.1 µs | 3.5 µs | 4.0 µs |
+| writing | 170,000 | 14 | 4.5 µs | 16.3 µs | 26.5 µs |
+| writing and folding | 166,000 | 6 | 5.6 µs | 17.9 µs | 28.3 µs |
 
-An ingest costs a reader about 80 percent at the median and three to four times at p99, and that is the writing rather than the folding.
-Adding the folding costs 13 percent more at the median and takes the tail down rather than up: p99 falls from 3.26 ms to 2.97 ms and the worst query of the run falls from 20.1 ms to 9.9 ms.
-Three runs of the whole thing gave the same answer each time.
+Three runs of the whole thing, and each cell is the middle of the three.
 
-That is worth saying plainly because it is the opposite of what a rate limit is usually for.
-The worst query in a run is the one that had the most segments to walk, and folding is what stops there being fourteen of them.
+An ingest costs a reader 45 percent at the median and six times at p99, and that is the writing rather than the folding.
+Adding a fold beside the writing costs a further 24 percent at the median and nothing at p99: the two writing rows came out at 26.5 and 28.3 in one run, 32.5 and 28.3 in the next and 22.0 and 25.7 in the third, which is a wash.
+What the median costs is cores, since a keeper on a ten core machine beside four writers and a reader is a fifth thing wanting one.
+
+There is no worst column, though there used to be.
+Now that a query is a few microseconds, the largest number in a million of them is the scheduler taking the core away rather than the store doing anything, and it came out at 1.8 ms, 15.2 ms and 17.5 ms across three runs of the same thing.
+
+That the folding is nearly free to the reader is worth saying plainly, because it is the opposite of what a rate limit is usually for.
 The fold takes the store for as long as it runs, but a reader does not take the store, so what a fold costs a reader is the cores it uses and not a wait.
-On this machine and this corpus that trade comes out in the reader's favour, and a rate limit tuned to protect the read path would be protecting it from the wrong thing.
+On this machine and this corpus a rate limit tuned to protect the read path would be protecting it from a quarter of a microsecond at the median and from nothing at all in the tail.
 
-What folding costs is the ingest: 199.7 ms with nothing folding against 253.1 ms with a keeper beside it, medians of five rounds, for a store that ends at six segments rather than fourteen.
+What folding costs is the ingest: 168.7 ms with nothing folding against 248.9 ms with a keeper beside it, medians of five rounds, for a store that ends at six segments rather than fourteen.
+
+These numbers replace an earlier set that had the quiet median at 0.48 ms rather than 3.1 µs.
+That measurement was not wrong about the store, it was measuring something else: nearly all of it was a reader hashing every byte of the store on the way in, which is the section below.
+It also had the folding taking the read tail down rather than leaving it alone, and that was the same artefact, because the reader with the most segments open was the reader with the most hashing to do.
 
 ## What a segment count costs a query
 
@@ -674,24 +682,25 @@ The Go source tree at go1.26.6, 10,750 documents indexed into 22 segments and fo
 
 | segments | live | opening | opening unchecked | median | p95 | p99 |
 | --- | --- | --- | --- | --- | --- | --- |
-| 1 | 16 MB | 872.9 µs | 0.8 µs | 2.1 µs | 2.9 µs | 2.9 µs |
-| 2 | 16 MB | 890.7 µs | 1.0 µs | 3.3 µs | 10.8 µs | 11.2 µs |
-| 4 | 16 MB | 911.5 µs | 1.2 µs | 4.1 µs | 12.5 µs | 13.2 µs |
-| 8 | 17 MB | 942.4 µs | 1.9 µs | 6.0 µs | 9.7 µs | 10.8 µs |
-| 16 | 19 MB | 1050.6 µs | 3.2 µs | 10.3 µs | 16.5 µs | 16.8 µs |
+| 1 | 16 MB | 0.9 µs | 0.8 µs | 2.2 µs | 3.0 µs | 3.2 µs |
+| 2 | 16 MB | 1.0 µs | 1.0 µs | 3.2 µs | 10.8 µs | 10.9 µs |
+| 4 | 16 MB | 1.5 µs | 1.2 µs | 4.1 µs | 12.6 µs | 12.8 µs |
+| 8 | 17 MB | 2.1 µs | 1.8 µs | 6.1 µs | 9.8 µs | 9.9 µs |
+| 16 | 19 MB | 3.7 µs | 3.1 µs | 10.7 µs | 17.0 µs | 17.1 µs |
 
-The query itself behaves the way the claim says.
-Four segments is twice the median of one and sixteen is five times it, so the cost is roughly a fixed amount per segment on top of the work the query would do anyway.
+The query behaves the way the claim says.
+Four segments is about twice the median of one and sixteen is about five times it, so what a segment costs is roughly a fixed amount on top of the work the query would do anyway.
 Earlier text here put four segments at 20 to 30 percent slower than one, which was too kind to it, and that line has been corrected.
 
-The other column is the surprise, and it is much the larger number.
-Opening a reader over a one segment store costs 873 µs, which is four hundred times the query it is opened for, and it barely moves as the segment count climbs.
-The reason is that opening a segment hashes every section in it against the digest in its table before handing back a reader, so an open costs what the store holds rather than what the query wants.
-Sixteen megabytes at about 19 GB/s is 870 µs, and the bytes are the same at every rung because the rungs are the same documents.
-The unchecked column is the same structural parse with the digests left alone, and it is under a microsecond at one segment and 3.2 µs at sixteen, which is the per segment cost the rung is actually meant to be showing.
+The opening column is there because the first run of this found something much larger than the thing it was built to measure.
+Opening a reader over a one segment store cost 873 µs, four hundred times the query it was opened for, and it barely moved as the segment count climbed.
+Opening a segment hashed every section in it against the digest in its table before handing back a reader, so an open cost what the store held rather than what the query wanted, and sixteen megabytes at about 19 GB/s is 870 µs.
+That was most of the quiet median in the section above, and it scaled with the store, so a large one would have opened in seconds.
 
-That number is most of the 0.48 ms quiet median in the section above, where the store holds half as many bytes and so pays about half as much.
-It is being fixed rather than explained away, and until it is, a caller that holds one searcher open across queries pays it once instead of once a query.
+A reader now opens without checking the digests, which is what the key lookup path had been doing all along.
+The structure is still checked, the footer included, so every slice a reader hands out is still inside the mapping, and a byte that changed on disk is still caught by `kura-cli verify`, which is the tool whose job it is to ask.
+Opening one segment went from 873 µs to 0.9 µs.
+The unchecked column is what is left of the comparison: it opens the same segments through the same call the fix uses, so the two columns agree, and a run where they stop agreeing is a run where the hashing has come back.
 
 ## Bounding what an index run holds at once
 
