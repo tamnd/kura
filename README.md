@@ -369,6 +369,7 @@ A run without `--store` writes a single segment and keys nothing, because a file
 
 Without a budget an index run keeps every posting in memory until the last file has been read, so the memory it needs is set by the size of what it was pointed at rather than by anything the machine can promise.
 `--memory` finishes a segment once the writer is holding that much and starts a new one, so the memory is set by the budget instead.
+A run into a store is bounded at 128m without being asked, `--memory none` is how to turn that off, and a run without `--store` is unbounded either way because what it writes is one segment and there is nowhere to put a second.
 
 The budget is in the same units the run reports, which is what the writer holds, and the writer is asked after every document.
 That makes it a floor rather than a ceiling: the writer stops when it has crossed the budget, not before, so what it holds at its largest is the budget plus whatever the document that crossed it added.
