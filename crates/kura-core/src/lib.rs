@@ -34,6 +34,8 @@ pub mod filter;
 pub mod index;
 #[cfg(feature = "fs")]
 pub mod ingest;
+#[cfg(feature = "fs")]
+pub mod keeper;
 pub mod keys;
 pub mod length;
 pub mod lz;

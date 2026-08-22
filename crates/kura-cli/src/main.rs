@@ -56,6 +56,7 @@ use kura_core::durability::Reach;
 use kura_core::file::{Store, Trouble};
 use kura_core::index::{Held, Reader, Writer};
 use kura_core::ingest::{self, Batch, Logged};
+use kura_core::keeper::Keeper;
 use kura_core::manifest;
 use kura_core::mapping::Map;
 use kura_core::policy::{Policy, Pressure};
@@ -188,12 +189,18 @@ are ready when a commit finishes go into the next one together, so the run pays
 for one commit rather than for one per thread. The analysis is where an index
 run spends its time, so this is the option that uses the machine.
 
-Two things are different above one thread and the run says both. There is no
-log, because a record goes into it as its document arrives and the log is
-reached through the store, which one thread at a time holds, so a run that stops
-loses whatever it had not committed rather than leaving it for a recovery. And
-the folding happens once at the end rather than as the run goes, because a fold
-moves the segments that the batches being built are counting positions into.
+One thing is different above one thread and the run says it. There is no log,
+because a record goes into it as its document arrives and the log is reached
+through the store, which one thread at a time holds, so a run that stops loses
+whatever it had not committed rather than leaving it for a recovery.
+
+The folding above one thread is done by a thread of its own rather than by
+whichever writer noticed. It asks the same question of the same policy and it
+holds the store for as long as a fold takes, so nothing commits in that window,
+but the threads filling batches carry on filling them, because that is the half
+of ingest that needs no store. The run says how many of its folds were done
+beside it and the most segments that thread ever saw at once. --no-fold turns
+it off with everything else.
 
 --memory is per thread, so eight threads at 128m is a gigabyte and not 128
 megabytes. Set it to what one thread should hold and multiply.
@@ -1148,6 +1155,13 @@ struct Folds {
     /// How many of them a writer at the hard cap waited for, rather than paying
     /// for one fold and carrying on.
     stalled: usize,
+    /// How many of them happened on a thread of their own beside the run rather
+    /// than in front of it, which changes what the time they took means.
+    beside: usize,
+    /// The most segments the folding thread ever saw at once, which is what it
+    /// sampled rather than what the run reached, and zero on a run that folded
+    /// in front of itself with nobody watching.
+    highest: usize,
 }
 
 impl Folds {
@@ -1158,6 +1172,8 @@ impl Folds {
         self.documents += other.documents;
         self.took += other.took;
         self.stalled += other.stalled;
+        self.beside += other.beside;
+        self.highest = self.highest.max(other.highest);
     }
 
     /// Prints what the folding cost, or nothing if there was none.
@@ -1171,13 +1187,36 @@ impl Folds {
             0.0
         };
         println!(
-            "folded {} {}, {} segments and {} documents, {:.1?} of the run, {share:.0} percent",
+            "folded {} {}{}, {} segments and {} documents, {:.1?} {}, {share:.0} percent",
             self.count,
             if self.count == 1 { "time" } else { "times" },
+            if self.beside == self.count {
+                " beside the run"
+            } else if self.beside > 0 {
+                " and all but the last of them beside the run"
+            } else {
+                ""
+            },
             self.segments,
             self.documents,
-            self.took
+            self.took,
+            if self.beside > 0 {
+                "in which nothing else could commit"
+            } else {
+                "of the run"
+            }
         );
+        if self.highest > 0 {
+            println!(
+                "the folding thread never saw more than {} {} at once",
+                self.highest,
+                if self.highest == 1 {
+                    "segment"
+                } else {
+                    "segments"
+                }
+            );
+        }
         if self.stalled > 0 {
             println!(
                 "{} of those were waited for at the hard cap of level zero rather than paid for one at a time",
@@ -1393,6 +1432,7 @@ fn into_store<'a>(plan: &Plan, files: &'a [PathBuf], run: &mut Run<'a>) -> Resul
         at += one_batch(&mut store, plan, &files[at..], run)?;
         keep_up(&mut store, plan, run)?;
     }
+    tidy(&mut store, plan, run, now)?;
     run.segments = store.manifest().segments.len();
     run.syncs = store.syncs();
     Ok(())
@@ -1566,8 +1606,8 @@ fn one_batch<'a>(
 /// counted positions into and every one of them would be refused.
 fn shared<'a>(plan: &Plan, files: &'a [PathBuf], run: &mut Run<'a>) -> Result<(), Failure> {
     let mut store = open_store(&plan.out, plan.durability)?;
-    let now = now();
-    let put_back = ingest::replay(&mut store, now, now)
+    let stamp = now();
+    let put_back = ingest::replay(&mut store, stamp, stamp)
         .map_err(|trouble| Failure::Store(plan.out.clone(), trouble))?;
     if !put_back.is_empty() {
         println!(
@@ -1585,14 +1625,20 @@ fn shared<'a>(plan: &Plan, files: &'a [PathBuf], run: &mut Run<'a>) -> Result<()
         SharedWriter::new(store).map_err(|trouble| Failure::Store(plan.out.clone(), trouble))?;
 
     let next = AtomicUsize::new(0);
+    let keeper = Keeper::new(&writer);
     let parts = std::thread::scope(|scope| {
+        let keeper = &keeper;
+        // The folding goes on a thread of its own so that the segment count
+        // sits near the cap over the run rather than climbing to the thread
+        // count and being brought back in one jump at the end.
+        let keeping = plan.fold.then(|| scope.spawn(move || keeper.run(now)));
         let running: Vec<_> = (0..plan.threads)
             .map(|_| {
                 let (writer, next) = (&writer, &next);
                 scope.spawn(move || shard(writer, plan, files, next))
             })
             .collect();
-        running
+        let parts = running
             .into_iter()
             .map(|handle| {
                 handle.join().unwrap_or_else(|_| {
@@ -1602,15 +1648,42 @@ fn shared<'a>(plan: &Plan, files: &'a [PathBuf], run: &mut Run<'a>) -> Result<()
                     ))
                 })
             })
-            .collect::<Result<Vec<_>, Failure>>()
+            .collect::<Result<Vec<_>, Failure>>();
+        // Whatever happened to the shards, and it is told before the answers
+        // are looked at, because a scope that ends waits for every thread in it
+        // and a keeper nobody stopped is a keeper that never returns.
+        keeper.stop();
+        let folding = keeping.map_or(Ok(()), |keeping| {
+            keeping
+                .join()
+                .unwrap_or_else(|_| {
+                    Err(Trouble::Io(std::io::Error::other(
+                        "the folding thread stopped",
+                    )))
+                })
+                .map_err(|trouble| Failure::Store(plan.out.clone(), trouble))
+        });
+        // The shards answer first. A fold that failed because the store did
+        // says less than the failure the thread that hit it was given.
+        let parts = parts?;
+        folding?;
+        Ok::<_, Failure>(parts)
     })?;
     for part in parts {
         run.absorb(part);
     }
+    let tally = keeper.tally();
+    run.folds.count += usize::try_from(tally.folds).unwrap_or(usize::MAX);
+    run.folds.beside += usize::try_from(tally.folds).unwrap_or(usize::MAX);
+    run.folds.segments += usize::try_from(tally.segments).unwrap_or(usize::MAX);
+    run.folds.documents += tally.documents;
+    run.folds.took += tally.took;
+    run.folds.highest = run.folds.highest.max(tally.highest);
 
     // Now that nothing is preparing a batch, the store can be moved about.
     let mut store = writer.into_store();
     settle(&mut store, plan, run)?;
+    tidy(&mut store, plan, run, stamp)?;
     run.segments = store.manifest().segments.len();
     run.syncs = store.syncs();
     Ok(())
@@ -1695,6 +1768,43 @@ fn shard<'a>(
 /// makes is one the single threaded path would have made in the middle of the
 /// run, so the work is the same work and the documents after it did not wait for
 /// it. What a store is left in is the same either way.
+/// Folds what this run left at level zero into one segment.
+///
+/// A run that folded as it went can stop with level zero under the cap and
+/// still holding several segments, because the fold it paid for took the ones
+/// that were there when it started and the commits that came after were never
+/// enough to be due again. Under the cap is a store the policy is content with,
+/// and it is not a store worth walking away from: these are this run's own
+/// segments, they hold what it has just written, and folding them costs what the
+/// run was already holding rather than what the store holds.
+///
+/// Only this run's, which is what `since` is for. A run that added one segment
+/// to a store with six at level zero already has no business rewriting the six.
+fn tidy(store: &mut Store, plan: &Plan, run: &mut Run<'_>, since: u64) -> Result<(), Failure> {
+    if !plan.fold {
+        return Ok(());
+    }
+    let segments = &store.manifest().segments;
+    let start = segments
+        .iter()
+        .rposition(|segment| segment.level != 0 || segment.created < since)
+        .map_or(0, |at| at + 1);
+    let end = segments.len();
+    if end - start < 2 {
+        return Ok(());
+    }
+    let now = now();
+    let folding = Instant::now();
+    let done = store
+        .compact(start..end, now, now)
+        .map_err(|trouble| Failure::Store(plan.out.clone(), trouble))?;
+    run.folds.count += 1;
+    run.folds.segments += done.folded;
+    run.folds.documents += u64::from(done.documents);
+    run.folds.took += folding.elapsed();
+    Ok(())
+}
+
 fn settle(store: &mut Store, plan: &Plan, run: &mut Run<'_>) -> Result<(), Failure> {
     if !plan.fold {
         return Ok(());
@@ -2756,7 +2866,10 @@ mod tests {
         let corpus = documents(&dir.join("corpus"), 0, 137);
         let store = dir.join("cut.kura");
 
-        into(&corpus, &store, &["--flush-every", "1k"]).expect("the first run");
+        // --no-fold on the first run, because a run that folds ends with its
+        // segments in one and the thing being tested is the second run reading
+        // across several of them.
+        into(&corpus, &store, &["--flush-every", "1k", "--no-fold"]).expect("the first run");
         let after_one = Store::open(&store)
             .expect("the store opens")
             .manifest()
@@ -2767,7 +2880,7 @@ mod tests {
             after_one.segments.len()
         );
 
-        into(&corpus, &store, &["--flush-every", "1k"]).expect("the second run");
+        into(&corpus, &store, &["--flush-every", "1k", "--no-fold"]).expect("the second run");
         let opened = Store::open(&store).expect("the store opens");
         assert_eq!(opened.manifest().live, 137);
         assert_eq!(opened.manifest().total, 274);
@@ -3115,6 +3228,62 @@ mod tests {
     }
 
     #[test]
+    fn a_run_of_several_threads_folds_while_it_is_still_writing() {
+        // A run of several threads used to leave the folding until the writing
+        // stopped, because a fold moved the segments the batches in flight were
+        // counting positions into. Now a thread of its own does it as the run
+        // goes, and what says so is that level zero stayed under the cap while
+        // the documents were still arriving rather than being brought back to
+        // it in one jump at the end.
+        let dir = scratch_dir("threads-fold-as-they-go");
+        let corpus = documents(&dir.join("corpus"), 0, 400);
+        let kept = dir.join("kept.kura");
+        into(&corpus, &kept, &["--flush-every", "8", "--threads", "4"]).expect("the run");
+
+        let store = Store::open(&kept).expect("the store opens");
+        assert_eq!(store.manifest().live, 400);
+        drop(store);
+
+        // The same corpus by one thread, which folds in front of itself, and
+        // the two have to answer the same questions.
+        let one = dir.join("one.kura");
+        into(&corpus, &one, &["--flush-every", "8"]).expect("the run of one");
+        for query in ["ledger", "invoice quarter", "ledger audit invoice"] {
+            assert_eq!(live(&kept, query), live(&one, query), "{query}");
+            assert!(live(&kept, query) > 0, "{query} found nothing either way");
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_run_told_not_to_fold_has_no_keeper_beside_it() {
+        // --no-fold is one flag and it has to mean all of it, or a run that
+        // asked for the segments to be left where they are would find a thread
+        // quietly folding them anyway.
+        let dir = scratch_dir("threads-no-keeper");
+        let corpus = documents(&dir.join("corpus"), 0, 200);
+        let left = dir.join("left.kura");
+        into(
+            &corpus,
+            &left,
+            &["--flush-every", "8", "--threads", "4", "--no-fold"],
+        )
+        .expect("the run");
+
+        let store = Store::open(&left).expect("the store opens");
+        assert!(
+            store.manifest().segments.len() > 8,
+            "nothing folded them, and got {} segments",
+            store.manifest().segments.len()
+        );
+        assert_eq!(store.manifest().live, 200);
+        drop(store);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_run_of_several_threads_leaves_what_one_thread_leaves() {
         // The whole of what --threads is allowed to change is how long the run
         // takes. Two stores over the same corpus, one filled by one thread and
@@ -3159,10 +3328,11 @@ mod tests {
 
         let opened = Store::open(&store).expect("the store opens");
         assert_eq!(opened.manifest().live, 200, "a document went in twice");
-        // Not four hundred in all, which is what the same run of one thread
-        // leaves. The second run ends over the cap and folds on the way out,
-        // and a fold is where the replaced copies stop being written down.
-        assert_eq!(opened.manifest().total, opened.manifest().live);
+        // Four hundred written down, two hundred of them replaced, which is
+        // what the same run of one thread leaves. The fold each run pays on the
+        // way out takes only the segments that run wrote, so the copies the
+        // second run replaced are in a segment neither fold touched.
+        assert_eq!(opened.manifest().total, 400);
         drop(opened);
 
         // And what it answers is what the same corpus answers when it was put

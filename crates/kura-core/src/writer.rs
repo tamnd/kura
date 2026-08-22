@@ -36,8 +36,9 @@
 //! That view is one commit behind for anybody who took it before the commit now
 //! in flight, which is most writers most of the time. It does not have to be
 //! current. A batch is joined onto whatever happened while it was being
-//! prepared, and only a compaction refuses it. See [`crate::ingest::commit_all`]
-//! for what the join does.
+//! prepared, a compaction under it is one more thing it is carried through, and
+//! what is refused is a batch that two compactions went past. See
+//! [`crate::ingest::commit_all`] for what the join does.
 //!
 //! # The log
 //!
@@ -190,10 +191,11 @@ impl Writer {
     /// for what it is for and give it back.
     ///
     /// Giving it back is also when the shared view catches up, if what was done
-    /// with it moved the store. That is not politeness. A compaction is the one
-    /// thing a batch cannot be joined onto, so a compaction that left every
-    /// writer preparing against the view before it would be a compaction that
-    /// refused the next batch from each of them.
+    /// with it moved the store. That is not politeness. A batch prepared before
+    /// a compaction is carried through it rather than refused now, but carrying
+    /// it is work, and a compaction that left every writer preparing against the
+    /// view before it would be a compaction every one of them had to be carried
+    /// across.
     #[must_use]
     pub fn store(&self) -> Locked<'_> {
         Locked {
