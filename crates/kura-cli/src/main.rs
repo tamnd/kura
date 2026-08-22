@@ -43,7 +43,7 @@ mod verify;
 
 use std::fmt;
 use std::fs;
-use std::io::{BufWriter, Write as _};
+use std::io::{BufWriter, Read as _, Write as _};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -1127,15 +1127,14 @@ fn one_batch<'a>(
     let mut taken = 0usize;
     for file in files {
         taken += 1;
-        let Ok(content) = fs::read(file) else {
+        let Ok(Some(content)) = read_text(file) else {
             run.skipped += 1;
             continue;
         };
+        // A file that opened as text still decodes lossily, because a mixed file
+        // should be indexed for the words in it rather than dropped. On a file
+        // that is text the decode borrows and costs nothing.
         let text = String::from_utf8_lossy(&content);
-        if looks_binary(&text) {
-            run.skipped += 1;
-            continue;
-        }
         run.bytes += content.len() as u64;
         pending += content.len() as u64;
         // The path is the key as well as the field it is already stored under,
@@ -1206,19 +1205,15 @@ fn into_file<'a>(plan: &Plan, files: &'a [PathBuf], run: &mut Run<'a>) -> Result
     let mut writer = fresh(plan.memory);
     run.steepest = Steepest::from(writer.held().total());
     for file in files {
-        let Ok(content) = fs::read(file) else {
-            run.skipped += 1;
-            continue;
-        };
         // A directory of anything real holds files that are not text, and a
         // lossy decode indexes the words in a mixed file rather than dropping
         // it. What it must not do is silently index a megabyte of replacement
         // characters, which is what a binary would become.
-        let text = String::from_utf8_lossy(&content);
-        if looks_binary(&text) {
+        let Ok(Some(content)) = read_text(file) else {
             run.skipped += 1;
             continue;
-        }
+        };
+        let text = String::from_utf8_lossy(&content);
         run.bytes += content.len() as u64;
         let path = file.to_string_lossy().into_owned();
         writer.add_with_fields(&text, [(PATH_FIELD, path.as_bytes())])?;
@@ -1588,20 +1583,87 @@ fn collect(path: &Path, files: &mut Vec<PathBuf>) -> Result<(), Failure> {
     Ok(())
 }
 
-/// Whether a lossy decode turned enough of the input into replacement
-/// characters that indexing it would be indexing noise.
+/// How much of a file is enough to tell text from anything else.
+///
+/// A binary is as obviously a binary in its first few kilobytes as in the whole
+/// of it, and a file rejected on its prefix costs a prefix to reject rather than
+/// its length.
+const PREFIX: u64 = 8 * 1024;
+
+/// Reads a file if it is text, and gives back nothing if it is not.
+///
+/// The order is the point. Decoding a file and then deciding costs its length
+/// whatever the decision was, and on a directory of anything real most of the
+/// length is in the files that get dropped. A 77 MB static library cost 77 MB to
+/// read and up to three times that to decode, because a lossy decode turns every
+/// bad byte into three, and the peak that came out of that was fifty times what
+/// the writer was holding.
+///
+/// The prefix is asked first so a binary is turned down after a few kilobytes,
+/// and the whole is asked after so a file whose opening happens to read as text
+/// is judged on the same rule it was judged on before. Neither question decodes
+/// anything.
+fn read_text(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    let mut file = fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    std::io::Read::by_ref(&mut file)
+        .take(PREFIX)
+        .read_to_end(&mut bytes)?;
+    if looks_binary(&bytes) {
+        return Ok(None);
+    }
+    if bytes.len() < usize::try_from(PREFIX).unwrap_or(usize::MAX) {
+        return Ok(Some(bytes));
+    }
+    file.read_to_end(&mut bytes)?;
+    if looks_binary(&bytes) {
+        return Ok(None);
+    }
+    Ok(Some(bytes))
+}
+
+/// Whether enough of the input is undecodable that indexing it would be
+/// indexing noise.
 ///
 /// A tenth is well above what a text file with one bad byte produces and well
-/// below what a binary produces, so the exact figure does not matter much.
-fn looks_binary(text: &str) -> bool {
-    if text.is_empty() {
+/// below what a binary produces, so the exact figure does not matter much. It is
+/// counted off the bytes rather than off a decoded string because the decode is
+/// the expensive half and nothing should pay for it before something wants the
+/// text.
+///
+/// A sequence cut off by the end of the input is not counted. On a prefix that
+/// is a character the caller has not read yet rather than a bad byte, and on a
+/// whole file it is one character in the length of a file.
+fn looks_binary(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
         return false;
     }
-    let replaced = text
-        .chars()
-        .filter(|c| *c == char::REPLACEMENT_CHARACTER)
-        .count();
-    replaced * 10 > text.chars().count()
+    let mut rest = bytes;
+    let mut characters = 0usize;
+    let mut replaced = 0usize;
+    loop {
+        let error = match str::from_utf8(rest) {
+            Ok(text) => {
+                characters += text.chars().count();
+                break;
+            }
+            Err(error) => error,
+        };
+        let good = error.valid_up_to();
+        characters += str::from_utf8(&rest[..good])
+            .expect("the part before the error decodes")
+            .chars()
+            .count();
+        let Some(bad) = error.error_len() else {
+            break;
+        };
+        // A lossy decode writes one replacement character for the whole bad
+        // sequence, so counting sequences is counting what it would have
+        // written.
+        replaced += 1;
+        rest = &rest[good + bad..];
+    }
+    replaced * 10 > characters + replaced
 }
 
 /// Analyses a query into its distinct terms, in order.
@@ -1714,21 +1776,99 @@ mod tests {
 
     #[test]
     fn a_text_file_with_one_bad_byte_is_still_text() {
-        let bytes = b"the quick brown fox\xff jumps over the lazy dog";
-        let text = String::from_utf8_lossy(bytes);
-        assert!(!looks_binary(&text));
+        assert!(!looks_binary(
+            b"the quick brown fox\xff jumps over the lazy dog"
+        ));
     }
 
     #[test]
     fn a_run_of_undecodable_bytes_is_not_text() {
-        let bytes = vec![0xff_u8; 512];
-        let text = String::from_utf8_lossy(&bytes);
-        assert!(looks_binary(&text));
+        assert!(looks_binary(&[0xff_u8; 512]));
     }
 
     #[test]
     fn an_empty_file_is_not_binary() {
-        assert!(!looks_binary(""));
+        assert!(!looks_binary(b""));
+    }
+
+    #[test]
+    fn a_character_the_end_of_the_prefix_cut_in_half_is_not_a_bad_byte() {
+        // The first two bytes of a three byte character, which is what a prefix
+        // ending in the middle of one leaves behind.
+        assert!(!looks_binary(b"ledger \xe2\x82"));
+    }
+
+    /// The prefix, as a length a test can build a file out of.
+    fn prefix() -> usize {
+        usize::try_from(PREFIX).expect("a prefix this machine can hold")
+    }
+
+    #[test]
+    fn a_binary_is_turned_down_on_its_opening() {
+        let dir = scratch_dir("turned-down");
+        let path = dir.join("library.a");
+        // Binary at the front and prose after it, so a decision taken on the
+        // whole file would keep it and a decision taken on the opening will not.
+        let mut bytes = vec![0xff_u8; prefix()];
+        for _ in 0..PREFIX {
+            bytes.extend_from_slice(b"ledger ");
+        }
+        fs::write(&path, &bytes).expect("a file");
+        assert!(read_text(&path).expect("the file opens").is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_that_opens_as_text_and_goes_on_as_a_binary_is_still_turned_down() {
+        let dir = scratch_dir("text-then-binary");
+        let path = dir.join("data.bin");
+        let mut bytes = b"ledger invoice quarter ".repeat(prefix());
+        bytes.extend(std::iter::repeat_n(0xff_u8, bytes.len()));
+        fs::write(&path, &bytes).expect("a file");
+        assert!(read_text(&path).expect("the file opens").is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_text_file_longer_than_the_prefix_is_read_whole() {
+        let dir = scratch_dir("read-whole");
+        let path = dir.join("notes.txt");
+        let text = "ledger invoice quarter ".repeat(4_096);
+        fs::write(&path, &text).expect("a file");
+        let read = read_text(&path).expect("the file opens").expect("text");
+        assert!(read.len() > prefix());
+        assert_eq!(read.len(), text.len());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn turning_a_large_binary_down_does_not_cost_its_length() {
+        const LENGTH: u64 = 32 * 1024 * 1024;
+
+        let dir = scratch_dir("large-binary");
+        let path = dir.join("archive.a");
+        let length = usize::try_from(LENGTH).expect("a size this machine can hold");
+        // Writing it puts its length through the process first, so the reading
+        // below starts from a peak that already covers a file this size and the
+        // test cannot pass on a peak somebody else set.
+        fs::write(&path, vec![0xff_u8; length]).expect("a file");
+
+        // Reading this one the old way cost its length to read and up to three
+        // times that to decode, so a peak that has not moved is the whole point
+        // of the test.
+        let before = residency::peak_resident();
+        for _ in 0..4 {
+            assert!(read_text(&path).expect("the file opens").is_none());
+        }
+        let after = residency::peak_resident();
+        // A platform that will not report a peak has nothing to say here.
+        if let (Ok(before), Ok(after)) = (before, after) {
+            assert!(
+                after.saturating_sub(before) < LENGTH / 4,
+                "peak went from {before} to {after} turning down a {LENGTH} byte binary"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// A small index, and the same index with one byte of its body flipped.

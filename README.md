@@ -476,6 +476,21 @@ Unlike the held numbers the total moves from run to run, because it is the whole
 Read it as a shape and not as a measurement.
 On a run with `--flush-every` the last two steps read as nothing, because by then the segments before it have already pushed the mark past anything the last one does.
 
+The last line of an index run says how many files were not text, and the files it counts used to be the most expensive thing about the run.
+A tree of anything real holds archives and libraries and images, and the tool decided whether a file was text by reading all of it and decoding all of it first, so a 77 MB library cost 77 MB to read and up to three times that to decode, because a lossy decode turns every bad byte into three bytes of replacement character.
+The decision is now taken on the opening bytes, before anything is decoded and before the rest of the file is read, and a file that survives that is asked the same question again on the whole of it once it has been read.
+The rule itself has not changed, and neither has the answer for any file whose opening reads the way the rest of it does.
+A tree of 57,363 files, 1.0 GB of text in the 55,884 of them that are text, indexed into a store at four budgets:
+
+| budget | segments | held | peak RSS before | peak RSS now |
+| --- | --- | --- | --- | --- |
+| none, one file rather than a store | 1 | 244.6 MB | 434.8 MB | 405.7 MB |
+| none | 7 | 76.0 MB | 541.3 MB | 219.3 MB |
+| 64m | 7 | 65.0 MB | 502.1 MB | 228.4 MB |
+| 32m | 13 | 35.1 MB | 531.2 MB | 183.6 MB |
+
+Before the change the budget did not reach the peak at all, and the tightest budget had the highest peak of the three, because the peak was being set by the files the run was throwing away rather than by the ones it was keeping.
+
 ## Looking at the file itself
 
 ```sh
