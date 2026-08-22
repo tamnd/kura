@@ -377,28 +377,69 @@ That is the honest floor of taking the queue as it stands, and it is what a smal
 The compaction that refuses a batch refuses that batch and not the group it arrived in.
 The leader checks each one against the store it is about to commit into, tells the one a fold moved that it was moved, and commits the rest.
 
-The Go source tree at go1.26.6, which is 10,888 text files and 106.4 MB, on an M4 with the files already in page cache, `--memory 32m`, eight runs of the same command one after another:
+### Threads that fill batches at once
+
+The commit is two syncs and the read is a syscall, and between them is the analyser, which is where an index run spends its time.
+`--threads` gives that part of it to the machine.
+Each thread takes files off a shared counter one at a time, fills a batch of its own against the view the writer is handing out, and gives it back, and the batches that are ready when a commit finishes go into the next one together.
+
+```sh
+kura-cli index /usr/src -o /var/lib/kura/store.kura --store --memory 32m --threads 8
+```
+
+The Go source tree again, 10,884 text files and 104.6 MB, on an M4 of ten cores with the files in page cache:
+
+| threads | wall | documents/s | peak resident | commits | syncs | segments after |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 1.1 s | 9,900 | 88.2 MB | 2 | 4 | 2 |
+| 2 | 513 ms | 21,200 | 95.7 MB | 3 | 6 | 3 |
+| 4 | 297 ms | 36,700 | 127.7 MB | 4 | 6 | 4 |
+| 8 | 377 ms | 28,900 | 145.3 MB | 8 | 8 | 1 |
+| 16 | 395 ms | 27,600 | 156.6 MB | 16 | 12 | 1 |
+
+It scales to four threads and then it stops, and what stops it is in the last column rather than in the analyser.
+Eight threads leave eight segments where four leave four, eight is the level zero cap, so the run folds on the way out and pays 146 ms of its 377 for it.
+Sixteen pays 182 of 395.
+With `--no-fold` the same runs are 302 ms at four threads, 225 ms at eight and 219 ms at sixteen, which is 48,000 documents a second at eight and no better at sixteen, so the scaling runs out at the core count where it should.
+The fold is not waste, it is the work a single threaded run does in the middle of itself, and a store that skipped it would hand the cost to every query afterwards.
+What the two columns together say is that above four threads the run is bounded by folding rather than by indexing, which is what the rate limited compaction on the roadmap is for.
+
+Two things are different above one thread and the run says both.
+There is no log, because a record goes into the ring as its document arrives and the ring is reached through the store, which one thread at a time holds, so a run that stops loses whatever it had not committed rather than leaving it for the next run to put back.
+Part of the gap between the first row and the second is that: the single threaded run wrote 83.8 MB into the log on the way past, and the same corpus into a bare segment with no store and no log takes 873 ms.
+And the folding happens once at the end rather than as the run goes, because a fold moves the segments that the batches in flight counted positions into and would refuse every one of them at once.
+
+`--memory` is per thread, so eight threads at 128m is a gigabyte.
+That is the peak resident column growing while the wall clock falls, and it is the thing to set before turning the count up on a machine that has other work on it.
+
+What `--threads` is not allowed to change is the store it leaves.
+The same corpus by one thread and by eight gives the same live count, the same answers to the same queries and the same stored fields, and a run over a corpus that is already in the store replaces every document once whichever thread got there first.
+
+The Go source tree at go1.26.6, which is 10,884 text files and 104.6 MB, on an M4 with the files already in page cache, `--memory 32m --no-fold`, eight runs of the same command one after another:
 
 | run | new | replaced | segments after | wall |
 | --- | --- | --- | --- | --- |
-| 1 | 10,888 | 0 | 2 | 1.9 s |
-| 2 | 0 | 10,888 | 4 | 1.2 s |
-| 3 | 0 | 10,888 | 6 | 1.2 s |
-| 4 | 0 | 10,888 | 8 | 1.3 s |
-| 5 | 0 | 10,888 | 10 | 1.3 s |
-| 6 | 0 | 10,888 | 12 | 1.4 s |
-| 7 | 0 | 10,888 | 14 | 1.2 s |
-| 8 | 0 | 10,888 | 16 | 1.3 s |
+| 1 | 10,884 | 0 | 2 | 2.2 s |
+| 2 | 0 | 10,884 | 4 | 1.3 s |
+| 3 | 0 | 10,884 | 6 | 1.8 s |
+| 4 | 0 | 10,884 | 8 | 2.0 s |
+| 5 | 0 | 10,884 | 10 | 1.4 s |
+| 6 | 0 | 10,884 | 12 | 1.5 s |
+| 7 | 0 | 10,884 | 14 | 1.3 s |
+| 8 | 0 | 10,884 | 16 | 1.2 s |
+
+Folding is off here so that the segments pile up and the cost of a store that nobody is keeping in shape is visible.
+The same eight runs without that flag fold at the fourth and end on two segments, and they are the same wall clock.
 
 Every document in a run after the first is a lookup, an index and a deletion rather than an append, and it costs about two thirds of what the first run cost, because the first run is the one that reads the files off disk rather than out of the page cache.
 A lookup asks the key index of every segment in turn, so the cost of one grows with the segment count, and the run that ended with sixteen segments was not slower than the run that ended with four.
 
 What it does cost is the file.
-The documents that were replaced are still in the segments they were written into, so the store grows by a segment a run: 69.8 MB of segments after four runs and 139.4 MB after eight, with 10,888 live documents and 87,104 written throughout.
-The file itself is 134.2 MB longer than that, which is the log region, and it is sparse, so a store of a handful of documents is a long file that occupies almost nothing.
+The documents that were replaced are still in the segments they were written into, so the store grows by a segment a run: 68.9 MB of segments after four runs and 137.7 MB after eight, with 10,884 live documents and 87,072 written throughout.
+The file itself is 134.4 MB longer than that, which is the log region, and it is sparse, so a store of a handful of documents is a long file that occupies almost nothing.
 Reclaiming that is compaction.
 Half of it is here: `kura_core::compact::merge` folds segments into one holding their live documents, and the example beside it does that to a whole store and checks the result answers what the store answered.
-On the sixteen segment store the eight runs above left, 139.4 MB of segments holding 87,104 documents of which 10,888 are live:
+On the sixteen segment store the eight runs above left, 137.7 MB of segments holding 87,072 documents of which 10,884 are live:
 
 ```
 cargo run --release --example compact -- /tmp/docs.kura
@@ -406,15 +447,15 @@ cargo run --release --example compact -- /tmp/docs.kura
 
 ```
 merge wall                  0.36 s
-merge rate                 30076 docs/s
-merged documents           10888
-  left behind              76216
-merged terms              400588
-merged bytes            16522592
+merge rate                 29836 docs/s
+merged documents           10884
+  left behind              76188
+merged terms              391413
+merged bytes            16339149
   of the sources           11.9 %
 ```
 
-The dictionary is the part that shrinks furthest, from 3,679,160 entries across the sixteen segments to 400,588, because fifteen of every sixteen copies of a term were held only by documents somebody had already deleted.
+The dictionary is the part that shrinks furthest, from 3,603,768 entries across the sixteen segments to 391,413, because fifteen of every sixteen copies of a term were held only by documents somebody had already deleted.
 The merge held 37.5 MB of its own beyond the mapped file, which is the segment it was building.
 
 The other half is the commit that swaps the merged segment into the store in place of the segments it came from, and that is what `kura-cli compact` does:
@@ -426,26 +467,26 @@ The other half is the commit that swaps the merged segment into the store in pla
 ```
   segments                       16
     folding                      16
-  documents                   87104
-    live                      10888
-  file bytes              273637391
+  documents                   87072
+    live                      10884
+  file bytes              272130063
 
-  fold wall                    0.75 s
-  merged documents            10888
-    left behind               76216
-  merged terms               400588
-  merged bytes             16522592
-  stranded bytes          139214498
+  fold wall                    0.45 s
+  merged documents            10884
+    left behind               76188
+  merged terms               391413
+  merged bytes             16339149
+  stranded bytes          137705042
 
   segments                        1
-  documents                   10888
-    live                      10888
-  file bytes              290164064
+  documents                   10884
+    live                      10884
+  file bytes              288473293
   epoch                          18
 ```
 
 The file gets bigger, which is the part worth saying out loud.
-A commit appends, so the merged segment goes on the end and the sixteen it replaced stay where they are, holding 139.2 MB that nothing reads any more.
+A commit appends, so the merged segment goes on the end and the sixteen it replaced stay where they are, holding 137.7 MB that nothing reads any more.
 That space comes back when the file is rewritten and not before, because a query that started before the commit is still reading out of the segments the commit replaced.
 Reclaiming it is a separate piece of work from choosing what to fold.
 
@@ -454,13 +495,13 @@ The same three queries over the same store, both files warm, nine runs of each, 
 
 | query | matches | postings decoded before | after | median before | median after |
 | --- | --- | --- | --- | --- | --- |
-| goroutine channel | 656 | 5,792 | 724 | 156 µs | 29 µs |
-| context deadline exceeded | 890 | 7,920 | 990 | 153 µs | 31 µs |
-| garbage collector mark | 531 | 5,272 | 659 | 166 µs | 28 µs |
+| goroutine channel | 655 | 5,784 | 723 | 150 µs | 40 µs |
+| context deadline exceeded | 887 | 7,888 | 986 | 238 µs | 47 µs |
+| garbage collector mark | 529 | 5,256 | 657 | 241 µs | 37 µs |
 
 The match counts are the same on both sides, which is the check that matters: a fold that answered a different number would be a fold that lost or duplicated a document.
-What the fold takes away is the work of walking sixteen dictionaries and then throwing away seven postings in every eight, and the queries come out about five times faster for it.
-The part of the file a query reads goes from 132.7 MB to 15.8 MB at the same time, which is the number that decides how much of an index has to stay in memory.
+What the fold takes away is the work of walking sixteen dictionaries and then throwing away seven postings in every eight, and the queries come out four or five times faster for it.
+The part of the file a query reads goes from 131.4 MB to 15.6 MB at the same time, which is the number that decides how much of an index has to stay in memory.
 
 Choosing what to fold is `--due`, which asks the policy in `kura_core::policy` and folds the one run it says is due:
 

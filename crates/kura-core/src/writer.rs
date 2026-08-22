@@ -195,8 +195,8 @@ impl Writer {
     /// writer preparing against the view before it would be a compaction that
     /// refused the next batch from each of them.
     #[must_use]
-    pub fn store(&self) -> Held<'_> {
-        Held {
+    pub fn store(&self) -> Locked<'_> {
+        Locked {
             writer: self,
             store: held(&self.store),
         }
@@ -377,20 +377,20 @@ fn held<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// The store, held, from [`Writer::store`].
+/// The store, locked, from [`Writer::store`].
 ///
 /// Reads and writes as the store does. Handing it back is what lets the next
 /// commit happen, and is where the shared view catches up with whatever was done
 /// through it.
 #[derive(Debug)]
-pub struct Held<'a> {
+pub struct Locked<'a> {
     /// The writer whose view is behind this.
     writer: &'a Writer,
     /// The store.
     store: MutexGuard<'a, Store>,
 }
 
-impl core::ops::Deref for Held<'_> {
+impl core::ops::Deref for Locked<'_> {
     type Target = Store;
 
     fn deref(&self) -> &Self::Target {
@@ -398,13 +398,13 @@ impl core::ops::Deref for Held<'_> {
     }
 }
 
-impl core::ops::DerefMut for Held<'_> {
+impl core::ops::DerefMut for Locked<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.store
     }
 }
 
-impl Drop for Held<'_> {
+impl Drop for Locked<'_> {
     fn drop(&mut self) {
         self.writer.catch_up(&self.store);
     }
