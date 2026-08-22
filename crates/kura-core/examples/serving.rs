@@ -65,6 +65,15 @@
 //! the writing row was. Two subtractions, each of a row against its own
 //! control, and what is read is the two of them against each other.
 //!
+//! By the byte leaves one more fork, and the two sides of it want different
+//! fixes. The bytes are on their way to a file, and the reader is about to walk
+//! them. So a last row builds the same batches and writes each finished segment
+//! to a file of its own beside the store, commits none of them, and asks its
+//! questions of the same store that never changes that the no commits row asks
+//! its questions of. The same megabytes go somewhere instead of nowhere and
+//! nothing else about the two rows differs, so they are read against each other
+//! whole rather than at a matched count.
+//!
 //! The count all this is held at is what the middle query of the writing
 //! condition walked rather than what the store held when the round was over, and
 //! the two are not close. A writing condition that finishes at thirteen segments
@@ -145,6 +154,7 @@
 #![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 
 use std::collections::HashMap;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -551,6 +561,60 @@ fn inside(conditions: &[(&str, &Answered)]) {
     }
 }
 
+/// The writing row taken apart into the four things it is, each step read
+/// against the row above it rather than against quiet.
+///
+/// Against quiet is what a reader would want and it is not what the four allow.
+/// A percentage of a percentage is not a percentage of the floor, and printing
+/// them as though they were would be the sort of arithmetic that makes a table
+/// wrong.
+fn steps(quiet: &Answered, writing: &Answered, folding: &Answered, apart: &Apart) {
+    let (settled, spread, busy) = (&apart.settled, &apart.spread, &apart.busy);
+    let (Some(spread), Some(busy)) = (spread, busy) else {
+        return;
+    };
+    println!(
+        "the middle query of the writing condition walked {} segments and the one at the end of it {}, and folding held the middle at {}",
+        writing.walked(),
+        writing.segments,
+        folding.walked(),
+    );
+    println!(
+        "of that, the documents the writing adds cost {:.0} percent at the median and {:.0} at p99, holding them across {} segments rather than one costs {:.0} and {:.0} more, and the cores the threads take cost {:.0} and {:.0} on top of that",
+        share(settled.median(), quiet.median()),
+        share(settled.p99(), quiet.p99()),
+        spread.segments,
+        share(spread.median(), settled.median()),
+        share(spread.p99(), settled.p99()),
+        share(busy.median(), spread.median()),
+        share(busy.p99(), spread.p99()),
+    );
+    if let (Some(all), Some(most)) = (writing.wrote_in(), busy.wrote_in()) {
+        println!(
+            "the threads with the commits taken out were held to {most:.2?} over the same files against the {all:.2?} the writing took, so the cores they wanted are the cores the writing wanted"
+        );
+    }
+    commits("the commits", writing, busy, spread.segments);
+    // Both of these rows hold one segment count for the whole round and query a
+    // store that never changes, so they are read whole rather than at a matched
+    // count, and what is between them is the megabytes going to a file rather
+    // than nowhere.
+    if let Some(aside) = &apart.aside {
+        println!(
+            "writing the same segments to a file of their own instead of throwing them away cost {:.0} percent at the median, {:.0} at p95 and {:.0} at p99, over rows that both held {} segments all round",
+            share(aside.median(), busy.median()),
+            share(aside.at(95), busy.at(95)),
+            share(aside.p99(), busy.p99()),
+            spread.segments,
+        );
+    }
+    println!(
+        "taken whole rather than at a matched count that comes to {:.0} percent, which is the ramp from one segment to {} and not the commits, since a row that holds one count all round has no cheap queries in it",
+        share(writing.median(), busy.median()),
+        writing.segments,
+    );
+}
+
 /// Everything a run says under its table.
 fn report(
     quiet: &Answered,
@@ -562,6 +626,7 @@ fn report(
     load: Load,
 ) {
     let (settled, spread, busy) = (&apart.settled, &apart.spread, &apart.busy);
+    let aside = &apart.aside;
 
     println!();
     if let (Some(w), Some(f)) = (writing.wrote_in(), folding.wrote_in()) {
@@ -576,39 +641,7 @@ fn report(
         share(folding.median(), quiet.median()),
         share(folding.p99(), quiet.p99()),
     );
-    // The same cost taken apart. Each step is against the row above it rather
-    // than against quiet, because the four do not add up: a percentage of a
-    // percentage is not a percentage of the floor, and printing them as though
-    // they were would be the sort of arithmetic that makes a table wrong.
-    if let (Some(spread), Some(busy)) = (spread, busy) {
-        println!(
-            "the middle query of the writing condition walked {} segments and the one at the end of it {}, and folding held the middle at {}",
-            writing.walked(),
-            writing.segments,
-            folding.walked(),
-        );
-        println!(
-            "of that, the documents the writing adds cost {:.0} percent at the median and {:.0} at p99, holding them across {} segments rather than one costs {:.0} and {:.0} more, and the cores the threads take cost {:.0} and {:.0} on top of that",
-            share(settled.median(), quiet.median()),
-            share(settled.p99(), quiet.p99()),
-            spread.segments,
-            share(spread.median(), settled.median()),
-            share(spread.p99(), settled.p99()),
-            share(busy.median(), spread.median()),
-            share(busy.p99(), spread.p99()),
-        );
-        if let (Some(all), Some(most)) = (writing.wrote_in(), busy.wrote_in()) {
-            println!(
-                "the threads with the commits taken out were held to {most:.2?} over the same files against the {all:.2?} the writing took, so the cores they wanted are the cores the writing wanted"
-            );
-        }
-        commits("the commits", writing, busy, spread.segments);
-        println!(
-            "taken whole rather than at a matched count that comes to {:.0} percent, which is the ramp from one segment to {} and not the commits, since a row that holds one count all round has no cheap queries in it",
-            share(writing.median(), busy.median()),
-            writing.segments,
-        );
-    }
+    steps(quiet, writing, folding, apart);
     commits("the syncs", writing, loosely, writing.walked());
     // The one that tells a cost per byte from a cost per commit. It is the same
     // subtraction as the line above the syncs, done a second time with a
@@ -648,6 +681,7 @@ fn report(
             ("quiet, all of it", Some(settled)),
             ("quiet, spread out", spread.as_ref()),
             ("threads, no commits", busy.as_ref()),
+            ("threads, segments written aside", aside.as_ref()),
         ];
         for (name, answered) in rows
             .into_iter()
@@ -732,6 +766,9 @@ struct Apart {
     /// The same store as [`Self::spread`], with the writer threads reading the
     /// same files and building the same segments and committing none of them.
     busy: Option<Answered>,
+    /// The same again, with each thread writing the segments it builds to a
+    /// file of its own instead of throwing them away unwritten.
+    aside: Option<Answered>,
 }
 
 /// The small batch row and the row it is read against.
@@ -793,7 +830,7 @@ fn taken_apart(
     settled.tell(&format!("quiet, {added} more, 1 seg"));
     std::fs::remove_file(&one).ok();
 
-    let (mut spread, mut busy) = (None, None);
+    let (mut spread, mut busy, mut aside) = (None, None, None);
     if count > 1 {
         let measured = rounds(&many, directory, "spread", queries, Doing::Nothing, load)?;
         measured.tell(&format!("quiet, {added} more, {count}"));
@@ -810,6 +847,19 @@ fn taken_apart(
             load,
         )?;
         churning.tell("threads, no commits");
+        let written = rounds(
+            &many,
+            directory,
+            "aside",
+            queries,
+            Doing::Aside {
+                files: rest,
+                pace,
+                at: directory,
+            },
+            load,
+        )?;
+        written.tell("threads, segments written aside");
         if count != segments {
             // The writing condition's segments are full batches and so are
             // these, so the two land on the same count unless a thread there
@@ -821,12 +871,14 @@ fn taken_apart(
         }
         spread = Some(measured);
         busy = Some(churning);
+        aside = Some(written);
     }
     std::fs::remove_file(&many).ok();
     Ok(Apart {
         settled,
         spread,
         busy,
+        aside,
     })
 }
 
@@ -1276,6 +1328,24 @@ enum Doing<'a> {
         /// what a batch of the writing row held.
         most: usize,
     },
+    /// The same as [`Doing::Busy`], with the segment written to a file of its
+    /// own beside the store and thrown away rather than thrown away unwritten.
+    ///
+    /// This is the row that says whether what a commit costs a reader is the
+    /// bytes reaching a file at all or something the store does with them. The
+    /// store it queries never changes, exactly as in [`Doing::Busy`], so the
+    /// two are read against each other whole rather than at a matched count,
+    /// and the only difference between them is that the same megabytes are
+    /// going somewhere instead of nowhere. No sync, because #176 already
+    /// measured what those cost a reader and it was nothing.
+    Aside {
+        /// The files the threads work through.
+        files: &'a [PathBuf],
+        /// How long the writing condition took over the same files.
+        pace: Duration,
+        /// Where the file each thread writes its segments to goes.
+        at: &'a Path,
+    },
     /// The same as [`Doing::Writing`], with the store asking the drive to order
     /// the writes rather than to finish them.
     ///
@@ -1295,6 +1365,7 @@ impl<'a> Doing<'a> {
         match self {
             Doing::Nothing => None,
             Doing::Busy { files, .. }
+            | Doing::Aside { files, .. }
             | Doing::Writing(files)
             | Doing::Folding(files)
             | Doing::Loosely(files)
@@ -1314,7 +1385,7 @@ impl<'a> Doing<'a> {
     /// held to a clock rather than let run.
     fn pace(self) -> Option<Duration> {
         match self {
-            Doing::Busy { pace, .. } => Some(pace),
+            Doing::Busy { pace, .. } | Doing::Aside { pace, .. } => Some(pace),
             _ => None,
         }
     }
@@ -1327,12 +1398,19 @@ impl<'a> Doing<'a> {
         )
     }
 
-    /// How much text goes into a batch before it is handed over.
     /// How many documents a batch takes before it commits.
     fn most(self) -> usize {
         match self {
             Doing::Smaller { most, .. } | Doing::Busy { most, .. } => most,
             _ => usize::MAX,
+        }
+    }
+
+    /// Where the thrown away segments are written, when they are written.
+    fn aside(self) -> Option<&'a Path> {
+        match self {
+            Doing::Aside { at, .. } => Some(at),
+            _ => None,
         }
     }
 
@@ -1573,6 +1651,9 @@ fn add(
     began: Instant,
 ) -> Result<(), String> {
     let (commit, most, pace) = (doing.commits(), doing.most(), doing.pace());
+    // One file per thread per round, truncated on the way in and removed on the
+    // way out, so what the drive is asked to hold is a round rather than a run.
+    let aside = doing.aside().map(scratch).transpose()?;
     let mut again: Vec<usize> = Vec::new();
     let mut drained = false;
     loop {
@@ -1607,9 +1688,16 @@ fn add(
             }
         }
         if !batch.is_empty() {
-            let prepared = batch.finish().map_err(|problem| problem.to_string())?;
+            let mut prepared = batch.finish().map_err(|problem| problem.to_string())?;
             drop(view);
             if !commit {
+                if let (Some((file, _)), Some((segment, _))) =
+                    (aside.as_ref(), prepared.segment.take())
+                {
+                    segment
+                        .write_to(&mut &*file)
+                        .map_err(|problem| problem.to_string())?;
+                }
                 drop(prepared);
                 hold(files.len(), next, began, pace);
                 if drained {
@@ -1630,6 +1718,29 @@ fn add(
         if drained && again.is_empty() {
             return Ok(());
         }
+    }
+}
+
+/// A file for one thread of one round to write its thrown away segments to.
+///
+/// Named after a counter rather than after the thread, since the threads of a
+/// round run at once and the rounds do not, and removed by the guard when the
+/// thread that made it is done with it.
+fn scratch(at: &Path) -> Result<(File, Scrap), String> {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let mine = NEXT.fetch_add(1, Ordering::Relaxed);
+    let path = at.join(format!("kura-serving-aside-{mine}.tmp"));
+    let file =
+        std::fs::File::create(&path).map_err(|problem| format!("{}: {problem}", path.display()))?;
+    Ok((file, Scrap(path)))
+}
+
+/// Removes the file it names when the thread writing to it is done.
+struct Scrap(PathBuf);
+
+impl Drop for Scrap {
+    fn drop(&mut self) {
+        std::fs::remove_file(&self.0).ok();
     }
 }
 
