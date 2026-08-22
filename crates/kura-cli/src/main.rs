@@ -130,7 +130,9 @@ options:
   -k <n>        how many results, for search and explain (default 10)
   -o <file>     where to write, for index, topics and migrate
   --store       for index, add a segment to a store rather than write a bare one
-  --memory <size>       for index, start a new segment once the writer holds this much
+  --memory <size>       for index into a store, start a new segment once the
+                writer holds this much, or none to let it hold everything
+                (default 128m)
   --flush-every <size>  for index, start a new segment once this much text has gone in
   --durability <reach>  for index into a store, what a commit survives:
                 platter, the power going, which is the default
@@ -164,8 +166,10 @@ nothing in it to replace.
 
 --memory and --flush-every both take a plain number of bytes or a number with k,
 m or g after it, and each of them bounds how much of a corpus an index run holds
-at once. Without one of them a run keeps every posting in memory until the last
-file has been read, so the memory it needs is the size of what it was pointed at.
+at once. A run into a store is bounded at 128m without either of them, and
+--memory none turns that off, which makes the memory the run needs the size of
+what it was pointed at. A run without --store is unbounded either way, because
+what it writes is one segment and there is nowhere to put a second.
 
 --memory is the one to reach for. It is measured in what the writer is holding,
 which is the number the run reports as held, so the budget and the report are in
@@ -789,6 +793,22 @@ fn tell_held(peak: Held) {
     );
 }
 
+/// How much a run into a store lets a writer hold before it starts a new
+/// segment, unless it was told a figure of its own.
+///
+/// It is a ceiling on the memory rather than a target for the segment size, and
+/// the two differ: a writer that has just been given a document larger than what
+/// was left of the budget is over it until the segment is written.
+///
+/// On a tree of 1.0 GB of text it changes nothing, because the log ring fills
+/// first and a full log commits, so the run is the seven commits and the 76.0 MB
+/// held that it was without it. That is the point of having it rather than an
+/// argument against it. Without it what bounds a run is the length of the log,
+/// which is a property of the store the run was pointed at, and a store with a
+/// larger log or a corpus that makes more postings per byte of text would be
+/// unbounded again.
+const DEFAULT_MEMORY: u64 = 128 << 20;
+
 /// What an index run was asked to do, once its arguments have been read.
 struct Plan {
     inputs: Vec<PathBuf>,
@@ -812,6 +832,7 @@ impl Plan {
         let mut into_store = false;
         let mut flush_every: Option<u64> = None;
         let mut memory: Option<u64> = None;
+        let mut unbounded = false;
         let mut durability = Reach::default();
         let mut at = 0;
         while at < args.len() {
@@ -829,7 +850,13 @@ impl Plan {
                     let value = args
                         .get(at)
                         .ok_or_else(|| Failure::usage("--memory wants a size"))?;
-                    memory = Some(size(value)?);
+                    if value == "none" {
+                        unbounded = true;
+                        memory = None;
+                    } else {
+                        unbounded = false;
+                        memory = Some(size(value)?);
+                    }
                 }
                 "--durability" => {
                     at += 1;
@@ -858,7 +885,7 @@ impl Plan {
             // what this option does is write more than one.
             return Err(Failure::usage("--flush-every needs --store to flush into"));
         }
-        if memory.is_some() && !into_store {
+        if (memory.is_some() || unbounded) && !into_store {
             return Err(Failure::usage("--memory needs --store to flush into"));
         }
         if durability != Reach::default() && !into_store {
@@ -883,6 +910,14 @@ impl Plan {
             return Err(Failure::usage(
                 "--memory and --flush-every are two answers to the same question, so pick one",
             ));
+        }
+        // A run into a store is bounded unless somebody says otherwise, because
+        // the alternative is a run whose memory is the size of what it was
+        // pointed at and nobody asks for that on purpose. A run given
+        // --flush-every has already said how it wants to be bounded, and a bare
+        // index has nowhere to flush a second segment to.
+        if into_store && memory.is_none() && flush_every.is_none() && !unbounded {
+            memory = Some(DEFAULT_MEMORY);
         }
         Ok(Self {
             inputs,
@@ -2352,7 +2387,37 @@ mod tests {
         assert_eq!(plan.flush_every, None);
 
         let plan = Plan::read(&args(&["--store"])).expect("a plan");
+        assert_eq!(plan.memory, Some(DEFAULT_MEMORY));
+    }
+
+    #[test]
+    fn a_run_into_a_store_is_bounded_unless_it_is_told_not_to_be() {
+        let args = |extra: &[&str]| {
+            let mut args = vec!["corpus".to_string(), "-o".to_string(), "out".to_string()];
+            args.extend(extra.iter().map(|part| (*part).to_string()));
+            args
+        };
+        // Asked for, and the answer is the figure that was asked for.
+        let plan = Plan::read(&args(&["--store", "--memory", "32m"])).expect("a plan");
+        assert_eq!(plan.memory, Some(32 << 20));
+
+        // Turned off on purpose, which is the only way to get a run that holds a
+        // whole corpus.
+        let plan = Plan::read(&args(&["--store", "--memory", "none"])).expect("a plan");
         assert_eq!(plan.memory, None);
+
+        // Bounded another way already, so the default would be a second answer
+        // to a question that has one.
+        let plan = Plan::read(&args(&["--store", "--flush-every", "8m"])).expect("a plan");
+        assert_eq!(plan.memory, None);
+        assert_eq!(plan.flush_every, Some(8 << 20));
+
+        // Nowhere to flush to.
+        let plan = Plan::read(&args(&[])).expect("a plan");
+        assert_eq!(plan.memory, None);
+
+        // Turning it off still needs somewhere to have been flushing to.
+        assert!(Plan::read(&args(&["--memory", "none"])).is_err());
     }
 
     #[test]
