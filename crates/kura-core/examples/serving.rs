@@ -22,6 +22,27 @@
 //! - writing and folding, the same threads with a keeper beside them, which
 //!   holds the segment count down and takes the store to do it
 //!
+//! Two more rows follow them, both quiet, and they are there to take the first
+//! three apart. A writing row differs from the quiet row in three things at
+//! once: by the end it holds twice the documents, it holds them across a dozen
+//! or so segments rather than one, and there are writers on the cores while the
+//! query runs. So the run builds the store the writing condition ends with, one
+//! thread and nothing reading, folds a copy of it to one segment and another
+//! copy to a chosen segment count, and asks the same questions of both with
+//! nothing else happening. The first says what the extra documents cost, the
+//! second says what the segment count costs on top of them, and what is left
+//! between the second and the writing row is the writers.
+//!
+//! The count the second of them is held at is what the middle query of the
+//! writing condition walked rather than what the store held when the round was
+//! over, and the two are not close. A writing condition that finishes at
+//! thirteen segments started at one, so its middle query walked five, and a
+//! quiet row held at thirteen for a whole round is being compared against
+//! something no query in the writing row ever saw. Held at thirteen it came out
+//! slower than the writing row it was there to explain, which is how that got
+//! noticed. So every query records what its own view held, after its clock has
+//! stopped, and the middle of those is the count.
+//!
 //! The second and third are the pair that matters. Folding is not free for a
 //! reader: it takes the store for the length of a fold, and it rewrites the
 //! segments the reader is about to open. Not folding is not free either, for
@@ -172,7 +193,9 @@ const KEEPING_UP: f64 = 0.99;
 fn main() {
     let mut args = std::env::args().skip(1);
     let Some(corpus) = args.next().map(PathBuf::from) else {
-        eprintln!("usage: serving <corpus> [<directory>] [threads=<n>] [<queries per second> ...]");
+        eprintln!(
+            "usage: serving <corpus> [<directory>] [threads=<n>] [readers=<n>] [<queries per second> ...]"
+        );
         eprintln!("the corpus is a directory of text files, and the store goes in the directory");
         eprintln!("a rate is how many queries a second the reader offers, and without one it asks");
         eprintln!("as fast as it can");
@@ -326,6 +349,14 @@ fn conditions(
     )?;
     folding.tell("writing and folding");
 
+    // The count the second quiet row is held at is what the middle query of the
+    // writing condition walked, not what the store held when the round was
+    // over. The writing condition starts at one segment and climbs, so the
+    // count at the end is what its last query paid and holding a quiet row
+    // there for a whole round would be comparing against something no query in
+    // the writing row ever saw.
+    let (settled, spread) = quiet_ends(base, directory, queries, rest, load, writing.walked())?;
+
     println!();
     if let (Some(w), Some(f)) = (writing.wrote_in(), folding.wrote_in()) {
         println!(
@@ -339,16 +370,44 @@ fn conditions(
         share(folding.median(), quiet.median()),
         share(folding.p99(), quiet.p99()),
     );
+    // The same cost taken apart. Each step is against the row above it rather
+    // than against quiet, because the three do not add up: a percentage of a
+    // percentage is not a percentage of the floor, and printing them as though
+    // they were would be the sort of arithmetic that makes a table wrong.
+    if let Some(spread) = &spread {
+        println!(
+            "the middle query of the writing condition walked {} segments and the one at the end of it {}, and folding held the middle at {}",
+            writing.walked(),
+            writing.segments,
+            folding.walked(),
+        );
+        println!(
+            "of that, the documents the writing adds cost {:.0} percent at the median and {:.0} at p99, holding them across {} segments rather than one costs {:.0} and {:.0} more, and the writers on top of that cost {:.0} and {:.0}",
+            share(settled.median(), quiet.median()),
+            share(settled.p99(), quiet.p99()),
+            spread.segments,
+            share(spread.median(), settled.median()),
+            share(spread.p99(), settled.p99()),
+            share(writing.median(), spread.median()),
+            share(writing.p99(), spread.p99()),
+        );
+    }
     if let Some(rate) = load.rate {
         // A condition that did not hold the offered rate has a queue that grew
         // for the whole round, so its percentiles are how long the round was
         // rather than how long a query takes, and saying so is the difference
         // between a measurement and a misleading table.
-        for (name, answered) in [
-            ("quiet", &quiet),
-            ("writing", &writing),
-            ("writing and folding", &folding),
-        ] {
+        let rows = [
+            ("quiet", Some(&quiet)),
+            ("writing", Some(&writing)),
+            ("writing and folding", Some(&folding)),
+            ("quiet, all of it", Some(&settled)),
+            ("quiet, spread out", spread.as_ref()),
+        ];
+        for (name, answered) in rows
+            .into_iter()
+            .filter_map(|(name, row)| Some((name, row?)))
+        {
             if answered.rate() < rate * KEEPING_UP {
                 println!(
                     "{name} got through {:.0} of the {rate:.0} offered, so it did not keep up and what it reports is a backlog rather than a latency",
@@ -372,6 +431,58 @@ fn conditions(
         );
     }
     Ok(())
+}
+
+/// The two quiet rows the writing row is taken apart against.
+///
+/// The writing row differs from the quiet row in three things at once. By the
+/// end it holds twice the documents, it holds them across a dozen or so
+/// segments rather than one, and there are writers on the cores while the query
+/// runs. So the store the writing condition ends up with is built here, once,
+/// and folded to one segment and then to the count the writing condition
+/// reached. Both are asked the same questions with nothing else happening, so
+/// the first row is what the documents cost and the second is what the segments
+/// cost on top of them.
+///
+/// The second row is skipped, and comes back as nothing, when the writing
+/// condition ended at one segment, since it would be the first row again.
+fn quiet_ends(
+    base: &Path,
+    directory: &Path,
+    queries: &[String],
+    rest: &[PathBuf],
+    load: Load,
+    segments: usize,
+) -> Result<(Answered, Option<Answered>), String> {
+    let end = directory.join("kura-serving-end.kura");
+    let held = settle(base, &end, rest)?;
+    let one = directory.join("kura-serving-end-one.kura");
+    folded(&end, &one, 1)?;
+    let settled = rounds(&one, directory, "settled", queries, None, load)?;
+    settled.tell("quiet, all of it");
+    std::fs::remove_file(&one).ok();
+
+    let spread = if segments > 1 {
+        let many = directory.join("kura-serving-end-many.kura");
+        let count = folded(&end, &many, segments)?;
+        let measured = rounds(&many, directory, "spread", queries, None, load)?;
+        measured.tell(&format!("quiet, in {count} segments"));
+        std::fs::remove_file(&many).ok();
+        if count != segments {
+            // A fold cannot make segments it was not given, and [`settle`]
+            // writes small enough that it never should have to. If this line
+            // ever prints, the row above it is not the comparison it claims to
+            // be and the budget in [`settle`] wants lowering.
+            println!(
+                "that row was asked for {segments} segments and the store it was folded from held {held}"
+            );
+        }
+        Some(measured)
+    } else {
+        None
+    };
+    std::fs::remove_file(&end).ok();
+    Ok((settled, spread))
 }
 
 /// How much more one time is than another, as a percentage.
@@ -422,36 +533,12 @@ fn fill(path: &Path, files: &[PathBuf]) -> Result<(Vec<String>, u64), String> {
     let mut analyzer = Analyzer::new();
     let mut counts: HashMap<Vec<u8>, u64> = HashMap::new();
     let mut bytes = 0u64;
-
-    let mut at = 0;
-    while at < files.len() {
-        let view = store.view().map_err(|problem| problem.to_string())?;
-        let mut batch = Batch::with_budget(&view, BUDGET).map_err(|problem| problem.to_string())?;
-        while at < files.len() {
-            let path = &files[at];
-            at += 1;
-            let Some(text) = text_of(path) else { continue };
-            bytes += text.len() as u64;
-            analyzer.analyze(&text, |term, _| {
-                *counts.entry(term.to_vec()).or_default() += 1;
-            });
-            let key = path.to_string_lossy().into_owned();
-            batch
-                .add_keyed(key.as_bytes(), &text)
-                .map_err(|problem| problem.to_string())?;
-            if batch.is_full() {
-                break;
-            }
-        }
-        if batch.is_empty() {
-            break;
-        }
-        let prepared = batch.finish().map_err(|problem| problem.to_string())?;
-        drop(view);
-        prepared
-            .commit(&mut store, 1_700_000_001, 1)
-            .map_err(|problem| problem.to_string())?;
-    }
+    index_into(&mut store, files, |text| {
+        bytes += text.len() as u64;
+        analyzer.analyze(text, |term, _| {
+            *counts.entry(term.to_vec()).or_default() += 1;
+        });
+    })?;
 
     let segments = store.manifest().segments.len();
     if segments > 1 {
@@ -471,6 +558,109 @@ fn fill(path: &Path, files: &[PathBuf]) -> Result<(Vec<String>, u64), String> {
     Ok((queries, bytes))
 }
 
+/// Adds files to a store, one batch of [`BUDGET`] at a time, on this thread.
+///
+/// `saw` is handed the text of every file that went in, which is how the first
+/// pass counts the vocabulary the queries come out of. The conditions do their
+/// writing through [`Writer`] rather than this, because they are measuring what
+/// several threads handing batches over costs a reader. This is for building
+/// the stores they are measured against, where there is nothing to race with
+/// and one thread is the simplest thing that works.
+fn index_into(store: &mut Store, files: &[PathBuf], saw: impl FnMut(&str)) -> Result<(), String> {
+    index_into_with(store, files, BUDGET, saw)
+}
+
+/// The same thing with the batch size given rather than taken from [`BUDGET`].
+fn index_into_with(
+    store: &mut Store,
+    files: &[PathBuf],
+    budget: u64,
+    mut saw: impl FnMut(&str),
+) -> Result<(), String> {
+    let mut at = 0;
+    while at < files.len() {
+        let view = store.view().map_err(|problem| problem.to_string())?;
+        let mut batch = Batch::with_budget(&view, budget).map_err(|problem| problem.to_string())?;
+        while at < files.len() {
+            let path = &files[at];
+            at += 1;
+            let Some(text) = text_of(path) else { continue };
+            saw(&text);
+            let key = path.to_string_lossy().into_owned();
+            batch
+                .add_keyed(key.as_bytes(), &text)
+                .map_err(|problem| problem.to_string())?;
+            if batch.is_full() {
+                break;
+            }
+        }
+        if batch.is_empty() {
+            break;
+        }
+        let prepared = batch.finish().map_err(|problem| problem.to_string())?;
+        drop(view);
+        prepared
+            .commit(&mut *store, 1_700_000_001, 1)
+            .map_err(|problem| problem.to_string())?;
+    }
+    Ok(())
+}
+
+/// Builds the store the writing condition ends up with.
+///
+/// The same documents in the same order, added by one thread with nothing
+/// reading and nothing folding, so that a quiet condition can be run against
+/// the end of the writing condition rather than against the start of it.
+/// Returns how many segments it came to, which is the top of what [`folded`]
+/// can be asked for.
+///
+/// The batches are a quarter of the size the conditions use, which is not the
+/// same shape the writing condition leaves behind and is deliberate. One thread
+/// committing in order does not land on the same segment count as four threads
+/// racing to, and it came out two short of it when it used the same budget. A
+/// fold can take segments away and cannot make them, so the way to land on a
+/// count exactly is to overshoot it and fold back. What that leaves is the same
+/// documents in the same number of segments, with the newest ones smaller than
+/// the writing condition's, and the count is what a query pays for.
+fn settle(base: &Path, path: &Path, files: &[PathBuf]) -> Result<usize, String> {
+    std::fs::remove_file(path).ok();
+    std::fs::copy(base, path).map_err(|problem| format!("{}: {problem}", path.display()))?;
+    let mut store = Store::open(path).map_err(|problem| problem.to_string())?;
+    index_into_with(&mut store, files, BUDGET / 4, |_| ())?;
+    Ok(store.manifest().segments.len())
+}
+
+/// Copies a store and folds it down to a segment count.
+///
+/// The newest segments are left where they are and everything older is folded
+/// into one, so two stores made this way from the same source hold the same
+/// documents and differ in the segment count and in nothing else. Returns what
+/// it reached, which is what was asked for unless the store did not hold enough
+/// segments to fold that far.
+fn folded(from: &Path, path: &Path, want: usize) -> Result<usize, String> {
+    std::fs::remove_file(path).ok();
+    std::fs::copy(from, path).map_err(|problem| format!("{}: {problem}", path.display()))?;
+    let mut store = Store::open(path).map_err(|problem| problem.to_string())?;
+    let held = store.manifest().segments.len();
+    if held > want {
+        store
+            .compact(0..held - want + 1, 1_700_000_002, 2)
+            .map_err(|problem| problem.to_string())?;
+    }
+    Ok(store.manifest().segments.len())
+}
+
+/// What one reader thread came back with.
+struct Asked {
+    /// How long each of its queries took, in microseconds.
+    times: Vec<f64>,
+    /// How long each took counting the wait for its turn, in microseconds,
+    /// which is empty unless a rate was offered.
+    waited: Vec<f64>,
+    /// How many segments each of them walked.
+    walked: Vec<usize>,
+}
+
 /// What one condition came to.
 #[derive(Default)]
 struct Answered {
@@ -479,6 +669,8 @@ struct Answered {
     /// How long each query took counting the wait for its turn, in
     /// microseconds, which is empty unless a rate was offered.
     waited: Vec<f64>,
+    /// How many segments each query walked.
+    walked: Vec<usize>,
     /// How many segments the store held when it was over.
     segments: usize,
     /// How long the writing took in each round, on the two conditions that
@@ -512,6 +704,21 @@ impl Answered {
     /// What the query took at a percentile, in microseconds.
     fn at(&self, percentile: usize) -> f64 {
         percentile_of(&self.times, percentile)
+    }
+
+    /// How many segments the middle query of the condition walked.
+    ///
+    /// Not the same thing as what the store held when it was over, on a
+    /// condition that was writing. That store started at one segment and
+    /// finished at a dozen, so the count at the end is what the last query paid
+    /// and this is what a query paid.
+    fn walked(&self) -> usize {
+        if self.walked.is_empty() {
+            return self.segments;
+        }
+        let mut sorted = self.walked.clone();
+        sorted.sort_unstable();
+        sorted[sorted.len() / 2]
     }
 
     /// What the client waited at a percentile, in microseconds.
@@ -591,6 +798,7 @@ fn rounds(
         let round = measure(base, directory, name, queries, writing, load)?;
         pooled.times.extend(round.times);
         pooled.waited.extend(round.waited);
+        pooled.walked.extend(round.walked);
         pooled.segments = round.segments;
         pooled.ingest.extend(round.ingest);
         pooled.span += round.span;
@@ -655,18 +863,19 @@ fn measure(
         }
         let took = started.elapsed();
         stop.store(true, Ordering::Release);
-        let (mut times, mut waited) = (Vec::new(), Vec::new());
+        let (mut times, mut waited, mut walked) = (Vec::new(), Vec::new(), Vec::new());
         for handle in asking {
-            let (theirs, waits) = handle
+            let theirs = handle
                 .join()
                 .unwrap_or_else(|_| Err("a reader stopped".into()))?;
-            times.extend(theirs);
-            waited.extend(waits);
+            times.extend(theirs.times);
+            waited.extend(theirs.waited);
+            walked.extend(theirs.walked);
         }
-        Ok::<_, String>((times, waited, took))
+        Ok::<_, String>((times, waited, walked, took))
     });
 
-    let (times, waited, took) = outcome?;
+    let (times, waited, walked, took) = outcome?;
     let segments = writer.view().len();
     drop(writer);
     std::fs::remove_file(&path).ok();
@@ -674,6 +883,7 @@ fn measure(
     Ok(Answered {
         times,
         waited,
+        walked,
         segments,
         ingest: writing.map(|_| took).into_iter().collect(),
         span: took,
@@ -696,9 +906,10 @@ fn ask(
     rate: Option<f64>,
     opened: Instant,
     turn: &AtomicU64,
-) -> Result<(Vec<f64>, Vec<f64>), String> {
+) -> Result<Asked, String> {
     let mut times = Vec::new();
     let mut waited = Vec::new();
+    let mut walked = Vec::new();
     while !stop.load(Ordering::Acquire) {
         // The turn is taken from the counter every reader shares, so which
         // question gets asked and when it was due are both properties of the
@@ -728,8 +939,16 @@ fn ask(
         if let Some(due) = due {
             waited.push(done.duration_since(due).as_secs_f64() * 1_000_000.0);
         }
+        // After the clock has stopped, since it is bookkeeping rather than part
+        // of the query. The view is the one the query ran against, so this is
+        // what that query walked and not what the store holds now.
+        walked.push(view.len());
     }
-    Ok((times, waited))
+    Ok(Asked {
+        times,
+        waited,
+        walked,
+    })
 }
 
 /// One writer, taking files off the shared counter until they run out.
