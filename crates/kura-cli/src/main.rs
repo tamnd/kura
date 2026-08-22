@@ -57,6 +57,7 @@ use kura_core::index::{Held, Reader, Writer};
 use kura_core::ingest::{self, Logged};
 use kura_core::manifest;
 use kura_core::mapping::Map;
+use kura_core::policy::{Policy, Pressure};
 use kura_core::residency;
 use kura_core::search::Searcher;
 use kura_core::segment::{Segment, Writer as SegmentWriter};
@@ -134,6 +135,8 @@ options:
                 writer holds this much, or none to let it hold everything
                 (default 128m)
   --flush-every <size>  for index, start a new segment once this much text has gone in
+  --no-fold     for index into a store, leave the segments where they are
+                rather than folding when level zero fills
   --durability <reach>  for index into a store, what a commit survives:
                 platter, the power going, which is the default
                 device, the process dying but not the power going
@@ -165,6 +168,15 @@ one wrote rather than putting a second copy of it in. The run says how many
 documents were new and how many replaced one. A run without --store writes a
 single segment and keys nothing, because a file is not a store and there is
 nothing in it to replace.
+
+a run with --store also keeps the store in shape as it goes. Every batch it
+commits adds a segment at level zero, eight of them is a fold, and the run pays
+for that fold itself because nothing else is there to. At twelve it stops taking
+documents until level zero is back under the cap, which is the point where
+carrying on is what is making the store slow to read. The run says how many
+folds it did and how much of its time went into them, and --no-fold turns the
+whole of it off, which leaves a store with as many segments as the run had
+batches.
 
 --memory and --flush-every both take a plain number of bytes or a number with k,
 m or g after it, and each of them bounds how much of a corpus an index run holds
@@ -834,6 +846,13 @@ struct Plan {
     into_store: bool,
     flush_every: Option<u64>,
     memory: Option<u64>,
+    /// Whether the run keeps the store it is writing to in shape as it goes.
+    ///
+    /// On by default, because a run that leaves a store with forty segments in
+    /// it has handed somebody a store that answers every question forty times.
+    /// Off is for measuring what it costs and for a run that would rather do
+    /// the folding itself afterwards.
+    fold: bool,
     /// How far a commit of this run makes its writes go.
     ///
     /// Here rather than assumed, because the answer costs a factor of four on
@@ -851,11 +870,13 @@ impl Plan {
         let mut flush_every: Option<u64> = None;
         let mut memory: Option<u64> = None;
         let mut unbounded = false;
+        let mut fold = true;
         let mut durability = Reach::default();
         let mut at = 0;
         while at < args.len() {
             match args[at].as_str() {
                 "--store" => into_store = true,
+                "--no-fold" => fold = false,
                 "--flush-every" => {
                     at += 1;
                     let value = args
@@ -906,6 +927,12 @@ impl Plan {
         if (memory.is_some() || unbounded) && !into_store {
             return Err(Failure::usage("--memory needs --store to flush into"));
         }
+        if !fold && !into_store {
+            // A bare index is one segment and there is nothing in it to fold,
+            // so turning the folding off is turning off something that was
+            // never going to happen.
+            return Err(Failure::usage("--no-fold needs --store to not fold"));
+        }
         if durability != Reach::default() && !into_store {
             // A bare index is written and closed rather than committed, so
             // there is no commit here for the reach to be about, and accepting
@@ -943,6 +970,7 @@ impl Plan {
             into_store,
             flush_every,
             memory,
+            fold,
             durability,
         })
     }
@@ -993,9 +1021,61 @@ struct Run<'a> {
     /// the spread is the whole question and a total hides it. There are as many
     /// of these as the run had flushes, which is a handful.
     commits: Vec<Duration>,
+    /// What the run paid to keep the store it was writing to in shape.
+    folds: Folds,
     peak: Held,
     steepest: Steepest<'a>,
     marks: Marks,
+}
+
+/// The folds an index run did on its way through, and what they cost it.
+///
+/// This is the metric the backpressure is reported through. A run that says how
+/// long it took and not how much of that was folding is a run whose throughput
+/// cannot be compared with the run before it, because the two were doing
+/// different amounts of work for the same documents.
+#[derive(Default)]
+struct Folds {
+    /// How many folds happened.
+    count: usize,
+    /// How many segments went into them.
+    segments: usize,
+    /// How many documents were rewritten.
+    documents: u64,
+    /// How long they took in total, which is time the documents after them
+    /// waited for.
+    took: Duration,
+    /// How many of them a writer at the hard cap waited for, rather than paying
+    /// for one fold and carrying on.
+    stalled: usize,
+}
+
+impl Folds {
+    /// Prints what the folding cost, or nothing if there was none.
+    fn tell(&self, took: Duration) {
+        if self.count == 0 {
+            return;
+        }
+        let share = if took.as_secs_f64() > 0.0 {
+            100.0 * self.took.as_secs_f64() / took.as_secs_f64()
+        } else {
+            0.0
+        };
+        println!(
+            "folded {} {}, {} segments and {} documents, {:.1?} of the run, {share:.0} percent",
+            self.count,
+            if self.count == 1 { "time" } else { "times" },
+            self.segments,
+            self.documents,
+            self.took
+        );
+        if self.stalled > 0 {
+            println!(
+                "{} of those were waited for at the hard cap of level zero rather than paid for one at a time",
+                self.stalled
+            );
+        }
+    }
 }
 
 impl<'a> Run<'a> {
@@ -1079,6 +1159,7 @@ impl<'a> Run<'a> {
             }
             println!();
             self.tell_commits(plan.durability);
+            self.folds.tell(took);
         }
         tell_held(self.peak);
         if let Some(budget) = plan.memory {
@@ -1150,9 +1231,63 @@ fn into_store<'a>(plan: &Plan, files: &'a [PathBuf], run: &mut Run<'a>) -> Resul
     let mut at = 0;
     while at < files.len() {
         at += one_batch(&mut store, plan, &files[at..], run)?;
+        keep_up(&mut store, plan, run)?;
     }
     run.segments = store.manifest().segments.len();
     Ok(())
+}
+
+/// Folds what a batch left behind, if the store is behind on its folding.
+///
+/// This is where the backpressure is, and in a run there is only one thing it
+/// can be. Nothing else is writing and nothing else is folding, so a writer that
+/// is told to wait has nobody to wait for and pays for the fold itself, which is
+/// the honest form of a stall: the documents after it are as late as the fold
+/// was long, and the run says so at the end.
+///
+/// Two thresholds and two behaviours. At the soft one it pays for a single fold
+/// and carries on, which is what a writer with something folding behind it would
+/// be doing anyway. At the hard one it keeps folding until level zero is under
+/// the cap, because past that point the store is one nobody can read quickly and
+/// adding to it is what is making that worse.
+///
+/// A store that is over the cap with no fold due is left alone rather than
+/// looped over. That takes segments at level zero which are not next to each
+/// other, which this path does not produce, and a caller that has made one is
+/// better off with a run that finishes than with a run that spins.
+fn keep_up(store: &mut Store, plan: &Plan, run: &mut Run<'_>) -> Result<(), Failure> {
+    if !plan.fold {
+        return Ok(());
+    }
+    let policy = Policy::default();
+    loop {
+        let pressure = policy.pressure(&store.manifest().segments);
+        if pressure.is_clear() {
+            return Ok(());
+        }
+        let trouble = |trouble| Failure::Store(plan.out.clone(), trouble);
+        let deleted = fold::deletions(store).map_err(trouble)?;
+        let Some(job) = policy.choose_with(&store.manifest().segments, &deleted) else {
+            return Ok(());
+        };
+        let now = now();
+        let folding = Instant::now();
+        let done = store
+            .compact_into(job.run.clone(), Some(job.into), now, now)
+            .map_err(trouble)?;
+        run.folds.count += 1;
+        run.folds.segments += done.folded;
+        run.folds.documents += u64::from(done.documents);
+        run.folds.took += folding.elapsed();
+        if pressure == Pressure::Stalled {
+            run.folds.stalled += 1;
+        } else {
+            // One fold, then back to the documents. Level zero is over the cap
+            // and a store somebody is reading is better served by a writer that
+            // keeps up than by one that stops until everything is tidy.
+            return Ok(());
+        }
+    }
 }
 
 /// Fills one batch, commits it, and says how many files it got through.
@@ -2043,6 +2178,111 @@ mod tests {
         ];
         args.extend(extra.iter().map(|part| (*part).to_string()));
         index(&args)
+    }
+
+    #[test]
+    fn a_run_folds_the_store_it_is_writing_to_as_it_goes() {
+        // A batch per document, so the run commits sixty times and would leave
+        // sixty segments behind. What it leaves instead is a level zero under
+        // the cap, and every document is still in there once.
+        let dir = scratch_dir("folds-as-it-goes");
+        let corpus = documents(&dir.join("corpus"), 0, 60);
+        let kept = dir.join("kept.kura");
+        into(&corpus, &kept, &["--flush-every", "1"]).expect("the run");
+
+        let store = Store::open(&kept).expect("the store opens");
+        let zero = store
+            .manifest()
+            .segments
+            .iter()
+            .filter(|segment| segment.level == 0)
+            .count();
+        assert!(zero < 8, "level zero holds {zero} segments");
+        assert_eq!(store.manifest().live, 60);
+        drop(store);
+
+        // The same run told not to, which is what it used to do always.
+        let left = dir.join("left.kura");
+        into(&corpus, &left, &["--flush-every", "1", "--no-fold"]).expect("the run");
+        let store = Store::open(&left).expect("the store opens");
+        assert!(
+            store.manifest().segments.len() > 8,
+            "{} segments",
+            store.manifest().segments.len()
+        );
+        drop(store);
+
+        // And the folding changed how many segments the answer came out of and
+        // nothing else about the answer.
+        assert_eq!(live(&kept, "ledger"), live(&left, "ledger"));
+        assert!(live(&kept, "ledger") > 0);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_writer_at_the_hard_cap_folds_before_it_writes_anything_else() {
+        // A store somebody left far past the cap, which is what --no-fold and a
+        // batch per document make. The next run does not add to it and hope:
+        // the first thing it does is fold until level zero is under the cap,
+        // and it says how many folds it waited for.
+        let dir = scratch_dir("hard-cap");
+        let corpus = documents(&dir.join("corpus"), 0, 30);
+        let path = dir.join("behind.kura");
+        into(&corpus, &path, &["--flush-every", "1", "--no-fold"]).expect("the run");
+
+        let mut store = Store::open(&path).expect("the store opens");
+        let before = store.manifest().segments.len();
+        assert!(before >= 12, "{before} segments");
+        assert_eq!(
+            Policy::default().pressure(&store.manifest().segments),
+            Pressure::Stalled
+        );
+
+        let plan = Plan::read(&[
+            corpus.to_string_lossy().into_owned(),
+            "-o".to_string(),
+            path.to_string_lossy().into_owned(),
+            "--store".to_string(),
+        ])
+        .expect("a plan");
+        let mut run = Run::default();
+        keep_up(&mut store, &plan, &mut run).expect("folded");
+
+        assert_eq!(run.folds.stalled, 1);
+        assert_eq!(run.folds.segments, before);
+        assert_eq!(run.folds.documents, 30);
+        assert!(
+            Policy::default()
+                .pressure(&store.manifest().segments)
+                .is_clear()
+        );
+        assert_eq!(store.manifest().live, 30);
+        drop(store);
+        assert!(live(&path, "ledger") > 0);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn folding_is_what_a_run_into_a_store_does_unless_it_is_told_not_to() {
+        let args = |extra: &[&str]| {
+            let mut args = vec!["corpus".to_string(), "-o".to_string(), "out".to_string()];
+            args.extend(extra.iter().map(|part| (*part).to_string()));
+            args
+        };
+        assert!(Plan::read(&args(&["--store"])).expect("a plan").fold);
+        assert!(
+            !Plan::read(&args(&["--store", "--no-fold"]))
+                .expect("a plan")
+                .fold
+        );
+        // A bare index is one segment, so there is nothing in it to fold and
+        // nothing for the flag to turn off.
+        let Err(refused) = Plan::read(&args(&["--no-fold"])) else {
+            panic!("a bare index has nothing to fold");
+        };
+        assert!(format!("{refused}").contains("--no-fold"), "{refused}");
     }
 
     #[test]
