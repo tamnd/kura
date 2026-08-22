@@ -151,6 +151,8 @@ options:
   --limit <n>   for dump, stop after this many records
   --commit      for repair, write the manifest rather than only say what it would be
   --keep <n>    for compact, leave the newest n segments where they are
+  --due         for compact, fold the one run the policy says is due rather
+                than everything, and say why, or say that nothing is
 
 an <index> is either a single segment, which is what index writes by default,
 or a store holding any number of them, which is what --store writes into. Every
@@ -343,10 +345,14 @@ fn check(args: &[String]) -> Result<(), Failure> {
 fn squash(args: &[String]) -> Result<(), Failure> {
     let mut positional = Vec::new();
     let mut keep = 0usize;
+    let mut asked = false;
+    let mut due = false;
     let mut at = 0;
     while at < args.len() {
         match args[at].as_str() {
+            "--due" => due = true,
             "--keep" => {
+                asked = true;
                 at += 1;
                 let value = want(args, at, "--keep wants a number")?;
                 keep = value
@@ -364,10 +370,22 @@ fn squash(args: &[String]) -> Result<(), Failure> {
         return Err(Failure::usage("wanted one store file"));
     };
     let path = Path::new(path);
+    if due && asked {
+        // One says fold everything but the newest few and the other says fold
+        // what the policy picked, and a run that did one of them would be a run
+        // whose report answered a question nobody asked.
+        return Err(Failure::usage(
+            "--due picks the run itself, so it and --keep are two answers to the same question",
+        ));
+    }
 
     let mut out = BufWriter::new(std::io::stdout());
-    fold::fold(path, keep, now(), &mut out)
-        .map_err(|trouble| Failure::Store(path.to_path_buf(), trouble))?;
+    let done = if due {
+        fold::due(path, now(), &mut out)
+    } else {
+        fold::fold(path, keep, now(), &mut out)
+    };
+    done.map_err(|trouble| Failure::Store(path.to_path_buf(), trouble))?;
     out.flush().map_err(Failure::Stdout)?;
     Ok(())
 }
