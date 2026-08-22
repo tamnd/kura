@@ -624,6 +624,47 @@ Without the stall the same run would have finished with forty four segments in t
 
 `--no-fold` turns all of it off, which is how the numbers above were measured and what to use on a run that would rather fold afterwards.
 
+## Where the time in a fold goes
+
+A fold is worth what it costs, which is settled elsewhere and comes to a few tens of thousands of queries against the store it leaves.
+What it costs is a separate question and this is the answer to it.
+
+```sh
+cargo run --release --example folding -- ./src /tmp
+```
+
+```
+ sources         in        out     opening     hashing     merging    the rest       whole
+       2     1.2 MB     1.0 MB      0.1 ms      0.1 ms      6.1 ms     10.5 ms     16.6 ms
+       4     3.2 MB     2.8 MB      0.2 ms      0.2 ms     16.9 ms     12.8 ms     29.9 ms
+       8     6.7 MB     5.7 MB      0.4 ms      0.3 ms     38.4 ms     16.9 ms     55.7 ms
+      16    15.3 MB    12.5 MB      0.8 ms      0.8 ms     91.4 ms     23.6 ms    115.8 ms
+```
+
+Each row folds that many of the newest segments of the same store, which are the ones a run's own fold folds and are all about the size of the memory budget.
+The Go toolchain source at go1.26.6, 10,750 documents in 22 segments, on an M4 of ten cores.
+
+Opening is a source per segment, digests checked.
+The read path stopped checking them because it costs a read of the whole segment against a query that wants a few bytes of it, and a fold is the opposite case: it is about to read every byte anyway and it is the last thing that will ever read these bytes before the manifest stops pointing at them.
+The hashing column is what that check costs, measured by opening the same segments without it, and it is one percent of the fold.
+That is the price of a merge being the place damage is caught, and it is worth paying.
+
+Merging is the whole of the rest of the work and about four fifths of the time.
+The vocabularies are walked together, every posting list is decoded, renumbered against the merged document numbering and encoded again, and the block ceilings are recomputed because they are scored against a mean document length that has moved.
+Nothing is written to the file in this column.
+
+The rest is the file and the drive: appending the segment, writing the manifest, and waiting for the drive twice.
+It is ten milliseconds even for the row that writes a megabyte, because two `F_FULLFSYNC` calls on this machine are about nine of that, and a commit costs two syncs whatever it holds.
+
+The first run of this found a quarter of the merge in `memcmp`.
+The walk across the source dictionaries was finding the smallest term at the front of any source by comparing all of them, and then finding which sources held that term by comparing all of them again.
+The second pass is now gone: the pass that finds the smallest term records which fronts it compared equal to, because it already knows.
+That took the sixteen segment merge from 97.6 ms to 91.4, and the saving grows with the source count because the comparison it removed was one per source per term.
+
+A heap is the usual answer to a merge of sorted runs and it is the wrong one here, which is worth writing down so that nobody has to find out twice.
+A heap costs a comparison per entry per level, and the entries are the terms of every source added up.
+For segments cut out of one corpus, where nearly every term is in nearly every segment, that is the same count the scan does multiplied by the depth of the heap.
+
 ## What a query costs while the store is being written to
 
 Every other measurement here is of one thing at a time.
