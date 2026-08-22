@@ -391,26 +391,35 @@ kura-cli index /usr/src -o /var/lib/kura/store.kura --store --memory 32m --threa
 
 The Go source tree again, 10,884 text files and 104.6 MB, on an M4 of ten cores with the files in page cache:
 
-| threads | wall | documents/s | peak resident | commits | syncs | segments after |
-| --- | --- | --- | --- | --- | --- | --- |
-| 1 | 1.1 s | 9,900 | 88.2 MB | 2 | 4 | 2 |
-| 2 | 513 ms | 21,200 | 95.7 MB | 3 | 6 | 3 |
-| 4 | 297 ms | 36,700 | 127.7 MB | 4 | 6 | 4 |
-| 8 | 377 ms | 28,900 | 145.3 MB | 8 | 8 | 1 |
-| 16 | 395 ms | 27,600 | 156.6 MB | 16 | 12 | 1 |
+| threads | wall | documents/s | peak resident | commits | syncs | folding | wall with `--no-fold` | segments after |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 1.2 s | 9,100 | 94.0 MB | 2 | 6 | 104 ms | 1.1 s | 1 |
+| 2 | 627 ms | 17,400 | 96.8 MB | 3 | 8 | 111 ms | 509 ms | 1 |
+| 4 | 451 ms | 24,100 | 125.5 MB | 4 | 8 | 122 ms | 289 ms | 1 |
+| 8 | 389 ms | 28,000 | 140.8 MB | 8 | 8 | 151 ms | 233 ms | 1 |
+| 16 | 397 ms | 27,400 | 158.5 MB | 16 | 10 | 180 ms | 208 ms | 2 |
 
-It scales to four threads and then it stops, and what stops it is in the last column rather than in the analyser.
-Eight threads leave eight segments where four leave four, eight is the level zero cap, so the run folds on the way out and pays 146 ms of its 377 for it.
-Sixteen pays 182 of 395.
-With `--no-fold` the same runs are 302 ms at four threads, 225 ms at eight and 219 ms at sixteen, which is 48,000 documents a second at eight and no better at sixteen, so the scaling runs out at the core count where it should.
-The fold is not waste, it is the work a single threaded run does in the middle of itself, and a store that skipped it would hand the cost to every query afterwards.
-What the two columns together say is that above four threads the run is bounded by folding rather than by indexing, which is what the rate limited compaction on the roadmap is for.
+Five runs of each, medians.
+The two last columns are the whole story: every run now ends by folding what it wrote into one segment, and what a run costs above the `--no-fold` ceiling is that fold.
+It scales to eight threads, which is where the ceiling stops improving, and it stops scaling for the ordinary reason rather than for a storage one.
 
-Two things are different above one thread and the run says both.
+The four thread row is slower than it used to be and it is worth saying why.
+It was 297 ms and it left four segments; it is 451 ms and it leaves one.
+Four segments is a store that answers 20 to 30 percent slower than the same documents in one, for as long as it stays that way, so the run was quietly handing its own saving to every query afterwards.
+`--threads` now changes how long the run takes and not the shape of the store it leaves, which was the point of the flag.
+The old behaviour is still there under `--no-fold`, and `kura-cli compact` is what folds afterwards for anybody who would rather choose the moment.
+
+The fold that happens as the run goes is a thread of its own now.
+It asks the policy what is due against the same view the writers are filling batches against, which costs no lock, and takes the store only for the fold itself.
+The batches in flight are carried through it rather than refused, which is what makes it possible at all.
+At `--memory 32m` on this corpus it barely gets to do anything, because 32m per thread is more than a tenth of the corpus and every thread commits once at the very end, so only the sixteen thread run has anything to fold in the middle of itself.
+The case it is for is a smaller budget, where the commits are spread over the run.
+Eight threads at `--memory 4m`, five paired runs, medians: folding at the end is 470 ms and leaves one segment, folding beside the run is 368 ms and leaves four.
+That is 22 percent off the wall clock and a store that wants a `compact` afterwards, and the segment count sits at the cap over the run instead of climbing to thirty three and dropping in one jump at the end.
+
+One thing is different above one thread and the run says it.
 There is no log, because a record goes into the ring as its document arrives and the ring is reached through the store, which one thread at a time holds, so a run that stops loses whatever it had not committed rather than leaving it for the next run to put back.
 Part of the gap between the first row and the second is that: the single threaded run wrote 83.8 MB into the log on the way past, and the same corpus into a bare segment with no store and no log takes 873 ms.
-And the folding happens once at the end rather than as the run goes, which is where the 146 ms above comes from.
-A fold in the middle of the run is no longer the problem it was, because the batches in flight are carried through it now rather than refused, and what is left is deciding when to start one without taking the thread that would have been indexing.
 
 `--memory` is per thread, so eight threads at 128m is a gigabyte.
 That is the peak resident column growing while the wall clock falls, and it is the thing to set before turning the count up on a machine that has other work on it.
