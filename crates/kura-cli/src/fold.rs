@@ -133,11 +133,15 @@ pub fn due(path: &Path, now: u64, out: &mut impl Write) -> Result<Option<Compact
 
 /// How many documents each segment of a store has had deleted.
 ///
+/// Public because the index run asks the same question of the store it is
+/// writing to, and two counts of the same thing that could disagree are worse
+/// than one that is used twice.
+///
 /// Counted out of the bitmaps rather than read off the manifest, because the
 /// manifest says how long a tombstone set is and not how many documents are in
 /// it, and a compressed bitmap of one deletion and a compressed bitmap of a
 /// thousand can be the same number of bytes.
-fn deletions(store: &Store) -> Result<Vec<u64>> {
+pub fn deletions(store: &Store) -> Result<Vec<u64>> {
     let view = store.view()?;
     let mut counts = Vec::with_capacity(view.len());
     for at in 0..view.len() {

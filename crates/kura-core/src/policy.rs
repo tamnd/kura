@@ -62,13 +62,29 @@
 //! could ever fill. So a job carries the level its replacement should land at
 //! rather than leaving the caller to assume.
 //!
+//! # Pushing back
+//!
+//! [`Policy::pressure`] is the other half, and it answers the other question. A
+//! job says what is worth folding, pressure says whether whoever is writing
+//! should be allowed to keep going, and the two have to be separate because a
+//! store can be behind on its folding without anybody being to blame and can be
+//! so far behind that carrying on is the thing making it worse.
+//!
+//! It counts level zero and nothing else. A deep level over its capacity is a
+//! fold that ought to happen, but holding a writer up for it would not stop it
+//! growing, because a writer does not add to a deep level. Level zero is where
+//! every commit lands, so it is the only place where writing faster makes the
+//! problem worse. Eight is where a fold is due and twelve is where a writer has
+//! to stop and pay for one, and the gap between them is the room a store has to
+//! fold in the background before folding happens in front of whoever is writing.
+//!
 //! # What it does not do
 //!
-//! It does not say when to run, only what to run. Nothing here knows how much
-//! read latency a fold is allowed to cost or whether the machine is busy, and a
-//! caller that folds every job this returns as fast as it can return them will
-//! spend the whole store's write bandwidth on folding. The rate limit and the
-//! backpressure are the caller's, and they are what turn this from a rule into a
+//! It does not say when to run, only what to run and whether to wait. Nothing
+//! here knows how much read latency a fold is allowed to cost or whether the
+//! machine is busy, and a caller that folds every job this returns as fast as it
+//! can return them will spend the whole store's write bandwidth on folding. The
+//! rate limit is the caller's, and it is what turns this from a rule into a
 //! policy.
 
 use core::ops::Range;
@@ -104,6 +120,17 @@ const BASE: u64 = 128 << 20;
 /// have had this argument before settled on.
 const DEAD_SHARE: u32 = 30;
 
+/// How many segments at level zero a writer is allowed to get to before it is
+/// made to stop and pay for a fold itself.
+///
+/// Twelve rather than eight, so that there is room between the count at which a
+/// fold becomes due and the count at which a writer has to wait for one. That
+/// gap is the whole of the difference between a store that folds in the
+/// background and a store that folds in front of whoever is writing to it, and
+/// four segments of it is roughly a fold's worth of writing on the corpora this
+/// has been run on.
+const HARD_CAP: usize = 12;
+
 /// The rule a store is folded by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Policy {
@@ -117,6 +144,9 @@ pub struct Policy {
     /// How many of every hundred documents in a run have to be deleted before a
     /// rewrite of it is due.
     pub dead_share: u32,
+    /// How many level zero segments there can be before a writer has to stop
+    /// and fold before it commits anything else.
+    pub hard_cap: usize,
 }
 
 impl Default for Policy {
@@ -126,6 +156,7 @@ impl Default for Policy {
             growth: GROWTH,
             base: BASE,
             dead_share: DEAD_SHARE,
+            hard_cap: HARD_CAP,
         }
     }
 }
@@ -253,6 +284,62 @@ impl Policy {
             }
         }
         None
+    }
+
+    /// What to say to somebody about to write into this store.
+    ///
+    /// The count is every segment at level zero rather than the longest run of
+    /// them, because what this is about is what a reader pays, and a reader pays
+    /// for a segment whether or not it sits next to another one at its level.
+    #[must_use]
+    pub fn pressure(self, segments: &[Segment]) -> Pressure {
+        let zero = segments.iter().filter(|segment| segment.level == 0).count();
+        if zero >= self.hard_cap {
+            Pressure::Stalled
+        } else if zero >= self.level_zero_cap {
+            Pressure::Behind
+        } else {
+            Pressure::Clear
+        }
+    }
+}
+
+/// How far behind the folding is, from the point of view of somebody trying to
+/// write.
+///
+/// It is about level zero and nothing else. A deep level that is over capacity
+/// is a fold that ought to happen, but it is not a reason to hold a writer up,
+/// because a writer does not add to a deep level and waiting would not stop it
+/// growing. Level zero is the one a commit adds to, so it is the only one where
+/// writing faster makes the problem worse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Pressure {
+    /// Level zero is under the cap. Write.
+    Clear,
+    /// A fold of level zero is due and has not happened. A writer may carry on,
+    /// and something ought to be folding.
+    Behind,
+    /// Level zero has got to the hard cap. A writer that commits anything else
+    /// before a fold happens is making a store nobody can read quickly, so it
+    /// pays for the fold itself.
+    Stalled,
+}
+
+impl Pressure {
+    /// Whether there is nothing to say to a writer.
+    #[must_use]
+    pub const fn is_clear(self) -> bool {
+        matches!(self, Self::Clear)
+    }
+
+    /// What to print when a report says why a writer waited.
+    #[must_use]
+    pub const fn why(self) -> &'static str {
+        match self {
+            Self::Clear => "level zero is under the cap",
+            Self::Behind => "a fold of level zero is due",
+            Self::Stalled => "level zero is at the hard cap",
+        }
     }
 }
 
@@ -518,6 +605,48 @@ mod tests {
             .expect("all of it");
         assert_eq!(job.docs, 10);
         assert_eq!(job.dead, 10);
+    }
+
+    #[test]
+    fn a_writer_is_told_to_wait_once_level_zero_is_at_the_hard_cap() {
+        let policy = Policy::default();
+        assert_eq!(policy.pressure(&[]), Pressure::Clear);
+        assert_eq!(policy.pressure(&several(0, 1 << 20, 7)), Pressure::Clear);
+        // A fold is due here, and a writer is not made to pay for it yet.
+        assert_eq!(policy.pressure(&several(0, 1 << 20, 8)), Pressure::Behind);
+        assert_eq!(policy.pressure(&several(0, 1 << 20, 11)), Pressure::Behind);
+        assert_eq!(policy.pressure(&several(0, 1 << 20, 12)), Pressure::Stalled);
+        assert!(Pressure::Clear.is_clear());
+        assert!(!Pressure::Behind.is_clear());
+    }
+
+    #[test]
+    fn only_level_zero_holds_a_writer_up() {
+        // Twenty segments at level one is a store far behind on its folding and
+        // is not a reason to stop somebody writing, because what they write does
+        // not go there.
+        let policy = Policy::default();
+        assert_eq!(
+            policy.pressure(&several(1, policy.base, 20)),
+            Pressure::Clear
+        );
+    }
+
+    #[test]
+    fn level_zero_is_counted_wherever_it_sits() {
+        // Six, then a folded segment, then six more. No run of them is at the
+        // cap and there are twelve of them, and twelve is what a reader pays.
+        let policy = Policy::default();
+        let mut segments = several(0, 1 << 20, 6);
+        segments.push(segment(1, 64 << 20));
+        segments.extend(several(0, 1 << 20, 6));
+        assert_eq!(policy.pressure(&segments), Pressure::Stalled);
+    }
+
+    #[test]
+    fn a_pressure_says_what_it_was() {
+        assert_ne!(Pressure::Behind.why(), Pressure::Stalled.why());
+        assert!(!Pressure::Clear.why().is_empty());
     }
 
     #[test]

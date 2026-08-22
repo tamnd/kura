@@ -435,9 +435,47 @@ What the file does in the meantime is grow, from 167.0 MB to 183.4 MB across tha
 The segment count and the live document count are what come back today, and giving the space back is its own piece of work.
 
 One fold per call, deliberately, because a store that is far behind needs several and each of them changes what the next decision should be.
-When to run it is still the caller's, and the rate limit and the backpressure that turn this from a rule into a policy are not written yet.
+When to run it is still the caller's, and the rate limit that turns this from a rule into a policy is not written yet.
 
 A run without `--store` writes a single segment and keys nothing, because a file is not a store and there is nothing in it to replace.
+
+## Keeping the store in shape while a run writes into it
+
+An index run into a store commits a batch at a time and every commit adds a segment, so a run that was bounded at 8 MB of memory over the Go toolchain source used to leave nine segments behind and a run bounded at 4 MB left twenty two.
+Nothing folded them, because nothing was asked to.
+Now the run folds as it goes, and it does it because there is nobody else there to: at eight segments at level zero a fold is due and the run pays for one, and at twelve it stops taking documents until level zero is back under the cap.
+
+```sh
+./target/release/kura-cli index ./src -o /tmp/docs.kura --store --memory 8m
+```
+
+```
+indexed 10884 documents, 104.6 MB of text into /tmp/docs.kura, 17.8 MB in 2.9s
+9 commits, median 15.4ms and worst 36.2ms, synced with F_FULLFSYNC which survives the power going
+folded 1 time, 8 segments and 10701 documents, 160.7ms of the run, 6 percent
+/tmp/docs.kura now holds 2 segments
+```
+
+Two segments instead of nine, for 160.7 ms of a 2.9 s run.
+The same corpus with `--no-fold` is the run that was there before, nine segments in 2.4 s, and the difference between the two is what the folding cost.
+
+What it buys is what every question afterwards pays.
+The same thirteen queries answered against both stores, warm, four runs of each, came out between 72 and 98 µs a query on the nine segment store and between 49 and 64 µs on the two segment one.
+A term costs one posting list walk per segment and a key costs one filter per segment, and that is the whole of the difference.
+
+The hard cap is the other half, and it is for a store that is already far behind rather than one this run is filling.
+
+```
+folded 3 times, 39 segments and 18893 documents, 312.1ms of the run, 16 percent
+1 of those were waited for at the hard cap of level zero rather than paid for one at a time
+/tmp/behind.kura now holds 8 segments
+```
+
+That is a run over a store that was left at twenty two segments.
+It stopped once before it wrote anything, folded until level zero was under the cap, and paid for two more folds on the way through, which came to 312.1 ms and sixteen percent of the run.
+Without the stall the same run would have finished with forty four segments in the file.
+
+`--no-fold` turns all of it off, which is how the numbers above were measured and what to use on a run that would rather fold afterwards.
 
 ## Bounding what an index run holds at once
 
