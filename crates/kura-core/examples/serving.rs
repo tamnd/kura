@@ -1,8 +1,10 @@
 //! What a query costs while the store it is reading is being written to.
 //!
-//! Run it with `cargo run --release --example serving -- <corpus> [<directory>]`,
-//! where the corpus is a directory of text files and the directory is where the
-//! store goes, defaulting to the temporary directory.
+//! Run it with `cargo run --release --example serving -- <corpus> [<directory>]
+//! [threads=<n>] [<queries per second> ...]`, where the corpus is a directory
+//! of text files and the directory is where the store goes, defaulting to the
+//! temporary directory. Every argument that is a number is an offered rate and
+//! the whole measurement is run again at each of them.
 //!
 //! Every other measurement in this repository is of one thing at a time. A run
 //! indexes and then it is asked questions, or it is asked questions and nothing
@@ -40,6 +42,34 @@
 //! this and would be answering out of date. The segment count is in that cost,
 //! which is the point.
 //!
+//! With no rate given the reader asks as fast as it can, which reports the
+//! latency of a saturated reader and is a different question from the one an
+//! operator asks. A budget is a promise about the latency at a load somebody
+//! chose, so the reader can also be given a rate and will hold to it: the
+//! hundredth query is due a hundred gaps after the first whatever the
+//! ninety ninth cost, and if the reader is behind it does not wait.
+//!
+//! Two numbers come out of a run at a rate and both are printed. What the query
+//! cost is the store's answer and it is what the table holds. What the client
+//! waited is that plus the time the query sat waiting for its turn, measured
+//! from when it was due rather than from when it started, and it goes on a line
+//! under the table. A reader that sleeps, wakes, and starts its clock on waking
+//! reports the first and calls it the second, and it reports a store that is
+//! keeping up long after it has stopped keeping up, because the queries it
+//! could not get to are the slow ones and they are the ones it left out.
+//!
+//! The wait is the number a budget is written against, and on an idle machine
+//! most of it is not the store. A reader that asks to be woken in a hundred
+//! microseconds is woken late, by about a third of whatever it asked for on
+//! this operating system, which is timer coalescing rather than anything here.
+//! The tail of it is worse than that: three runs of the quiet condition at ten
+//! thousand queries a second, where the query itself is twenty microseconds at
+//! p99 every time, put the wait at p99 at 21,170, 269 and 532 microseconds.
+//! That is the reader thread being taken off its core and it says nothing about
+//! a store. So the wait is printed with the quiet condition first, and a
+//! conclusion drawn from it wants the gap between the conditions to be larger
+//! than the gap between two runs of the same one.
+//!
 //! The slowest query of a round is not reported, though it used to be. Now that
 //! a query is a few microseconds, the largest number in a million of them is the
 //! scheduler taking the core away rather than the store doing anything, and it
@@ -65,11 +95,18 @@ use kura_core::writer::Writer;
 /// A store identifier, so a file written by this says what wrote it.
 const STORE: u128 = 0x006b_7572_612d_7365_7276_696e_6700_0001;
 
-/// How many threads fill batches in the two writing conditions.
+/// How many threads fill batches in the two writing conditions, unless the
+/// command line says otherwise.
 ///
 /// Four rather than the core count, because the question is what a reader pays
 /// while an ingest is going on and not how fast the ingest can be made to go. A
 /// run that took every core would be measuring the scheduler.
+///
+/// Taking every core is worth doing on purpose, though, which is what
+/// `threads=<n>` is for. Everything folding costs a reader on a machine with
+/// cores to spare is the cores it takes, so the case that would argue for a
+/// rate limit is the one where there are none, and setting this to the core
+/// count is that case without needing a smaller machine to run it on.
 const THREADS: usize = 4;
 
 /// How much text goes into a batch before it is handed over.
@@ -102,16 +139,50 @@ const QUIET_FOR: Duration = Duration::from_secs(1);
 /// larger corpus rather than the same one for longer.
 const ROUNDS: usize = 5;
 
+/// How close to the offered rate a condition has to come to count as keeping up.
+///
+/// Not one, because a round is a few hundred milliseconds and the last query of
+/// it is cut off partway, which costs a fraction of a percent whatever the store
+/// is doing.
+const KEEPING_UP: f64 = 0.99;
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let Some(corpus) = args.next().map(PathBuf::from) else {
-        eprintln!("usage: serving <corpus> [<directory>]");
+        eprintln!("usage: serving <corpus> [<directory>] [threads=<n>] [<queries per second> ...]");
         eprintln!("the corpus is a directory of text files, and the store goes in the directory");
+        eprintln!("a rate is how many queries a second the reader offers, and without one it asks");
+        eprintln!("as fast as it can");
         std::process::exit(2);
     };
-    let directory = args.next().map_or_else(std::env::temp_dir, PathBuf::from);
 
-    match run(&corpus, &directory) {
+    // Anything that reads as a number is a rate, anything of the shape
+    // threads=<n> is the writer count, and anything else is where the store
+    // goes, so the optional arguments can be given in any order.
+    let mut directory = std::env::temp_dir();
+    let mut rates = Vec::new();
+    let mut threads = THREADS;
+    for arg in args {
+        if let Some(count) = arg.strip_prefix("threads=") {
+            match count.parse::<usize>() {
+                Ok(count) if count > 0 => threads = count,
+                _ => {
+                    eprintln!("serving: {count} is not a number of threads");
+                    std::process::exit(2);
+                }
+            }
+        } else if let Ok(rate) = arg.parse::<f64>() {
+            if rate <= 0.0 || !rate.is_finite() {
+                eprintln!("serving: {rate} is not a rate anybody could offer");
+                std::process::exit(2);
+            }
+            rates.push(rate);
+        } else {
+            directory = PathBuf::from(arg);
+        }
+    }
+
+    match run(&corpus, &directory, &rates, threads) {
         Ok(()) => (),
         Err(problem) => {
             eprintln!("serving: {problem}");
@@ -121,7 +192,7 @@ fn main() {
 }
 
 /// The whole measurement.
-fn run(corpus: &Path, directory: &Path) -> Result<(), String> {
+fn run(corpus: &Path, directory: &Path, rates: &[f64], threads: usize) -> Result<(), String> {
     let mut files = Vec::new();
     walk(corpus, &mut files)?;
     files.sort();
@@ -154,17 +225,59 @@ fn run(corpus: &Path, directory: &Path) -> Result<(), String> {
             .collect::<Vec<_>>()
             .join(", ")
     );
+    println!("writers       {threads} filling batches in the two writing conditions");
+    if rates.is_empty() {
+        conditions(&base, directory, &queries, rest, None, threads)?;
+    } else {
+        for rate in rates {
+            conditions(&base, directory, &queries, rest, Some(*rate), threads)?;
+        }
+    }
+
+    std::fs::remove_file(&base).ok();
+    Ok(())
+}
+
+/// The three conditions at one offered rate, or at no rate at all.
+fn conditions(
+    base: &Path,
+    directory: &Path,
+    queries: &[String],
+    rest: &[PathBuf],
+    rate: Option<f64>,
+    threads: usize,
+) -> Result<(), String> {
     println!();
+    match rate {
+        Some(rate) => println!("offered       {rate:.0} queries a second"),
+        None => println!("offered       as fast as the reader can ask"),
+    }
     println!(
-        "{:<22} {:>9} {:>7} {:>11} {:>11} {:>11}",
-        "condition", "queries", "segs", "median", "p95", "p99"
+        "{:<22} {:>9} {:>6} {:>9} {:>11} {:>11} {:>11}",
+        "condition", "queries", "segs", "q/s", "median", "p95", "p99"
     );
 
-    let quiet = rounds(&base, directory, "quiet", &queries, None)?;
+    let quiet = rounds(base, directory, "quiet", queries, None, rate, threads)?;
     quiet.tell("quiet");
-    let writing = rounds(&base, directory, "writing", &queries, Some((rest, false)))?;
+    let writing = rounds(
+        base,
+        directory,
+        "writing",
+        queries,
+        Some((rest, false)),
+        rate,
+        threads,
+    )?;
     writing.tell("writing");
-    let folding = rounds(&base, directory, "folding", &queries, Some((rest, true)))?;
+    let folding = rounds(
+        base,
+        directory,
+        "folding",
+        queries,
+        Some((rest, true)),
+        rate,
+        threads,
+    )?;
     folding.tell("writing and folding");
 
     println!();
@@ -180,8 +293,38 @@ fn run(corpus: &Path, directory: &Path) -> Result<(), String> {
         share(folding.median(), quiet.median()),
         share(folding.p99(), quiet.p99()),
     );
-
-    std::fs::remove_file(&base).ok();
+    if let Some(rate) = rate {
+        // A condition that did not hold the offered rate has a queue that grew
+        // for the whole round, so its percentiles are how long the round was
+        // rather than how long a query takes, and saying so is the difference
+        // between a measurement and a misleading table.
+        for (name, answered) in [
+            ("quiet", &quiet),
+            ("writing", &writing),
+            ("writing and folding", &folding),
+        ] {
+            if answered.rate() < rate * KEEPING_UP {
+                println!(
+                    "{name} got through {:.0} of the {rate:.0} offered, so it did not keep up and what it reports is a backlog rather than a latency",
+                    answered.rate()
+                );
+            }
+        }
+        // The table is what the store did. This is what the client waited, and
+        // the difference between the two is the wait for a turn, most of which
+        // on an idle machine is the operating system waking the reader late.
+        // The quiet numbers are printed first for that reason: they are what
+        // the waiting costs when nothing is competing for anything.
+        println!(
+            "counting the wait for its turn, at the median and p99: quiet {:.0} and {:.0} µs, writing {:.0} and {:.0}, folding {:.0} and {:.0}",
+            quiet.waited_at(50),
+            quiet.waited_at(99),
+            writing.waited_at(50),
+            writing.waited_at(99),
+            folding.waited_at(50),
+            folding.waited_at(99),
+        );
+    }
     Ok(())
 }
 
@@ -285,13 +428,18 @@ fn fill(path: &Path, files: &[PathBuf]) -> Result<(Vec<String>, u64), String> {
 /// What one condition came to.
 #[derive(Default)]
 struct Answered {
-    /// How long each query took, in milliseconds.
+    /// How long each query took, in microseconds.
     times: Vec<f64>,
+    /// How long each query took counting the wait for its turn, in
+    /// microseconds, which is empty unless a rate was offered.
+    waited: Vec<f64>,
     /// How many segments the store held when it was over.
     segments: usize,
     /// How long the writing took in each round, on the two conditions that
     /// wrote.
     ingest: Vec<Duration>,
+    /// How long the reader was asking, added up over the rounds.
+    span: Duration,
 }
 
 impl Answered {
@@ -305,38 +453,63 @@ impl Answered {
         Some(sorted[sorted.len() / 2])
     }
 
-    /// The middle of the times, in microseconds.
+    /// The middle of what the query took, in microseconds.
     fn median(&self) -> f64 {
         self.at(50)
     }
 
-    /// The ninety ninth percentile, in microseconds.
+    /// The ninety ninth percentile of what the query took, in microseconds.
     fn p99(&self) -> f64 {
         self.at(99)
     }
 
-    /// The time at a percentile, in microseconds.
+    /// What the query took at a percentile, in microseconds.
     fn at(&self, percentile: usize) -> f64 {
-        if self.times.is_empty() {
+        percentile_of(&self.times, percentile)
+    }
+
+    /// What the client waited at a percentile, in microseconds.
+    ///
+    /// The same thing as [`Self::at`] when no rate was offered, since a reader
+    /// asking as fast as it can never waits for a turn.
+    fn waited_at(&self, percentile: usize) -> f64 {
+        if self.waited.is_empty() {
+            return self.at(percentile);
+        }
+        percentile_of(&self.waited, percentile)
+    }
+
+    /// How many queries a second the reader got through.
+    fn rate(&self) -> f64 {
+        if self.span.is_zero() {
             return 0.0;
         }
-        let mut sorted = self.times.clone();
-        sorted.sort_by(f64::total_cmp);
-        sorted[(sorted.len() - 1) * percentile / 100]
+        self.times.len() as f64 / self.span.as_secs_f64()
     }
 
     /// Prints it.
     fn tell(&self, name: &str) {
         println!(
-            "{:<22} {:>9} {:>7} {:>8.1} µs {:>8.1} µs {:>8.1} µs",
+            "{:<22} {:>9} {:>6} {:>9.0} {:>8.1} µs {:>8.1} µs {:>8.1} µs",
             name,
             self.times.len(),
             self.segments,
+            self.rate(),
             self.median(),
             self.at(95),
             self.p99(),
         );
     }
+}
+
+/// A percentile of a set of times.
+fn percentile_of(times: &[f64], percentile: usize) -> f64 {
+    if times.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = times.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    sorted[(sorted.len() - 1) * percentile / 100]
 }
 
 /// Runs one condition [`ROUNDS`] times and pools what the rounds answered.
@@ -350,13 +523,17 @@ fn rounds(
     name: &str,
     queries: &[String],
     writing: Option<(&[PathBuf], bool)>,
+    rate: Option<f64>,
+    threads: usize,
 ) -> Result<Answered, String> {
     let mut pooled = Answered::default();
     for _ in 0..ROUNDS {
-        let round = measure(base, directory, name, queries, writing)?;
+        let round = measure(base, directory, name, queries, writing, rate, threads)?;
         pooled.times.extend(round.times);
+        pooled.waited.extend(round.waited);
         pooled.segments = round.segments;
         pooled.ingest.extend(round.ingest);
+        pooled.span += round.span;
     }
     Ok(pooled)
 }
@@ -371,6 +548,8 @@ fn measure(
     name: &str,
     queries: &[String],
     writing: Option<(&[PathBuf], bool)>,
+    rate: Option<f64>,
+    threads: usize,
 ) -> Result<Answered, String> {
     let path = directory.join(format!("kura-serving-{name}.kura"));
     std::fs::remove_file(&path).ok();
@@ -384,13 +563,13 @@ fn measure(
     let outcome = std::thread::scope(|scope| {
         let asking = {
             let (writer, stop) = (&writer, &stop);
-            scope.spawn(move || ask(writer, queries, stop))
+            scope.spawn(move || ask(writer, queries, stop, rate))
         };
         let started = Instant::now();
         if let Some((files, folding)) = writing {
             let keeper = &keeper;
             let keeping = folding.then(|| scope.spawn(move || keeper.run(|| 1_700_000_003)));
-            let running: Vec<_> = (0..THREADS)
+            let running: Vec<_> = (0..threads)
                 .map(|_| {
                     let (writer, next) = (&writer, &next);
                     scope.spawn(move || add(writer, files, next))
@@ -413,30 +592,55 @@ fn measure(
         }
         let took = started.elapsed();
         stop.store(true, Ordering::Release);
-        let times = asking
+        let (times, waited) = asking
             .join()
             .unwrap_or_else(|_| Err("a reader stopped".into()))?;
-        Ok::<_, String>((times, took))
+        Ok::<_, String>((times, waited, took))
     });
 
-    let (times, took) = outcome?;
+    let (times, waited, took) = outcome?;
     let segments = writer.view().len();
     drop(writer);
     std::fs::remove_file(&path).ok();
 
     Ok(Answered {
         times,
+        waited,
         segments,
         ingest: writing.map(|_| took).into_iter().collect(),
+        span: took,
     })
 }
 
 /// The reader, asking the same questions over and over until it is told to
 /// stop, and timing each of them.
-fn ask(writer: &Writer, queries: &[String], stop: &AtomicBool) -> Result<Vec<f64>, String> {
+///
+/// With a rate, the turn a query takes is fixed when the reader starts rather
+/// than when the query before it finished, so a slow query pushes the one after
+/// it into a queue instead of pushing the whole schedule back. What comes back
+/// is both clocks: what the query took, and what it took counting the wait from
+/// when it was due, which are the same thing whenever the reader is keeping up
+/// and come apart exactly when it stops.
+fn ask(
+    writer: &Writer,
+    queries: &[String],
+    stop: &AtomicBool,
+    rate: Option<f64>,
+) -> Result<(Vec<f64>, Vec<f64>), String> {
     let mut times = Vec::new();
+    let mut waited = Vec::new();
+    let opened = Instant::now();
+    let mut turn = 0u64;
     while !stop.load(Ordering::Acquire) {
         for query in queries {
+            let due = rate.map(|rate| {
+                let due = opened + Duration::from_secs_f64(turn as f64 / rate);
+                turn += 1;
+                if let Some(left) = due.checked_duration_since(Instant::now()) {
+                    std::thread::sleep(left);
+                }
+                due
+            });
             let started = Instant::now();
             // The whole of what a reader pays to see the newest commit, which
             // is where the segment count shows up.
@@ -446,10 +650,14 @@ fn ask(writer: &Writer, queries: &[String], stop: &AtomicBool) -> Result<Vec<f64
             let _ = searcher
                 .search(query, 10)
                 .map_err(|problem| problem.to_string())?;
-            times.push(started.elapsed().as_secs_f64() * 1_000_000.0);
+            let done = Instant::now();
+            times.push(done.duration_since(started).as_secs_f64() * 1_000_000.0);
+            if let Some(due) = due {
+                waited.push(done.duration_since(due).as_secs_f64() * 1_000_000.0);
+            }
         }
     }
-    Ok(times)
+    Ok((times, waited))
 }
 
 /// One writer, taking files off the shared counter until they run out.
