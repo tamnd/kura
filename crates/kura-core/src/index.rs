@@ -22,7 +22,7 @@ use crate::codec::{get_u32, get_u64, get_uvarint, put_u32, put_u64, put_uvarint}
 use crate::error::{Error, Result};
 use crate::search::{B, K1};
 use crate::segment::{Segment, Writer as SegmentWriter, kind};
-use crate::{DocId, bitmap::Bitmap, bound, filter, keys, length, posting, store, terms};
+use crate::{DocId, bitmap::Bitmap, bound, filter, keys, length, posting, store, terms, upsert};
 
 /// The size of one link in a term's posting chain, in bytes.
 ///
@@ -290,6 +290,35 @@ struct Chain {
     last: DocId,
 }
 
+/// Where the words of a document being added come from.
+///
+/// Two ways in, one path through. A document arriving from a caller is text and
+/// gets analysed, and a document arriving from the log is already analysed and
+/// carries its tokens, and everything after the tokens exist is the same for
+/// both. Keeping that as one function rather than two is what stops a document
+/// replayed out of the log from being subtly a different document from the one
+/// that was acknowledged.
+#[derive(Debug, Clone, Copy)]
+enum Words<'a> {
+    /// Text as the caller wrote it, to be analysed here.
+    Prose(&'a str),
+    /// A record out of the log, holding the tokens the analyser produced when
+    /// the document was first written.
+    Tokens(upsert::Record<'a>),
+}
+
+impl<'a> From<&'a str> for Words<'a> {
+    fn from(text: &'a str) -> Self {
+        Self::Prose(text)
+    }
+}
+
+impl<'a> From<upsert::Record<'a>> for Words<'a> {
+    fn from(record: upsert::Record<'a>) -> Self {
+        Self::Tokens(record)
+    }
+}
+
 /// Builds an index from documents.
 ///
 /// Documents are numbered in the order they are added, from zero, and that
@@ -497,18 +526,53 @@ impl Writer {
         self.insert(Some(key), text, fields)
     }
 
+    /// Adds a document out of a record the log holds, without analysing
+    /// anything.
+    ///
+    /// This is what a recovery adds documents through. The record carries the
+    /// tokens the analyser produced when the document was first written, so a
+    /// replay costs a walk over them rather than a second pass over the text,
+    /// and a store that comes back after a tokeniser change comes back holding
+    /// the index it acknowledged rather than a different one built from the same
+    /// words.
+    ///
+    /// A document added this way is the document that was added the ordinary
+    /// way. The postings, the length and the stored fields are the same, which
+    /// is checked by indexing a corpus both ways and comparing the segments byte
+    /// for byte.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotSorted`] if more documents are added than a document
+    /// identifier can hold, and a decoding error if the record does not hold
+    /// what it says it holds.
+    pub fn add_record(&mut self, record: &upsert::Record<'_>) -> Result<DocId> {
+        // Collected because the store takes an iterator it can walk without
+        // failing and a record hands its fields back one at a time and can fail
+        // on any of them. A recovery is not the steady state path, and finding
+        // out that a field is damaged after half of the document is in the
+        // writer would be worse than the allocation.
+        let mut fields = Vec::new();
+        let mut walk = record.fields();
+        while let Some(field) = walk.next_field()? {
+            fields.push(field);
+        }
+        self.insert(record.key(), *record, fields)
+    }
+
     /// The one place a document is added, whether or not it was named.
     ///
     /// The key is taken here rather than in a method of its own so that a
     /// document has one key or none by construction. A writer that let a key be
     /// attached to a document already added would have to answer what a second
     /// key for the same document means, and there is no good answer to that.
-    fn insert<'f>(
+    fn insert<'t, 'f>(
         &mut self,
         key: Option<&[u8]>,
-        text: &str,
+        text: impl Into<Words<'t>>,
         fields: impl IntoIterator<Item = (&'f str, &'f [u8])>,
     ) -> Result<DocId> {
+        let text = text.into();
         let doc =
             u32::try_from(self.lengths.len()).map_err(|_| Error::NotSorted { at: u32::MAX })?;
         // The stamp is the document number plus one so that zero can mean a term
@@ -526,7 +590,18 @@ impl Writer {
             key_bytes,
             budget: _,
         } = self;
-        let length = analyzer.analyze(text, |term, _| postings.count(term, stamp));
+        let length = match text {
+            Words::Prose(text) => analyzer.analyze(text, |term, _| postings.count(term, stamp)),
+            Words::Tokens(record) => {
+                let mut walk = record.tokens();
+                let mut length: u32 = 0;
+                while let Some(token) = walk.next_token()? {
+                    postings.count(token, stamp);
+                    length = length.saturating_add(1);
+                }
+                length
+            }
+        };
         postings.flush(doc);
         lengths.push(length);
         *total += u64::from(length);
@@ -1561,6 +1636,75 @@ mod tests {
             writer.add(doc).expect("a handful of documents fit");
         }
         writer.finish().expect("what was written decodes")
+    }
+
+    /// A key, the text under it, and the fields stored beside it.
+    type Document<'a> = (&'a [u8], &'a str, &'a [(&'a str, &'a [u8])]);
+
+    /// A document as it would have gone into the log, tokens and all.
+    fn logged(key: &[u8], text: &str, fields: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut record = upsert::Upsert::new();
+        record.key(key);
+        let mut analyzer = Analyzer::new();
+        analyzer.analyze(text, |token, _| record.token(token));
+        for (name, value) in fields {
+            record.field(name, value);
+        }
+        record.bytes()
+    }
+
+    #[test]
+    fn a_document_replayed_out_of_a_record_is_the_document_that_was_written() {
+        // The claim the whole log rests on. A recovery that produced an index
+        // that merely answered the same questions would still be a different
+        // index, with different lengths and therefore different scores, so what
+        // is compared here is the bytes.
+        let corpus: [Document<'_>; 4] = [
+            (
+                b"docs/a.md",
+                "the quick brown fox jumps over the lazy dog",
+                &[("path", b"docs/a.md"), ("title", b"A")],
+            ),
+            (b"docs/b.md", "the dog barks", &[("path", b"docs/b.md")]),
+            (b"docs/c.md", "quick quick quick", &[]),
+            (
+                b"docs/d.md",
+                "\u{5009} \u{5eab} nothing in common with the others",
+                &[("path", b"docs/d.md")],
+            ),
+        ];
+
+        let mut written = Writer::new();
+        for (key, text, fields) in corpus {
+            written
+                .add_keyed_with_fields(key, text, fields.iter().copied())
+                .expect("a handful of documents fit");
+        }
+
+        let mut replayed = Writer::new();
+        for (key, text, fields) in corpus {
+            let bytes = logged(key, text, fields);
+            let record = upsert::Record::read(&bytes).expect("the record reads");
+            replayed.add_record(&record).expect("it goes in");
+        }
+
+        assert_eq!(
+            written.finish().expect("what was written decodes"),
+            replayed.finish().expect("what was replayed decodes"),
+        );
+    }
+
+    #[test]
+    fn a_record_that_lies_about_its_tokens_stops_the_replay_rather_than_the_index() {
+        let bytes = logged(b"docs/a.md", "one two three", &[]);
+        let mut broken = bytes.clone();
+        // The token count, which sits after the flags byte and the key.
+        let at = 1 + 1 + b"docs/a.md".len();
+        assert_eq!(broken[at], 3, "the count is not where this test thinks");
+        broken[at] = 9;
+        let record = upsert::Record::read(&broken).expect("the regions are still fine");
+        let mut writer = Writer::new();
+        assert!(writer.add_record(&record).is_err());
     }
 
     #[test]
