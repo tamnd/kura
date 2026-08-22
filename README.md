@@ -353,10 +353,14 @@ The default is the dictionary, `--postings` is a line per posting with its frequ
 Every line says which segment it came from, including when there is only one, so a script never has to know which kind of file it is reading.
 
 ```
-# segment	term	document	frequency
-1	storage	0	1
-1	storage	1	2
+# segment	term	document	live	frequency
+1	storage	0	yes	1
+1	storage	1	no	2
 ```
+
+Every other command hides what a store has deleted, because a document that was replaced is not an answer to a query.
+`dump` prints it and says so in the `live` column, because the file is the question this command is being asked: a replaced document stays in the segment it was written into until a merge gets to it, and a tool that dropped it could not be used to find out what a merge is about to do.
+Filtering a dump down to the live records is what makes it comparable with what a search returns.
 
 It is meant to be diffed.
 The same corpus indexed by two builds produces two identical dumps, and where they stop being identical is what changed.

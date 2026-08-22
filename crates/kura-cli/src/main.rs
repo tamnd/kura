@@ -47,6 +47,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use kura_core::analysis::Analyzer;
+use kura_core::bitmap::Bitmap;
 use kura_core::file::{Store, Trouble};
 use kura_core::index::{Held, Reader, Writer};
 use kura_core::ingest::Batch;
@@ -256,8 +257,8 @@ fn show(args: &[String]) -> Result<(), Failure> {
 
     let path = Path::new(path);
     let bytes = Map::open(path).map_err(|error| Failure::Io(path.to_path_buf(), error))?;
-    let segments = segments_in(&bytes, false)?;
-    let readers = readers_of(&segments)?;
+    let parts = parts_of(&bytes, false)?;
+    let readers = parts.readers()?;
 
     let request = dump::Request {
         what,
@@ -424,8 +425,8 @@ fn topics(args: &[String]) -> Result<(), Failure> {
 
     let index = Path::new(index);
     let bytes = Map::open(index).map_err(|error| Failure::Io(index.to_path_buf(), error))?;
-    let segments = segments_in(&bytes, verify)?;
-    let readers = readers_of(&segments)?;
+    let parts = parts_of(&bytes, verify)?;
+    let readers = parts.readers()?;
     let searcher = Searcher::over(&readers)?;
 
     let queries = Path::new(queries);
@@ -1173,7 +1174,7 @@ fn open(bytes: &[u8], verify: bool) -> Result<Segment<'_>, Failure> {
     }
 }
 
-/// Every segment in a mapped index file, whatever kind of file it is.
+/// What a mapped index file holds, whatever kind of file it is.
 ///
 /// A store and a bare segment are told apart by the first eight bytes rather
 /// than by trying one decoder and falling back to the other when it fails. The
@@ -1181,44 +1182,82 @@ fn open(bytes: &[u8], verify: bool) -> Result<Segment<'_>, Failure> {
 /// decode, get handed to the segment decode, fail that too, and report the
 /// second failure, so a person with a torn manifest would be told their file is
 /// not a segment. It is not, and that was never the question.
-fn segments_in(bytes: &[u8], verify: bool) -> Result<Vec<Segment<'_>>, Failure> {
-    Ok(parts_of(bytes, verify)?.0)
+///
+/// The deletions are here rather than left to the caller because a store keeps
+/// a replaced document in the segment it was written into and records that it
+/// is gone beside that segment. A command that opened the segments and stopped
+/// there would answer every query with the old copies as well as the new ones,
+/// which is what this tool did until the deletions were read here.
+struct Parts<'a> {
+    /// The segments, in the order they were written.
+    segments: Vec<Segment<'a>>,
+    /// What each of them has deleted, or `None` where nothing is.
+    deleted: Vec<Option<Bitmap>>,
+    /// The stretch of the file the segments sit in.
+    ///
+    /// For the residency probe, which reports how much of the index was already
+    /// in memory and needs to know what counts as the index. In a store that is
+    /// the segment region and not the file: the log is a sparse quarter of the
+    /// file that a query never reads, and counting it in the denominator turns a
+    /// warm index into a cold looking percentage.
+    region: Range<usize>,
 }
 
-/// The segments, and the stretch of the file they sit in.
-///
-/// The second one is for the residency probe, which reports how much of the
-/// index was already in memory and needs to know what counts as the index. In a
-/// store that is the segment region and not the file: the log is a sparse
-/// quarter of the file that a query never reads, and counting it in the
-/// denominator turns a warm index into a cold looking percentage.
-fn parts_of(bytes: &[u8], verify: bool) -> Result<(Vec<Segment<'_>>, Range<usize>), Failure> {
+impl<'a> Parts<'a> {
+    /// A reader per segment, with the deletions already applied.
+    ///
+    /// Separate from opening the file because the borrow runs one way down the
+    /// chain and cannot be tied in a knot: the mapping owns the bytes, the
+    /// segments borrow the mapping, the readers borrow the segments, and the
+    /// searcher borrows the readers. Each of those has to be a local of its own
+    /// in the function that wants the searcher.
+    fn readers(&self) -> Result<Vec<Reader<'a>>, Failure> {
+        self.segments
+            .iter()
+            .zip(&self.deleted)
+            .map(|(segment, deleted)| {
+                let reader = Reader::open(segment)?;
+                match deleted {
+                    Some(gone) => Ok(reader.hiding(gone.clone())?),
+                    None => Ok(reader),
+                }
+            })
+            .collect()
+    }
+}
+
+/// Opens a mapped index file and reads what is in it.
+fn parts_of(bytes: &[u8], verify: bool) -> Result<Parts<'_>, Failure> {
     if manifest::looks_like_a_store(bytes) {
         let (superblock, state) = manifest::front(bytes)?;
         let ranges = manifest::locate(&superblock, &state, bytes.len())?;
         let start = ranges.iter().map(|range| range.start).min().unwrap_or(0);
         let end = ranges.iter().map(|range| range.end).max().unwrap_or(0);
+        let graves = manifest::tombstones(&superblock, &state, bytes.len())?;
         let segments = ranges
             .into_iter()
             .map(|range| open(&bytes[range], verify))
             .collect::<Result<Vec<_>, _>>()?;
-        return Ok((segments, start..end));
+        let deleted = graves
+            .into_iter()
+            .map(|range| match range {
+                Some(range) => Ok(Some(Bitmap::read(&bytes[range])?)),
+                None => Ok(None),
+            })
+            .collect::<Result<Vec<_>, Failure>>()?;
+        return Ok(Parts {
+            segments,
+            deleted,
+            region: start..end,
+        });
     }
-    Ok((vec![open(bytes, verify)?], 0..bytes.len()))
-}
-
-/// A reader per segment, in the order the segments were written.
-///
-/// Separate from [`segments_in`] because the borrow runs one way down the chain
-/// and cannot be tied in a knot: the mapping owns the bytes, the segments borrow
-/// the mapping, the readers borrow the segments, and the searcher borrows the
-/// readers. Each of those has to be a local of its own in the function that
-/// wants the searcher.
-fn readers_of<'a>(segments: &[Segment<'a>]) -> Result<Vec<Reader<'a>>, Failure> {
-    segments
-        .iter()
-        .map(|segment| Ok(Reader::open(segment)?))
-        .collect()
+    // A bare segment has nowhere to record a deletion, so there are none. It is
+    // a segment as it was written and every document in it is an answer.
+    Ok(Parts {
+        segments: vec![open(bytes, verify)?],
+        deleted: vec![None],
+        region: 0..bytes.len(),
+    })
 }
 
 /// Runs a query, and says what it did when `explaining`.
@@ -1260,10 +1299,10 @@ fn query(args: &[String], explaining: bool) -> Result<(), Failure> {
     // query cost, and reading the index first charges the query for a copy of
     // an index it will touch a fraction of. See [`map`].
     let bytes = Map::open(path).map_err(|error| Failure::Io(path.to_path_buf(), error))?;
-    let (segments, region) = parts_of(&bytes, verify)?;
-    let readers = readers_of(&segments)?;
+    let parts = parts_of(&bytes, verify)?;
+    let readers = parts.readers()?;
     let searcher = Searcher::over(&readers)?;
-    let index = &bytes[region];
+    let index = &bytes[parts.region.clone()];
 
     // Which walk is being explained matters more than it looks. Asking for the
     // total as well as the page means every matching document has to be visited
@@ -1575,8 +1614,8 @@ mod tests {
     /// two indexes were built from different directories.
     fn scores(index: &Path, query: &str, k: usize) -> Vec<f32> {
         let bytes = Map::open(index).expect("a mapped index");
-        let segments = segments_in(&bytes, true).expect("segments");
-        let readers = readers_of(&segments).expect("readers");
+        let parts = parts_of(&bytes, true).expect("segments");
+        let readers = parts.readers().expect("readers");
         let searcher = Searcher::over(&readers).expect("a searcher");
         searcher
             .search(query, k)
@@ -1595,6 +1634,20 @@ mod tests {
         let store = Store::open(path).expect("the store opens");
         let view = store.view().expect("a view");
         let readers = view.readers().expect("readers");
+        let searcher = Searcher::over(&readers).expect("a searcher");
+        searcher.count(query).expect("counted")
+    }
+
+    /// How many documents a query finds through the path the commands take.
+    ///
+    /// The mapped file and nothing else, which is what `search`, `explain` and
+    /// `topics` all work from. [`live`] asks the same question through a view,
+    /// and the two answers agreeing is what says the commands are reading the
+    /// deletions the store recorded rather than the segments alone.
+    fn found(index: &Path, query: &str) -> u64 {
+        let bytes = Map::open(index).expect("a mapped index");
+        let parts = parts_of(&bytes, true).expect("segments");
+        let readers = parts.readers().expect("readers");
         let searcher = Searcher::over(&readers).expect("a searcher");
         searcher.count(query).expect("counted")
     }
@@ -1630,6 +1683,35 @@ mod tests {
         // which is what a replacement is until a merge gets to it.
         assert_eq!(opened.manifest().total, 80);
         assert_eq!(live(&store, "ledger"), once);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_replaced_file_is_one_answer_from_the_command_line_as_well() {
+        // Every `index --store` run over a directory that was indexed before
+        // produces this, so it is the ordinary state of a store rather than a
+        // corner of one. The commands read the segments out of the file and
+        // nothing was reading the deletions beside them, so a search answered
+        // with the replaced copies as well as the live ones and a corpus
+        // indexed nightly came back with a document once per night.
+        let dir = scratch_dir("deletions-from-the-tool");
+        let corpus = documents(&dir.join("corpus"), 0, 40);
+        fs::write(corpus.join("3.txt"), "debenture ledger").expect("a document");
+        let store = dir.join("twice.kura");
+
+        into(&corpus, &store, &[]).expect("the first run");
+        let once = found(&store, "ledger");
+        into(&corpus, &store, &[]).expect("the second run");
+
+        let opened = Store::open(&store).expect("the store opens");
+        assert_eq!(opened.manifest().total, 80);
+        assert_eq!(opened.manifest().live, 40);
+        assert_eq!(found(&store, "ledger"), once);
+        assert_eq!(found(&store, "ledger"), live(&store, "ledger"));
+        // One file holds the word and one hit is what a page of it should be,
+        // whatever the counting says.
+        assert_eq!(scores(&store, "debenture", 10).len(), 1);
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1767,7 +1849,7 @@ mod tests {
         .expect("several segments");
 
         let bytes = Map::open(&cut).expect("mapped");
-        let held = segments_in(&bytes, true).expect("segments").len();
+        let held = parts_of(&bytes, true).expect("segments").segments.len();
         assert!(held > 1, "the corpus went into {held} segments");
 
         for query in ["ledger", "invoice quarter", "ledger audit invoice"] {
@@ -1940,11 +2022,11 @@ mod tests {
 
         let bare = Map::open(&bare).expect("mapped");
         assert!(!manifest::looks_like_a_store(&bare));
-        assert_eq!(segments_in(&bare, true).expect("segments").len(), 1);
+        assert_eq!(parts_of(&bare, true).expect("segments").segments.len(), 1);
 
         let store = Map::open(&store).expect("mapped");
         assert!(manifest::looks_like_a_store(&store));
-        assert_eq!(segments_in(&store, true).expect("segments").len(), 1);
+        assert_eq!(parts_of(&store, true).expect("segments").segments.len(), 1);
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1965,8 +2047,8 @@ mod tests {
         }
 
         let bytes = Map::open(&store).expect("mapped");
-        let segments = segments_in(&bytes, true).expect("segments");
-        let readers = readers_of(&segments).expect("readers");
+        let parts = parts_of(&bytes, true).expect("segments");
+        let readers = parts.readers().expect("readers");
         let mut out = Vec::new();
         report::plan("ledger nonesuch", &readers, &mut out).expect("writes");
         let text = String::from_utf8(out).expect("ascii");

@@ -20,6 +20,17 @@
 //! of them. A column that is always 1 costs nothing and a script that has to
 //! know whether it is reading a store before it can parse a line costs plenty.
 //!
+//! # Deleted records are printed, and said to be deleted
+//!
+//! Every other command hides what a store has deleted, because a query asking
+//! for the corpus should not be answered out of documents somebody replaced.
+//! This one does not, because the file is the question it is being asked: a
+//! document that was replaced is still in the segment it was written into until
+//! a merge gets to it, and a tool that dropped it could not be used to find out
+//! what a merge is about to do. What the records carry instead is a `live`
+//! column, so a dump can be filtered down to what a query would see and the two
+//! answers can be compared against each other.
+//!
 //! # Terms and documents are somebody's data
 //!
 //! This is the one tool here that prints the corpus back out. Everything else
@@ -72,8 +83,8 @@ pub fn dump(
 ) -> Result<(), Failure> {
     let header = match request.what {
         What::Terms => "# segment\tterm\tdocuments\toffset\tbytes",
-        What::Postings => "# segment\tterm\tdocument\tfrequency",
-        What::Documents => "# segment\tdocument\tfield\tvalue",
+        What::Postings => "# segment\tterm\tdocument\tlive\tfrequency",
+        What::Documents => "# segment\tdocument\tlive\tfield\tvalue",
     };
     writeln!(out, "{header}").map_err(Failure::Stdout)?;
 
@@ -134,6 +145,12 @@ impl Budget {
 /// the largest frequency in a term's list is what a block bound is built out of
 /// and it is a genuinely useful number, and getting it means decoding every
 /// posting in the index, which is the other mode.
+///
+/// There is no `live` column here either, and the document count is the one the
+/// dictionary holds, which counts the postings of the term rather than the
+/// documents still answering with it. A term is not deleted, documents are, so
+/// the number that takes the deletions into account is the one the postings mode
+/// prints a line at a time.
 fn terms(
     reader: &index::Reader<'_>,
     segment: usize,
@@ -179,7 +196,7 @@ fn postings(
         let Some(list) = reader.postings(wanted)? else {
             return Ok(());
         };
-        return list_of(&list, segment, wanted, left, out);
+        return list_of(&list, reader, segment, wanted, left, out);
     }
 
     let mut entries = reader.entries();
@@ -189,7 +206,7 @@ fn postings(
         // held at once.
         let term = term.to_vec();
         let list = reader.list(entry)?;
-        list_of(&list, segment, &term, left, out)?;
+        list_of(&list, reader, segment, &term, left, out)?;
         if left.spent() {
             return Ok(());
         }
@@ -200,6 +217,7 @@ fn postings(
 /// Prints one posting list.
 fn list_of(
     list: &kura_core::posting::Reader<'_>,
+    reader: &index::Reader<'_>,
     segment: usize,
     term: &[u8],
     left: &mut Budget,
@@ -211,10 +229,20 @@ fn list_of(
         if !left.take() {
             return Ok(());
         }
-        writeln!(out, "{segment}\t{term}\t{doc}\t{}", cursor.frequency())
-            .map_err(Failure::Stdout)?;
+        writeln!(
+            out,
+            "{segment}\t{term}\t{doc}\t{}\t{}",
+            live(reader, doc),
+            cursor.frequency()
+        )
+        .map_err(Failure::Stdout)?;
     }
     Ok(())
+}
+
+/// Whether a document is still an answer, as a column.
+fn live(reader: &index::Reader<'_>, doc: u32) -> &'static str {
+    if reader.is_live(doc) { "yes" } else { "no" }
 }
 
 /// Prints every stored field of one segment.
@@ -237,8 +265,13 @@ fn documents(
             if !left.take() {
                 return Ok(());
             }
-            writeln!(out, "{segment}\t{doc}\t{name}\t{}", escaped(value))
-                .map_err(Failure::Stdout)?;
+            writeln!(
+                out,
+                "{segment}\t{doc}\t{}\t{name}\t{}",
+                live(reader, doc),
+                escaped(value)
+            )
+            .map_err(Failure::Stdout)?;
         }
     }
     Ok(())
@@ -322,6 +355,7 @@ pub fn to_stdout(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kura_core::bitmap::Bitmap;
     use kura_core::index::Writer;
     use kura_core::segment::Segment;
 
@@ -376,8 +410,8 @@ mod tests {
         // frequency would look identical to one that said it once, which is the
         // difference every ranking decision is made out of.
         let dump = dumped(&a_segment(), all(What::Postings));
-        assert!(dump.contains("1\tstorage\t0\t1"), "{dump}");
-        assert!(dump.contains("1\tstorage\t1\t2"), "{dump}");
+        assert!(dump.contains("1\tstorage\t0\tyes\t1"), "{dump}");
+        assert!(dump.contains("1\tstorage\t1\tyes\t2"), "{dump}");
     }
 
     #[test]
@@ -415,8 +449,48 @@ mod tests {
     #[test]
     fn the_stored_fields_come_back_with_the_document_they_belong_to() {
         let dump = dumped(&a_segment(), all(What::Documents));
-        assert!(dump.contains("1\t0\tpath\ta.txt"), "{dump}");
-        assert!(dump.contains("1\t1\tpath\tb.txt"), "{dump}");
+        assert!(dump.contains("1\t0\tyes\tpath\ta.txt"), "{dump}");
+        assert!(dump.contains("1\t1\tyes\tpath\tb.txt"), "{dump}");
+    }
+
+    #[test]
+    fn a_deleted_document_is_printed_and_said_to_be_deleted() {
+        // The one command that keeps answering out of what a store replaced,
+        // because what is in the file is the question it is being asked. It has
+        // to say so, though, or a dump and a query disagree with no way of
+        // telling which of the two is wrong.
+        let bytes = a_segment();
+        let segment = Segment::open_without_checksum(&bytes).expect("the segment opens");
+        let mut gone = Bitmap::new();
+        gone.insert(1);
+        let reader = index::Reader::open(&segment)
+            .expect("the sections open")
+            .hiding(gone)
+            .expect("the document is in the segment");
+
+        let mut out = Vec::new();
+        dump(&[reader], all(What::Documents), &mut out).expect("the dump runs");
+        let text = String::from_utf8(out).expect("the dump is text");
+        assert!(text.contains("1\t0\tyes\tpath\ta.txt"), "{text}");
+        assert!(text.contains("1\t1\tno\tpath\tb.txt"), "{text}");
+    }
+
+    #[test]
+    fn the_postings_of_a_deleted_document_say_it_is_gone() {
+        let bytes = a_segment();
+        let segment = Segment::open_without_checksum(&bytes).expect("the segment opens");
+        let mut gone = Bitmap::new();
+        gone.insert(1);
+        let reader = index::Reader::open(&segment)
+            .expect("the sections open")
+            .hiding(gone)
+            .expect("the document is in the segment");
+
+        let mut out = Vec::new();
+        dump(&[reader], all(What::Postings), &mut out).expect("the dump runs");
+        let text = String::from_utf8(out).expect("the dump is text");
+        assert!(text.contains("1\tstorage\t0\tyes\t1"), "{text}");
+        assert!(text.contains("1\tstorage\t1\tno\t2"), "{text}");
     }
 
     #[test]
