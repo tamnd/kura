@@ -158,6 +158,33 @@ pub mod kind {
     /// The block ceilings again, two bytes apiece instead of one, which is what
     /// pruning reads when it is there.
     pub const WIDE_BOUNDS: u16 = 14;
+
+    /// Every kind above, in one place.
+    ///
+    /// A new section goes here as well as in the constants, and this is not
+    /// bookkeeping for its own sake. Some code has to have an opinion about every
+    /// section there is rather than about the ones it happens to know: a merge
+    /// either carries a section across or refuses the segment, and a merge that
+    /// has never heard of a section carries neither. That is a section quietly
+    /// disappearing from a store, so [`crate::compact`] is checked against this
+    /// list, and a kind added here without the merge being taught about it fails
+    /// a test rather than a corpus.
+    pub const KNOWN: [u16; 14] = [
+        TERMS,
+        POSTINGS,
+        FIELDS,
+        VECTORS,
+        ACL,
+        COLUMNS,
+        GRAPH,
+        TOMBSTONES,
+        NORMS,
+        BOUNDS,
+        KEYS,
+        KEY_FILTER,
+        ROUNDED,
+        WIDE_BOUNDS,
+    ];
 }
 
 /// Builds a segment.
@@ -732,6 +759,19 @@ pub const fn name(kind: u16) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_known_kinds_are_every_number_from_one_up_with_none_missed_and_none_twice() {
+        // The kinds are handed out in order and nothing has ever been retired,
+        // so the list of them is the numbers one to however many there are. A
+        // gap here is a constant that was added without being listed, and a
+        // repeat is two sections that would be written into the same slot.
+        let count = u16::try_from(kind::KNOWN.len()).expect("the kinds fit their own width");
+        let expected: Vec<u16> = (1..=count).collect();
+        let mut known = kind::KNOWN;
+        known.sort_unstable();
+        assert_eq!(known.to_vec(), expected);
+    }
 
     #[test]
     fn the_section_table_reads_back_as_it_was_written() {
