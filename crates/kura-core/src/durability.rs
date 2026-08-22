@@ -38,6 +38,21 @@
 //! | --- | --- | --- | --- | --- | --- |
 //! | any | `fdatasync` | 13.71 ms | 115.26 ms | 239.62 ms | 73 |
 //!
+//! The example was run on that box again later, and because the three reaches
+//! are one call there it is three measurements of the same thing:
+//!
+//! | reach | call | median | p99 | max | syncs/s |
+//! | --- | --- | --- | --- | --- | --- |
+//! | [`Reach::Platter`] | `fdatasync` | 2.715 ms | 27.259 ms | 38.799 ms | 368 |
+//! | [`Reach::Device`] | `fdatasync` | 4.593 ms | 93.927 ms | 274.030 ms | 218 |
+//! | [`Reach::Ordered`] | `fdatasync` | 5.241 ms | 37.612 ms | 47.161 ms | 191 |
+//!
+//! Nothing separates those rows but the machine, and they are a factor of two
+//! apart at the median and a factor of ten at the worst. That is the floor on
+//! how finely any single sync measurement can be read, and it is why the
+//! decision the module doc argues for is made on which call was asked for
+//! rather than on which one measured faster on the day.
+//!
 //! The honest call on the laptop is free, inside the noise of the weaker one,
 //! and that is what decides the default. Somewhere it will cost a great deal
 //! more, and there the weaker reaches are here to be asked for deliberately.
