@@ -624,6 +624,40 @@ Without the stall the same run would have finished with forty four segments in t
 
 `--no-fold` turns all of it off, which is how the numbers above were measured and what to use on a run that would rather fold afterwards.
 
+## What a query costs while the store is being written to
+
+Every other measurement here is of one thing at a time.
+A run indexes and then it is asked questions, or it is asked questions and nothing is writing.
+That is not the case a store is built for, and it hides the question a rate limit would be tuned against: what does a reader pay while an ingest is going on beside it, and how much of what it pays is the folding rather than the writing.
+
+```sh
+cargo run --release --example serving -- ./src /var/lib/kura
+```
+
+Half the corpus is indexed and folded into one segment, and then the same queries are asked over and over in three conditions: nothing writing, four threads writing the other half with nothing folding, and the same four threads with a keeper folding beside them.
+The queries come out of the corpus rather than being made up, taken at ranks 1, 10, 100, 1,000 and 10,000 in what the analyser produced, which is a spread from a term in nearly every document to one in a handful.
+What a query costs is the whole of what a reader pays to see the newest commit: taking the view, opening a reader over each of its segments and running the query.
+A server holding one searcher open would pay less than this and would be answering out of date.
+
+The Go source tree at go1.26.6, 11,496 files of which 5,748 are indexed first and 5,748 written while the queries run, on an M4 of ten cores, five rounds of each condition with the times pooled:
+
+| condition | queries | segments at the end | median | p95 | p99 | worst |
+| --- | --- | --- | --- | --- | --- | --- |
+| quiet | 9,400 | 1 | 0.480 ms | 0.728 ms | 0.854 ms | 16.9 ms |
+| writing | 965 | 14 | 0.848 ms | 2.136 ms | 3.260 ms | 20.1 ms |
+| writing and folding | 1,135 | 6 | 0.976 ms | 2.059 ms | 2.965 ms | 9.9 ms |
+
+An ingest costs a reader about 80 percent at the median and three to four times at p99, and that is the writing rather than the folding.
+Adding the folding costs 13 percent more at the median and takes the tail down rather than up: p99 falls from 3.26 ms to 2.97 ms and the worst query of the run falls from 20.1 ms to 9.9 ms.
+Three runs of the whole thing gave the same answer each time.
+
+That is worth saying plainly because it is the opposite of what a rate limit is usually for.
+The worst query in a run is the one that had the most segments to walk, and folding is what stops there being fourteen of them.
+The fold takes the store for as long as it runs, but a reader does not take the store, so what a fold costs a reader is the cores it uses and not a wait.
+On this machine and this corpus that trade comes out in the reader's favour, and a rate limit tuned to protect the read path would be protecting it from the wrong thing.
+
+What folding costs is the ingest: 199.7 ms with nothing folding against 253.1 ms with a keeper beside it, medians of five rounds, for a store that ends at six segments rather than fourteen.
+
 ## Bounding what an index run holds at once
 
 ```sh
