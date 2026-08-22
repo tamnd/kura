@@ -381,8 +381,10 @@ Choosing what to fold is `--due`, which asks the policy in `kura_core::policy` a
   file bytes              153060641
 
   level 0       9 segments, 8 allowed,       18689801 bytes
+                        0 of 10884 documents deleted, a rewrite is due at 3266
 
-  folding 9 segments at level 0, 18689801 bytes, because level zero is full
+  folding 9 of them at level 0, 18689801 bytes and 0 of 10884 documents deleted,
+  into level 1, because level zero is full
 ```
 
 The rule is eight segments at level zero and a growth factor of ten above it.
@@ -390,14 +392,47 @@ Every commit adds a segment at level zero, eight of them are eight posting lists
 Past level zero a level is allowed ten times what a level zero segment weighs, so level one holds 1.28 GB and level two holds 12.8 GB, and a level is folded into the next when the segments at it come to more than that.
 The factor is what keeps the number of levels logarithmic in the size of the store, and every level is a segment every query opens.
 
-A fold can only take segments that sit next to each other in the manifest, because their order is what decides which copy of a key wins, so the policy reads each level as runs and a run of one is never folded.
+A fold can only take segments that sit next to each other in the manifest, because their order is what decides which copy of a key wins, so the policy reads each level as runs, and neither of the two size rules will fold a run of one.
 Asking again after that fold says what it looked at and that there is nothing to do:
 
 ```
   level 1       1 segment,       16339149 bytes of 1342177280 allowed
+                        0 of 10884 documents deleted, a rewrite is due at 3266
 
   nothing is due, so nothing was folded
 ```
+
+The third rule is dead weight, and it is the one rule that will take a run of one.
+A deleted document is still in the segment it was written to and still costs what a live one costs, which is a posting to skip in every list it appears in and an entry in the key filter, so once three in ten of the documents in a run are deleted the run is rewritten without them.
+Indexing the same tree into the same store twice is the case: the second run replaces every document, and half the store is then documents that have stopped answering.
+
+```sh
+./target/release/kura-cli index ./src -o /tmp/dead.kura --store
+./target/release/kura-cli index ./src -o /tmp/dead.kura --store
+./target/release/kura-cli compact /tmp/dead.kura --due
+```
+
+```
+  segments                        2
+  documents                   21768
+    live                      10884
+
+  level 0       2 segments, 8 allowed,       32678313 bytes
+                    10884 of 21768 documents deleted, a rewrite is due at 6531
+
+  folding 2 of them at level 0, 32678313 bytes and 10884 of 21768 documents deleted,
+  into level 0, because enough of it is deleted to pay for the rewrite
+
+  fold wall                    0.16 s
+  merged documents            10884
+    left behind               10884
+```
+
+That is 10,884 documents rewritten in 0.16 s, and the segment that comes out sits at the level the ones that went in were at rather than a level deeper.
+A rewrite that only drops what is dead is not a level of growth, and promoting it would walk a segment down the levels every time somebody deleted from it until it sat at a level whose capacity nothing could ever fill.
+
+What the file does in the meantime is grow, from 167.0 MB to 183.4 MB across that fold, because nothing is reclaimed yet and the segments the fold replaced are still where they were.
+The segment count and the live document count are what come back today, and giving the space back is its own piece of work.
 
 One fold per call, deliberately, because a store that is far behind needs several and each of them changes what the next decision should be.
 When to run it is still the caller's, and the rate limit and the backpressure that turn this from a rule into a policy are not written yet.

@@ -901,6 +901,33 @@ impl Store {
         created: u64,
         written: u64,
     ) -> Result<Compacted> {
+        self.compact_into(run, None, created, written)
+    }
+
+    /// Folds a run and puts the replacement at the level it is told to.
+    ///
+    /// [`compact`](Self::compact) is this with `level` left as `None`, which
+    /// means one past the deepest segment in the run. That is the right answer
+    /// for a fold that happened because a level grew, and the wrong one for a
+    /// fold that happened because a run was full of deleted documents: nothing
+    /// there grew, the run was rewritten in place to drop what was dead, and
+    /// promoting it would walk a segment down the levels every time somebody
+    /// deleted from it. So the caller that knows why it is folding says where
+    /// the result belongs.
+    ///
+    /// The level is a manifest field and nothing else reads it, so a number
+    /// written here is not checked against anything in the segment itself.
+    ///
+    /// # Errors
+    ///
+    /// As [`compact`](Self::compact).
+    pub fn compact_into(
+        &mut self,
+        run: core::ops::Range<usize>,
+        level: Option<u32>,
+        created: u64,
+        written: u64,
+    ) -> Result<Compacted> {
         if run.is_empty() || run.end > self.manifest.segments.len() {
             return Err(Trouble::Format(Error::MissingSection { kind: 0 }));
         }
@@ -928,16 +955,17 @@ impl Store {
                     .saturating_add(u64::from(segment.tombstones_len))
             })
             .sum();
-        // One past the deepest source, which is what a size tiered policy reads
-        // to tell a segment that has been folded once from one that has been
-        // folded five times. A policy that numbers its levels some other way is
-        // free to write its own number in afterwards.
-        let level = sources
-            .iter()
-            .map(|segment| segment.level)
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1);
+        // One past the deepest source unless the caller said otherwise, which is
+        // what a size tiered policy reads to tell a segment that has been folded
+        // once from one that has been folded five times.
+        let level = level.unwrap_or_else(|| {
+            sources
+                .iter()
+                .map(|segment| segment.level)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1)
+        });
         let documents = merged.documents;
         let folded = run.len();
 

@@ -3,10 +3,10 @@
 //! [`compact`](crate::compact) writes a replacement for some segments and
 //! [`Store::compact`](crate::file::Store::compact) swaps it in. Neither of them
 //! decides anything. This is the part that looks at a store and says which fold
-//! is due, and it is a function of the manifest alone: no file, no clock, no
-//! reader, so a policy question can be asked of a store that is a hundred
-//! gigabytes without opening it and can be tested by writing down a list of
-//! segments.
+//! is due, and it is a function of the manifest and a count of the deleted
+//! documents in each segment: no file, no clock, no reader, so a policy question
+//! can be asked of a store that is a hundred gigabytes without opening it and
+//! can be tested by writing down a list of segments.
 //!
 //! # The shape
 //!
@@ -25,6 +25,14 @@
 //! of ten and thirty at a factor of two, and every level is a segment every
 //! query opens.
 //!
+//! Beside those two there is the tombstone trigger, which is the only one that
+//! does not care about size or count. A deleted document is still in the segment
+//! it was written to and still costs what a live one costs: a posting to skip in
+//! every list it appears in, an entry in the key filter, a row of the columns
+//! and a slot in the vectors. Once three in ten of the documents in a run are
+//! dead, a rewrite of that run pays for itself, and it is the one fold that
+//! gives space back rather than only giving back segment count.
+//!
 //! # Why a run and not a set
 //!
 //! A fold can only take a contiguous run of the manifest, because the position
@@ -36,10 +44,23 @@
 //! the same level with something else between them are two candidates rather
 //! than one.
 //!
-//! That is also why a fold of a single segment is never chosen here. It is a
-//! copy of the segment with its deleted documents left out, which is a thing
-//! worth doing when there are enough of them to pay for it, and that is the
-//! tombstone trigger rather than this one.
+//! That is also why the two size rules never choose a run of one. A fold of a
+//! single segment is a copy of it with its deleted documents left out, which is
+//! worth doing when there are enough of them to pay for it and is worth nothing
+//! at all when there are not, so it belongs to the tombstone trigger and to
+//! nothing else. The tombstone trigger is the one rule here that will take a run
+//! of one.
+//!
+//! # Where the replacement lands
+//!
+//! A size fold puts what it wrote one level deeper than the run it read, because
+//! that is what the level number is for: it says how many folds a segment has
+//! been through and therefore what it is expected to weigh. A tombstone fold
+//! does not. Nothing about that run grew, it was rewritten in place to drop what
+//! was dead in it, and promoting it would walk a segment down the levels every
+//! time somebody deleted from it until it sat at a level whose capacity nothing
+//! could ever fill. So a job carries the level its replacement should land at
+//! rather than leaving the caller to assume.
 //!
 //! # What it does not do
 //!
@@ -72,6 +93,17 @@ const GROWTH: u64 = 10;
 /// be a second answer to a question that already has one.
 const BASE: u64 = 128 << 20;
 
+/// How many of every hundred documents in a run have to be deleted before
+/// rewriting it is worth the read and the write.
+///
+/// Thirty is a trade rather than a derivation. Fold at a smaller share and a
+/// store spends its write bandwidth copying documents that were live anyway,
+/// fold at a larger one and every query walks postings for documents that
+/// stopped answering long ago. Thirty is roughly where the two costs meet on the
+/// stores this has been run on, and it is the figure most of the engines that
+/// have had this argument before settled on.
+const DEAD_SHARE: u32 = 30;
+
 /// The rule a store is folded by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Policy {
@@ -82,6 +114,9 @@ pub struct Policy {
     /// What a level zero segment is expected to weigh, which is what every
     /// level's capacity is measured in multiples of.
     pub base: u64,
+    /// How many of every hundred documents in a run have to be deleted before a
+    /// rewrite of it is due.
+    pub dead_share: u32,
 }
 
 impl Default for Policy {
@@ -90,6 +125,7 @@ impl Default for Policy {
             level_zero_cap: LEVEL_ZERO_CAP,
             growth: GROWTH,
             base: BASE,
+            dead_share: DEAD_SHARE,
         }
     }
 }
@@ -105,6 +141,8 @@ pub enum Reason {
     LevelZeroFull,
     /// The segments at a level come to more than the level holds.
     OverCapacity,
+    /// Enough of the documents in the run are deleted to pay for rewriting it.
+    Deleted,
 }
 
 impl Reason {
@@ -114,6 +152,7 @@ impl Reason {
         match self {
             Self::LevelZeroFull => "level zero is full",
             Self::OverCapacity => "the level holds more than it is allowed",
+            Self::Deleted => "enough of it is deleted to pay for the rewrite",
         }
     }
 }
@@ -124,13 +163,21 @@ impl Reason {
 pub struct Job {
     /// Which segments, as positions in the manifest.
     pub run: Range<usize>,
-    /// Which level they are at now. The replacement lands one past it.
+    /// Which level they are at now.
     pub level: u32,
+    /// Which level the replacement should land at, which is one past `level`
+    /// for the two size rules and `level` itself for a rewrite that only drops
+    /// what is dead.
+    pub into: u32,
     /// Which rule chose them.
     pub reason: Reason,
     /// How many bytes of segment and tombstone the run comes to, which is the
     /// work the fold has to read and roughly what it will write.
     pub bytes: u64,
+    /// How many documents the run holds, including the deleted ones.
+    pub docs: u64,
+    /// How many of those are deleted, which is what the rewrite gets back.
+    pub dead: u64,
 }
 
 impl Policy {
@@ -154,19 +201,48 @@ impl Policy {
         room
     }
 
-    /// The fold that is due, or nothing if none is.
+    /// The fold that is due, or nothing if none is, knowing nothing about what
+    /// has been deleted.
     ///
-    /// Level zero is asked first, because it is the trigger an ingest run keeps
-    /// pulling and the one whose cost every query pays. After that the runs are
-    /// taken in the order they sit in the file, which is oldest first, so a
-    /// store with two levels over capacity folds the older one first and the
-    /// newer one on the next call.
+    /// This is the manifest on its own, which is all a caller holding a manifest
+    /// and no file has. The tombstone trigger cannot fire from it, because how
+    /// many documents in a segment are deleted is in the bitmap beside the
+    /// segment rather than in the manifest. Use [`choose_with`](Self::choose_with)
+    /// where those counts can be had.
     #[must_use]
     pub fn choose(self, segments: &[Segment]) -> Option<Job> {
-        let runs = runs(segments);
+        self.choose_with(segments, &[])
+    }
+
+    /// The fold that is due, given how many documents in each segment are
+    /// deleted.
+    ///
+    /// `deleted` is read by position and a position it does not reach counts as
+    /// nothing deleted, so a caller that has the counts for some segments and
+    /// not others is not obliged to invent the rest.
+    ///
+    /// Level zero is asked first, because it is the trigger an ingest run keeps
+    /// pulling and the one whose cost every query pays. Dead weight is asked
+    /// next, because it is the only fold that gives space back and because a
+    /// level that is over capacity for the third time in an hour is usually a
+    /// level full of documents that were replaced rather than one that grew.
+    /// Size is asked last. Within each rule the runs are taken in the order they
+    /// sit in the file, which is oldest first, so a store with two runs due
+    /// folds the older one first and the newer one on the next call.
+    #[must_use]
+    pub fn choose_with(self, segments: &[Segment], deleted: &[u64]) -> Option<Job> {
+        let runs = runs(segments, deleted);
         for run in &runs {
             if run.level == 0 && run.run.len() >= self.level_zero_cap {
                 return Some(job(run, Reason::LevelZeroFull));
+            }
+        }
+        for run in &runs {
+            if run.docs > 0
+                && run.dead.saturating_mul(100)
+                    >= run.docs.saturating_mul(u64::from(self.dead_share))
+            {
+                return Some(job(run, Reason::Deleted));
             }
         }
         for run in &runs {
@@ -182,11 +258,18 @@ impl Policy {
 
 /// One run and a reason, as a job.
 fn job(run: &Stretch, reason: Reason) -> Job {
+    let into = match reason {
+        Reason::Deleted => run.level,
+        Reason::LevelZeroFull | Reason::OverCapacity => run.level.saturating_add(1),
+    };
     Job {
         run: run.run.clone(),
         level: run.level,
+        into,
         reason,
         bytes: run.bytes,
+        docs: run.docs,
+        dead: run.dead,
     }
 }
 
@@ -196,24 +279,35 @@ struct Stretch {
     run: Range<usize>,
     level: u32,
     bytes: u64,
+    docs: u64,
+    dead: u64,
 }
 
 /// Every maximal run of one level, in the order they sit in the file.
-fn runs(segments: &[Segment]) -> Vec<Stretch> {
+fn runs(segments: &[Segment], deleted: &[u64]) -> Vec<Stretch> {
     let mut found: Vec<Stretch> = Vec::new();
     for (at, segment) in segments.iter().enumerate() {
         let weight = segment
             .len
             .saturating_add(u64::from(segment.tombstones_len));
+        let docs = u64::from(segment.docs);
+        // A count past the end of the segment's own documents would make a run
+        // look more than entirely dead, which is a number no report should ever
+        // print.
+        let dead = deleted.get(at).copied().unwrap_or(0).min(docs);
         match found.last_mut() {
             Some(open) if open.level == segment.level => {
                 open.run.end = at + 1;
                 open.bytes = open.bytes.saturating_add(weight);
+                open.docs = open.docs.saturating_add(docs);
+                open.dead = open.dead.saturating_add(dead);
             }
             _ => found.push(Stretch {
                 run: at..at + 1,
                 level: segment.level,
                 bytes: weight,
+                docs,
+                dead,
             }),
         }
     }
@@ -224,12 +318,16 @@ fn runs(segments: &[Segment]) -> Vec<Stretch> {
 mod tests {
     use super::*;
 
-    /// A segment at a level, of a size, with nothing else in it that a policy
-    /// reads.
+    /// A segment at a level, of a size, holding ten documents.
+    ///
+    /// Ten because the tombstone rule counts in hundredths and a run of ten
+    /// documents is the smallest one where three of them is the threshold
+    /// exactly.
     fn segment(level: u32, len: u64) -> Segment {
         Segment {
             len,
             level,
+            docs: 10,
             ..Segment::default()
         }
     }
@@ -328,8 +426,105 @@ mod tests {
     }
 
     #[test]
+    fn a_run_is_rewritten_once_enough_of_it_is_dead() {
+        let policy = Policy::default();
+        // One segment of ten documents, sitting at a level where no size rule
+        // will ever look at it on its own.
+        let alone = vec![segment(2, 1 << 20)];
+        assert_eq!(policy.choose_with(&alone, &[2]), None);
+
+        let job = policy.choose_with(&alone, &[3]).expect("three in ten");
+        assert_eq!(job.run, 0..1);
+        assert_eq!(job.level, 2);
+        assert_eq!(job.reason, Reason::Deleted);
+        assert_eq!(job.docs, 10);
+        assert_eq!(job.dead, 3);
+    }
+
+    #[test]
+    fn a_rewrite_that_only_drops_the_dead_stays_where_it_is() {
+        let policy = Policy::default();
+        let alone = vec![segment(3, 1 << 20)];
+        let job = policy.choose_with(&alone, &[9]).expect("nine in ten");
+        assert_eq!(job.into, job.level, "a rewrite in place is not a promotion");
+
+        // Where a size rule chose it, the replacement is a level deeper.
+        let full = several(0, 1 << 20, 8);
+        let job = policy.choose(&full).expect("level zero is full");
+        assert_eq!(job.into, 1);
+    }
+
+    #[test]
+    fn the_dead_are_counted_across_the_run_rather_than_segment_by_segment() {
+        let policy = Policy::default();
+        // Four segments of ten at the same level, one of them entirely dead.
+        // Ten in forty is a quarter, which is under the share, so the run is
+        // left alone even though one segment in it is nothing but deletions.
+        let run = several(1, 1 << 20, 4);
+        assert_eq!(policy.choose_with(&run, &[10, 0, 0, 0]), None);
+        let job = policy
+            .choose_with(&run, &[10, 2, 0, 0])
+            .expect("twelve in forty");
+        assert_eq!(job.run, 0..4);
+        assert_eq!(job.dead, 12);
+    }
+
+    #[test]
+    fn dead_weight_is_folded_before_a_level_that_is_over_capacity() {
+        let policy = Policy::default();
+        let mut segments = several(1, policy.base, 11);
+        segments.push(segment(2, 1 << 20));
+        let mut deleted = vec![0; 11];
+        deleted.push(5);
+        let job = policy
+            .choose_with(&segments, &deleted)
+            .expect("a fold is due");
+        assert_eq!(job.reason, Reason::Deleted);
+        assert_eq!(job.run, 11..12);
+    }
+
+    #[test]
+    fn a_full_level_zero_is_folded_before_dead_weight() {
+        let policy = Policy::default();
+        let mut segments = vec![segment(1, 1 << 20)];
+        segments.extend(several(0, 1 << 20, 8));
+        let mut deleted = vec![10];
+        deleted.extend(std::iter::repeat_n(0, 8));
+        let job = policy
+            .choose_with(&segments, &deleted)
+            .expect("a fold is due");
+        assert_eq!(job.reason, Reason::LevelZeroFull);
+        assert_eq!(job.run, 1..9);
+    }
+
+    #[test]
+    fn a_manifest_on_its_own_never_says_a_rewrite_is_due() {
+        // Nothing in a manifest says how many documents in a segment are
+        // deleted, so a caller that has not been given the counts is told that
+        // nothing is due rather than being told a guess.
+        let mut alone = vec![segment(2, 1 << 20)];
+        alone[0].tombstones_len = 4096;
+        assert_eq!(Policy::default().choose(&alone), None);
+    }
+
+    #[test]
+    fn more_deletions_than_documents_are_taken_as_all_of_them() {
+        // A count that disagrees with the manifest is a bug somewhere, and the
+        // answer here is a run that is entirely dead rather than a report that
+        // says two hundred percent of it is.
+        let alone = vec![segment(2, 1 << 20)];
+        let job = Policy::default()
+            .choose_with(&alone, &[1000])
+            .expect("all of it");
+        assert_eq!(job.docs, 10);
+        assert_eq!(job.dead, 10);
+    }
+
+    #[test]
     fn a_reason_says_what_it_was() {
         assert_ne!(Reason::LevelZeroFull.why(), Reason::OverCapacity.why());
+        assert_ne!(Reason::Deleted.why(), Reason::OverCapacity.why());
         assert!(!Reason::LevelZeroFull.why().is_empty());
+        assert!(!Reason::Deleted.why().is_empty());
     }
 }
