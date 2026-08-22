@@ -41,6 +41,7 @@ pub mod manifest;
 #[cfg(feature = "fs")]
 pub mod mapping;
 pub mod migrate;
+pub mod policy;
 pub mod posting;
 pub mod residency;
 pub mod search;

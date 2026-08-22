@@ -368,7 +368,39 @@ The match counts are the same on both sides, which is the check that matters: a 
 What the fold takes away is the work of walking sixteen dictionaries and then throwing away seven postings in every eight, and the queries come out about five times faster for it.
 The part of the file a query reads goes from 132.7 MB to 15.8 MB at the same time, which is the number that decides how much of an index has to stay in memory.
 
-Choosing when to fold and what to fold is policy and is not here yet, so this is a command somebody runs rather than something the store does on its own.
+Choosing what to fold is `--due`, which asks the policy in `kura_core::policy` and folds the one run it says is due:
+
+```sh
+./target/release/kura-cli compact /tmp/docs.kura --due
+```
+
+```
+  segments                        9
+  documents                   10884
+    live                      10884
+  file bytes              153060641
+
+  level 0       9 segments, 8 allowed,       18689801 bytes
+
+  folding 9 segments at level 0, 18689801 bytes, because level zero is full
+```
+
+The rule is eight segments at level zero and a growth factor of ten above it.
+Every commit adds a segment at level zero, eight of them are eight posting lists to walk for a term and eight key filters to ask before a document can be called new, and folding them into one at level one turns that back into one of each.
+Past level zero a level is allowed ten times what a level zero segment weighs, so level one holds 1.28 GB and level two holds 12.8 GB, and a level is folded into the next when the segments at it come to more than that.
+The factor is what keeps the number of levels logarithmic in the size of the store, and every level is a segment every query opens.
+
+A fold can only take segments that sit next to each other in the manifest, because their order is what decides which copy of a key wins, so the policy reads each level as runs and a run of one is never folded.
+Asking again after that fold says what it looked at and that there is nothing to do:
+
+```
+  level 1       1 segment,       16339149 bytes of 1342177280 allowed
+
+  nothing is due, so nothing was folded
+```
+
+One fold per call, deliberately, because a store that is far behind needs several and each of them changes what the next decision should be.
+When to run it is still the caller's, and the rate limit and the backpressure that turn this from a rule into a policy are not written yet.
 
 A run without `--store` writes a single segment and keys nothing, because a file is not a store and there is nothing in it to replace.
 
