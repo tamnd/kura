@@ -129,6 +129,39 @@ pub fn check(path: &Path, out: &mut impl Write) -> io::Result<Outcome> {
 /// manifest rather than to nothing. So a store where only one slot decodes is a
 /// store doing what it was designed to do, and this reports which slot is
 /// committed rather than calling the other one damage.
+/// Says what the log holds that no segment does, and how many failures that was.
+///
+/// Counted by walking the records rather than by subtracting the manifest's two
+/// positions, because a store that stopped without warning has records past the
+/// tail the last commit wrote down and those are exactly the ones worth knowing
+/// about. Nothing is applied and nothing is written: a store this reports on is a
+/// store still waiting for its replay.
+///
+/// The records themselves are not read out. This says how many there are and
+/// what they come to, and the tool that prints what is inside an index is the
+/// one that names things.
+fn log(file: &[u8], out: &mut impl Write) -> io::Result<usize> {
+    match kura_core::file::walk_log(file, |_| ()) {
+        Ok(walked) if walked.records > 0 => {
+            writeln!(
+                out,
+                "    {} records to replay, {}",
+                walked.records,
+                bytes(walked.bytes)
+            )?;
+            Ok(0)
+        }
+        Ok(_) => {
+            writeln!(out, "    nothing to replay")?;
+            Ok(0)
+        }
+        Err(error) => {
+            writeln!(out, "    the log does not walk, {error}")?;
+            Ok(1)
+        }
+    }
+}
+
 fn store(file: &[u8], out: &mut impl Write) -> io::Result<Outcome> {
     let mut outcome = Outcome::default();
 
@@ -186,6 +219,7 @@ fn store(file: &[u8], out: &mut impl Write) -> io::Result<Outcome> {
     writeln!(out, "  documents    {:>12}", manifest.live)?;
     writeln!(out, "  with deleted {:>12}", manifest.total)?;
     writeln!(out, "  log          {:>12}", bytes(superblock.wal_len))?;
+    outcome.failures += log(file, out)?;
     writeln!(out, "  segments     {:>12}", manifest.segments.len())?;
     // No share of the file here, unlike the sections inside a segment. Most of a
     // store's length is a log region that is reserved up front and sparse until

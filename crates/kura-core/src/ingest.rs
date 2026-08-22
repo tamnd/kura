@@ -25,6 +25,13 @@
 //! batch with the log underneath it: each document goes into the log as it
 //! arrives, and the commit is ordered so that the log and the manifest cannot
 //! disagree about which documents made it.
+//!
+//! [`replay`] is the other end of that. A store that stopped without warning
+//! comes back with records in its log that no segment holds, and a replay turns
+//! them into a segment and commits it, in the same order and for the same
+//! reason. A store nobody crashed has an empty log and a replay does nothing to
+//! it, which is what makes it something to do on every open rather than
+//! something to decide about.
 
 use std::collections::HashMap;
 
@@ -172,6 +179,26 @@ impl<'a> Batch<'a> {
             .add_keyed_with_fields(key, text, fields)
             .map_err(Trouble::Format)?;
         self.replacing(key, doc)?;
+        Ok(doc)
+    }
+
+    /// Adds a document that came out of the log.
+    ///
+    /// The record holds the analysed form, so this does not run the analyser and
+    /// cannot disagree with the index the record was written beside. A record
+    /// with a key replaces under that key exactly as [`add_keyed`](Self::add_keyed)
+    /// would, which is what makes a replay of a batch of replacements land where
+    /// the batch would have.
+    ///
+    /// # Errors
+    ///
+    /// As [`index::Writer::add_record`], and a decoding error if the record's
+    /// fields or a set of deletions in the view do not decode.
+    pub fn add_record(&mut self, record: &upsert::Record<'_>) -> Result<DocId> {
+        let doc = self.writer.add_record(record).map_err(Trouble::Format)?;
+        if let Some(key) = record.key() {
+            self.replacing(key, doc)?;
+        }
         Ok(doc)
     }
 
@@ -622,6 +649,119 @@ impl Pending<'_> {
         self.store.truncate_log(self.through)?;
         self.prepared.commit(self.store, created, written)
     }
+}
+
+/// What a replay put back.
+///
+/// Made by [`replay`]. Every count is about the records the log held, so a store
+/// that was closed cleanly gives back one of these with nothing in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Replayed {
+    /// How many records were read out of the log.
+    pub records: u64,
+    /// What their payloads came to.
+    pub bytes: u64,
+    /// How many documents went into the segment that was committed, which is
+    /// the same as the records unless a record was damaged.
+    pub documents: u32,
+    /// How many of them replaced a document, in the store or earlier in the log.
+    pub replacements: usize,
+    /// The epoch of the commit that made them visible, or nothing if the log had
+    /// nothing to put back and no commit happened.
+    pub epoch: Option<u64>,
+}
+
+impl Replayed {
+    /// Whether the log had nothing in it.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.records == 0
+    }
+}
+
+/// Puts back the documents the log holds and nothing else is holding.
+///
+/// This is what a store does when it opens: the manifest says what is in
+/// segments, the log says what was promised after that and never got there, and
+/// this is the difference between the two turned into a segment and committed.
+/// A store that was closed cleanly has an empty log and this does nothing to it,
+/// so it costs a walk that ends at the first byte.
+///
+/// # The order, again
+///
+/// The same order [`Pending::commit`] uses and for the same reason. The log is
+/// freed first and the segment published second, because the freed head only
+/// reaches the platter inside the manifest the publish writes. So a machine that
+/// stops in the middle of a replay comes back with the log exactly as it was and
+/// replays the same records again, and one that stops after it comes back with
+/// them in a segment and nothing to replay. Replaying twice is not a risk that
+/// has to be reasoned about, it is the ordinary case.
+///
+/// A key replayed twice replaces under that key twice, which is what the batch
+/// that logged it did, so the documents that come back are the ones that would
+/// have been there rather than every version of them.
+///
+/// # What it holds
+///
+/// A segment, built from every record the log had, which is bounded by the ring
+/// and not by anything this decides. A store with a quarter of a gigabyte of
+/// records to put back builds a segment out of all of them at once. That is the
+/// same bound a batch has and the same answer as the flush trigger, and it is
+/// not solved here.
+///
+/// # Errors
+///
+/// Returns [`Trouble::Io`] if the log cannot be read, [`Trouble::Format`] with
+/// [`Error::UnknownRecord`] if the log holds a record this build cannot apply,
+/// and whatever [`Prepared::commit`] returns if the commit fails. Damage in the
+/// log is not one of them: a torn record at the end is where the log ends, and
+/// the records before it are put back.
+pub fn replay(store: &mut Store, created: u64, written: u64) -> Result<Replayed> {
+    let view = store.view()?;
+    let mut batch = Batch::over(&view)?;
+    // The first thing that goes wrong stops the replay applying records and is
+    // returned once the walk is over. The walk hands records to a closure that
+    // cannot fail, which is right, because the walk's business is what is in the
+    // log and not what applying it does.
+    let mut trouble: Option<Trouble> = None;
+    let walked = store.recover(|record| {
+        if trouble.is_some() {
+            return;
+        }
+        if record.kind != upsert::KIND {
+            trouble = Some(Trouble::Format(Error::UnknownRecord {
+                kind: record.kind,
+                position: record.position,
+            }));
+            return;
+        }
+        if let Err(problem) = upsert::Record::read(record.payload)
+            .map_err(Trouble::Format)
+            .and_then(|held| batch.add_record(&held))
+        {
+            trouble = Some(problem);
+        }
+    })?;
+    if let Some(trouble) = trouble {
+        return Err(trouble);
+    }
+    if walked.records == 0 {
+        return Ok(Replayed::default());
+    }
+
+    let replacements = batch.replacements();
+    let through = store.log().tail();
+    let prepared = batch.finish()?;
+    let documents = prepared.segment.as_ref().map_or(0, |&(_, docs)| docs);
+    store.truncate_log(through)?;
+    let epoch = prepared.commit(store, created, written)?;
+    Ok(Replayed {
+        records: walked.records,
+        bytes: walked.bytes,
+        documents,
+        replacements,
+        epoch: Some(epoch),
+    })
 }
 
 /// A batch that has been turned into a segment and a set of deletions.
@@ -1147,5 +1287,256 @@ mod tests {
             .expect("the log walks");
         assert_eq!(seen, vec![("path".to_string(), b"docs/a.md".to_vec())]);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Fills a logged batch with the corpus and drops it, which is the machine
+    /// stopping with a batch half full.
+    fn stopped(store: &mut Store, documents: &[(&[u8], &str)]) {
+        let view = store.view().expect("a view");
+        let mut batch = Logged::over(&view, store).expect("a batch");
+        for (key, text) in documents {
+            batch.add_keyed(key, text).expect("added");
+        }
+    }
+
+    #[test]
+    fn a_store_that_stopped_comes_back_with_the_documents_its_log_holds() {
+        let path = path("replay");
+        let mut store = empty(&path);
+        stopped(&mut store, &CORPUS);
+        drop(store);
+
+        let mut store = Store::open(&path).expect("the store opens");
+        assert_eq!(count(&store, "ledger"), 0, "before the replay, nothing");
+        let put_back = replay(&mut store, 1_700_000_001, 1).expect("the replay finishes");
+
+        assert_eq!(put_back.records, 4);
+        assert_eq!(put_back.documents, 4);
+        assert_eq!(put_back.replacements, 0);
+        assert!(put_back.bytes > 0);
+        assert!(
+            put_back.epoch.is_some(),
+            "a replay that put documents back \
+            committed them"
+        );
+        assert_eq!(store.manifest().live, 4);
+        assert_eq!(count(&store, "ledger"), 3);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_replay_leaves_a_log_with_nothing_left_to_replay() {
+        let path = path("replay-once");
+        let mut store = empty(&path);
+        stopped(&mut store, &CORPUS);
+        drop(store);
+
+        let mut store = Store::open(&path).expect("the store opens");
+        replay(&mut store, 1_700_000_001, 1).expect("the replay finishes");
+        drop(store);
+
+        // Reopened rather than replayed again in place, because the freed head
+        // has to be on the platter and not only in memory. A second replay that
+        // found the same records would put every document in twice.
+        let mut store = Store::open(&path).expect("the store opens");
+        let again = replay(&mut store, 1_700_000_002, 2).expect("the replay finishes");
+        assert!(again.is_empty(), "the log was freed by the first replay");
+        assert_eq!(again.epoch, None, "and nothing was committed for it");
+        assert_eq!(store.manifest().live, 4);
+        assert_eq!(count(&store, "ledger"), 3);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_replay_of_a_store_that_was_closed_cleanly_does_nothing() {
+        let path = path("replay-clean");
+        let mut store = empty(&path);
+        write(&mut store, &CORPUS);
+        let before = store.manifest().epoch;
+        drop(store);
+
+        let mut store = Store::open(&path).expect("the store opens");
+        let put_back = replay(&mut store, 1_700_000_002, 2).expect("the replay finishes");
+        assert!(put_back.is_empty());
+        assert_eq!(
+            store.manifest().epoch,
+            before,
+            "a replay with nothing to do commits nothing"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_replayed_document_replaces_what_the_store_holds_under_its_key() {
+        let path = path("replay-replace");
+        let mut store = empty(&path);
+        write(&mut store, &[(b"a", "the first quarter ledger")]);
+        stopped(&mut store, &[(b"a", "the second quarter ledger")]);
+        drop(store);
+
+        let mut store = Store::open(&path).expect("the store opens");
+        let put_back = replay(&mut store, 1_700_000_002, 2).expect("the replay finishes");
+
+        assert_eq!(put_back.documents, 1);
+        assert_eq!(put_back.replacements, 1, "the older copy went with it");
+        assert_eq!(count(&store, "ledger"), 1);
+        assert_eq!(count(&store, "second"), 1);
+        assert_eq!(count(&store, "first"), 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_replay_writes_the_segment_the_batch_would_have_committed() {
+        // The claim the whole thing rests on. A store that was interrupted and
+        // replayed has to be the store that committed, byte for byte, or the
+        // log is a different index that happens to hold the same documents.
+        let committed = path("replay-against-committed");
+        let interrupted = path("replay-against-replayed");
+        let mut one = empty(&committed);
+        {
+            let view = one.view().expect("a view");
+            let mut batch = Logged::over(&view, &mut one).expect("a batch");
+            for (key, text) in CORPUS {
+                batch.add_keyed(key, text).expect("added");
+            }
+            batch.commit(1_700_000_001, 1).expect("committed");
+        }
+
+        let mut two = empty(&interrupted);
+        stopped(&mut two, &CORPUS);
+        drop(two);
+        let mut two = Store::open(&interrupted).expect("the store opens");
+        replay(&mut two, 1_700_000_001, 1).expect("the replay finishes");
+
+        let left = one.view().expect("a view");
+        let right = two.view().expect("a view");
+        assert_eq!(left.bytes(0), right.bytes(0));
+        let _ = std::fs::remove_file(&committed);
+        let _ = std::fs::remove_file(&interrupted);
+    }
+
+    #[test]
+    fn a_record_this_build_cannot_apply_stops_the_replay_rather_than_being_skipped() {
+        let path = path("replay-unknown");
+        let mut store = empty(&path);
+        let before = store.manifest().epoch;
+        store
+            .append(4242, b"a record from a build that came later")
+            .expect("appended");
+        store.sync().expect("synced");
+        drop(store);
+
+        let mut store = Store::open(&path).expect("the store opens");
+        let refused = replay(&mut store, 1_700_000_001, 1);
+        assert!(
+            matches!(
+                refused,
+                Err(Trouble::Format(Error::UnknownRecord { kind: 4242, .. }))
+            ),
+            "a replay that skipped it would lose a write the store promised"
+        );
+        assert_eq!(
+            store.manifest().epoch,
+            before,
+            "and it leaves the store where it was"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Overwrites part of a store with zeroes, which is what a machine that
+    /// stopped leaves behind when the bytes never reached the platter.
+    fn tear(path: &std::path::Path, at: u64, len: u64) {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("the store opens for writing");
+        file.seek(SeekFrom::Start(at)).expect("seeks");
+        file.write_all(&vec![
+            0u8;
+            usize::try_from(len).expect("a length that fits")
+        ])
+        .expect("writes");
+        file.sync_all().expect("syncs");
+    }
+
+    #[test]
+    fn a_log_torn_at_any_page_boundary_gives_back_what_was_promised() {
+        // The fault matrix. Every 4 KiB boundary in the window that was written
+        // since the last commit is a place a machine can stop, so the store is
+        // torn at each of them in turn and opened. What a commit returned for is
+        // there every time, and what was only logged comes back as far as the
+        // tear and no further.
+        let source = path("replay-torn");
+        // A megabyte of ring rather than the default quarter of a gigabyte, so
+        // that a copy of the file per boundary is cheap.
+        let mut store =
+            Store::create_with_log(&source, STORE, 1_700_000_000, 1 << 20).expect("a store");
+        write(&mut store, &[(b"audited", "the audited quarter ledger")]);
+        let keys: Vec<String> = (0..200).map(|n| format!("pending-{n:04}")).collect();
+        let pending: Vec<(&[u8], &str)> = keys
+            .iter()
+            .map(|key| (key.as_bytes(), "a pending quarter ledger entry"))
+            .collect();
+        stopped(&mut store, &pending);
+
+        let base = store.superblock().wal_offset;
+        let head = store.manifest().wal_head;
+        let tail = store.log().tail();
+        drop(store);
+        assert!(
+            tail >= head + 3 * 4096,
+            "the window is {} bytes, which is not enough boundaries to be a matrix",
+            tail - head
+        );
+
+        let mut cuts: Vec<u64> = (head..tail).step_by(4096).collect();
+        cuts.push(tail);
+        let mut before = 0;
+        for cut in cuts {
+            let torn = path(&format!("replay-torn-at-{cut}"));
+            std::fs::copy(&source, &torn).expect("a copy of the store");
+            tear(&torn, base + cut, tail - cut);
+
+            let mut store = Store::open(&torn).expect("the store opens");
+            let put_back = replay(&mut store, 1_700_000_002, 2).expect("the replay finishes");
+            let recovered = put_back.documents as usize;
+
+            assert_eq!(
+                count(&store, "audited"),
+                1,
+                "the committed document survived a tear at {cut}"
+            );
+            assert!(
+                recovered <= keys.len(),
+                "a tear at {cut} put back {recovered} documents out of {}",
+                keys.len()
+            );
+            assert!(
+                recovered >= before,
+                "a tear at {cut} put back {recovered} where a tear before it put back {before}"
+            );
+            // A prefix and not a subset. The records are in the log in the order
+            // they were written, so a tear takes the end of that order off and
+            // cannot take a document out of the middle.
+            let view = store.view().expect("a view");
+            for (at, key) in keys.iter().enumerate() {
+                let found = view
+                    .document(key.as_bytes())
+                    .expect("the key index reads")
+                    .is_some();
+                assert_eq!(
+                    found,
+                    at < recovered,
+                    "document {at} after a tear at {cut} that put back {recovered}"
+                );
+            }
+            before = recovered;
+            drop(view);
+            drop(store);
+            let _ = std::fs::remove_file(&torn);
+        }
+        assert_eq!(before, keys.len(), "an untorn log gives everything back");
+        let _ = std::fs::remove_file(&source);
     }
 }
