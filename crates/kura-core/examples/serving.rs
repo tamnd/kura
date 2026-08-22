@@ -74,6 +74,14 @@
 //! nothing else about the two rows differs, so they are read against each other
 //! whole rather than at a matched count.
 //!
+//! Arriving forks once more, into the page faults and the bytes themselves, and
+//! that one is answered by counting rather than by another row. Every round has
+//! the fault counters read around it and reports what it faulted for each query
+//! the reader got through. The counters belong to the process rather than to
+//! the reader, so no row of them can be read on its own, but the rows that
+//! differ in one thing can be read against each other like everything else
+//! here.
+//!
 //! The count all this is held at is what the middle query of the writing
 //! condition walked rather than what the store held when the round was over, and
 //! the two are not close. A writing condition that finishes at thirteen segments
@@ -164,6 +172,7 @@ use kura_core::durability::Reach;
 use kura_core::file::Store;
 use kura_core::ingest::Batch;
 use kura_core::keeper::Keeper;
+use kura_core::residency::Probe;
 use kura_core::search::Searcher;
 use kura_core::writer::Writer;
 
@@ -667,26 +676,28 @@ fn report(
             loosely.segments, writing.segments,
         );
     }
+    let rows = [
+        ("quiet", Some(quiet)),
+        ("writing", Some(writing)),
+        ("writing and folding", Some(folding)),
+        ("writing, ordered only", Some(loosely)),
+        ("writing, smaller batches", Some(smaller.row)),
+        ("quiet, all of it", Some(settled)),
+        ("quiet, spread out", spread.as_ref()),
+        ("threads, no commits", busy.as_ref()),
+        ("threads, segments written aside", aside.as_ref()),
+    ];
+    let rows: Vec<(&str, &Answered)> = rows
+        .into_iter()
+        .filter_map(|(name, row)| Some((name, row?)))
+        .collect();
+    faulting(&rows);
     if let Some(rate) = load.rate {
         // A condition that did not hold the offered rate has a queue that grew
         // for the whole round, so its percentiles are how long the round was
         // rather than how long a query takes, and saying so is the difference
         // between a measurement and a misleading table.
-        let rows = [
-            ("quiet", Some(quiet)),
-            ("writing", Some(writing)),
-            ("writing and folding", Some(folding)),
-            ("writing, ordered only", Some(loosely)),
-            ("writing, smaller batches", Some(smaller.row)),
-            ("quiet, all of it", Some(settled)),
-            ("quiet, spread out", spread.as_ref()),
-            ("threads, no commits", busy.as_ref()),
-            ("threads, segments written aside", aside.as_ref()),
-        ];
-        for (name, answered) in rows
-            .into_iter()
-            .filter_map(|(name, row)| Some((name, row?)))
-        {
+        for (name, answered) in &rows {
             if answered.rate() < rate * KEEPING_UP {
                 println!(
                     "{name} got through {:.0} of the {rate:.0} offered, so it did not keep up and what it reports is a backlog rather than a latency",
@@ -708,6 +719,41 @@ fn report(
             folding.waited_at(50),
             folding.waited_at(99),
         );
+    }
+}
+
+/// What each condition faulted for every query the reader got through.
+///
+/// This is here for the question #180 left open. A commit costs a reader the
+/// segment it just added being read for the first time, and for the first time
+/// is two things. One is the page faults, since every commit throws the
+/// mapping away and builds a new one, so a query afterwards faults in pages
+/// that were resident a moment ago through a mapping that is gone. The other is
+/// that the bytes are cold in the caches whatever the mapping does, and nothing
+/// about mapping fixes that.
+///
+/// The counters belong to the process and not to the reader, so a row on its
+/// own says very little. Two rows that differ in one thing are readable, and
+/// the pair this was added for is the writing row against the row that does
+/// everything a writer does except commit.
+fn faulting(rows: &[(&str, &Answered)]) {
+    let counted: Vec<_> = rows
+        .iter()
+        .filter_map(|(name, row)| Some((*name, row.faults_each()?)))
+        .collect();
+    if counted.is_empty() {
+        return;
+    }
+    println!();
+    println!(
+        "{:<32} {:>16} {:>16}",
+        "condition", "faults a query", "from a file"
+    );
+    for (name, (faults, from_disk)) in counted {
+        match from_disk {
+            Some(from_disk) => println!("{name:<32} {faults:>16.2} {from_disk:>16.2}"),
+            None => println!("{name:<32} {faults:>16.2} {:>16}", "not counted"),
+        }
     }
 }
 
@@ -1143,6 +1189,18 @@ struct Answered {
     ingest: Vec<Duration>,
     /// How long the reader was asking, added up over the rounds.
     span: Duration,
+    /// How many page faults the process took over the rounds, or nothing where
+    /// the platform does not account for them.
+    ///
+    /// The process rather than the reader, because that is the only granularity
+    /// any of the three platforms offers. The writer threads are in it too, and
+    /// they do the same work in every writing condition, so a difference
+    /// between two of those conditions is still readable even though the number
+    /// itself is not a reader's.
+    faults: Option<u64>,
+    /// The ones that needed a read from a file rather than a page table entry,
+    /// where the platform separates the two.
+    from_disk: Option<u64>,
 }
 
 impl Answered {
@@ -1228,6 +1286,24 @@ impl Answered {
             return 0.0;
         }
         self.times.len() as f64 / self.span.as_secs_f64()
+    }
+
+    /// How many page faults the process took for each query the reader got
+    /// through, and how many of those needed a read from a file.
+    ///
+    /// Per query rather than per round, because the rounds of two conditions
+    /// are not the same length. A writing round is over when the files are
+    /// done and a quiet round is a second, so a total would say which
+    /// condition ran longer and not much else.
+    fn faults_each(&self) -> Option<(f64, Option<f64>)> {
+        if self.times.is_empty() {
+            return None;
+        }
+        let each = self.times.len() as f64;
+        Some((
+            self.faults? as f64 / each,
+            self.from_disk.map(|from_disk| from_disk as f64 / each),
+        ))
     }
 
     /// What one of the four things a query does took at a percentile, in
@@ -1455,8 +1531,19 @@ fn rounds(
         pooled.segments = round.segments;
         pooled.ingest.extend(round.ingest);
         pooled.span += round.span;
+        pooled.faults = add_up(pooled.faults, round.faults);
+        pooled.from_disk = add_up(pooled.from_disk, round.from_disk);
     }
     Ok(pooled)
+}
+
+/// Adds a round's fault count to what the rounds before it came to.
+///
+/// Nothing as soon as one round has nothing, since a platform either accounts
+/// for faults or it does not, and a total that quietly left out the rounds it
+/// could not measure would read as though it had measured all of them.
+fn add_up(pooled: Option<u64>, round: Option<u64>) -> Option<u64> {
+    Some(pooled.unwrap_or(0) + round?)
 }
 
 /// Runs one condition against a copy of the base store.
@@ -1487,6 +1574,10 @@ fn measure(
                 scope.spawn(move || ask(writer, queries, stop, load, opened, turn))
             })
             .collect();
+        // An empty slice, so the probe reads the fault counters and skips the
+        // residency scan. What is wanted here is the faults a round took and
+        // not how warm the store was, and the scan is linear in the size of it.
+        let probe = Probe::start(&[]);
         let started = Instant::now();
         if let Some(files) = doing.files() {
             let keeper = &keeper;
@@ -1515,6 +1606,7 @@ fn measure(
             std::thread::sleep(QUIET_FOR);
         }
         let took = started.elapsed();
+        let residency = probe.finish();
         stop.store(true, Ordering::Release);
         let (mut times, mut waited, mut walked) = (Vec::new(), Vec::new(), Vec::new());
         let mut parts: [Vec<f64>; PARTS.len()] = Default::default();
@@ -1529,10 +1621,10 @@ fn measure(
                 held.extend(theirs);
             }
         }
-        Ok::<_, String>((times, waited, walked, parts, took))
+        Ok::<_, String>((times, waited, walked, parts, took, residency))
     });
 
-    let (times, waited, walked, parts, took) = outcome?;
+    let (times, waited, walked, parts, took, residency) = outcome?;
     let segments = writer.view().len();
     drop(writer);
     std::fs::remove_file(&path).ok();
@@ -1545,6 +1637,8 @@ fn measure(
         segments,
         ingest: doing.files().map(|_| took).into_iter().collect(),
         span: took,
+        faults: residency.faults,
+        from_disk: residency.faults_from_disk,
     })
 }
 

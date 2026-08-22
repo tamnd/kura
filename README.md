@@ -928,6 +928,53 @@ Two honest limits.
 The segment written aside goes out unbuffered and is never synced, so what that row pays is the write calls and the dirty pages rather than a flush, and it is only fair to compare it against a commit because the syncs were already measured and were nothing.
 And the tails move in both directions between the two rows, so what is claimed here is the median.
 
+## Whether a segment read cold costs page faults or cold bytes
+
+Read for the first time is still two things and they want different fixes.
+
+One is the page faults.
+`Store::view` takes a fresh mapping of the whole file every time, and `Writer::catch_up` replaces the view the writer holds whenever the manifest moves, so every commit throws a mapping away and builds another.
+A query after a commit faults in pages that were resident a moment ago through a mapping that no longer exists.
+
+The other is that the bytes are cold in the caches whatever the mapping does.
+A segment written a few milliseconds ago has been read once, by the thread that wrote it.
+Nothing about mapping fixes that.
+
+The run counts faults now, around the same window it times, and reports them per query rather than per round, because a writing round is over when the files are done and a quiet round is a second.
+Five runs, each cell the middle of the five:
+
+| condition | faults a query | from a file |
+| --- | --- | --- |
+| quiet | 0.00 | 0.00 |
+| writing | 0.29 | 0.00 |
+| writing and folding | 0.25 | 0.00 |
+| writing, ordered only | 0.28 | 0.00 |
+| writing, smaller batches | 0.25 | 0.01 |
+| quiet, all of it | 0.00 | 0.00 |
+| quiet, spread out | 0.00 | 0.00 |
+| threads, no commits | 0.06 | 0.01 |
+| threads, segments written aside | 0.04 | 0.01 |
+
+The quiet rows fault nothing at all, which is the floor and says the counters are reading what they should.
+Committing adds about 0.23 faults to a query, 0.29 against the 0.06 of the row that does the same work without committing, and not one of them is a read from a file, which is what pages written a few milliseconds ago should look like.
+
+Then the row that settles it.
+Committing eight times as often with an eighth of the bytes in each commit adds about 0.19, which is the same 0.23 within the noise, while its commits cost a reader 0.24 µs against 4.8.
+So the faults follow the commits and the cost follows the bytes, and those are two different things.
+
+The arithmetic agrees.
+Charging the whole 4.8 µs to 0.23 faults puts a fault at 21 µs, and a fault that needs no read from a file is hundreds of nanoseconds.
+At a realistic price the faults are about a twentieth of it, which is where the write went as well.
+
+What is left is the bytes.
+A store sitting still has had its hot postings read a quarter of a million times by the time its median query runs, and a segment a commit just added has been read once.
+That is the cost, and remapping on every commit is not worth doing anything about for this reason, whatever else argues for it.
+
+Two limits.
+The counters belong to the process and not to the reader, so the writer threads are in them, including whatever their own rebuilt views fault.
+That only makes the case stronger, since it means the reader's share of the 0.23 is smaller than 0.23, but it does mean no row here can be read on its own.
+And this is an answer by elimination and by a count that moves the wrong way, not a measurement of a cache miss.
+
 ## What it costs when there is no core to spare
 
 Everything folding costs a reader on the machine above is the core the keeper takes, and that machine has ten of them for four writers, a keeper and a reader.
