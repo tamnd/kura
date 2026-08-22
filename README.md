@@ -251,6 +251,17 @@ And on a four core Linux box on ext4 over SATA, where all three are one call:
 | --- | --- | --- | --- | --- | --- |
 | any | `fdatasync` | 13.71 ms | 115.26 ms | 239.62 ms | 73 |
 
+The example was run on that box again later, and since the three reaches are one call there it is three measurements of the same thing:
+
+| reach | call | median | p99 | max | syncs/s |
+| --- | --- | --- | --- | --- | --- |
+| platter | `fdatasync` | 2.715 ms | 27.259 ms | 38.799 ms | 368 |
+| device | `fdatasync` | 4.593 ms | 93.927 ms | 274.030 ms | 218 |
+| ordered | `fdatasync` | 5.241 ms | 37.612 ms | 47.161 ms | 191 |
+
+Nothing separates those three rows but the machine, and they are a factor of two apart at the median and a factor of ten at the worst.
+That is the floor on how finely a single sync measurement can be read, and it is why the reach is chosen by which promise a store wants rather than by which call measured faster on the day.
+
 The honest call is free on the laptop, inside the noise of the weaker one, which is what makes it the default.
 It is not free everywhere and it is not free at any moment.
 The same laptop measured with three indexing runs' writes still going down gave the strongest reach a median of 5.47 ms, a p99 of 452 ms and a worst of 1.97 s, against a p99 of 6.31 ms for the weaker call on the same run, because asking the drive to empty its cache means waiting for whatever else is in it.
