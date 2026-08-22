@@ -778,36 +778,55 @@ On this operating system a thread that asks to be woken in a hundred microsecond
 ## Where the cost of writing beside a reader goes
 
 The table above says writing costs a reader 181 percent at the median, and it does not say what the reader is paying for.
-The writing row differs from the quiet row in three things at once: by the end it holds twice the documents, it holds them across a dozen segments rather than one, and there are four writers on the cores while the query runs.
-So the same run adds two more rows, both quiet.
-It builds the store the writing condition ends up with, one thread and nothing reading, folds a copy of it down to one segment and another copy down to the segment count a query in the writing condition actually walked, and asks both of them the same questions with nothing else happening.
+The writing row differs from the quiet row in four things at once: it holds more documents, it holds them across several segments rather than one, there are four writers on the cores while the query runs, and those writers are committing.
+So the same command adds four more rows.
+It builds the store the middle query of the writing condition was looking at, by adding batches to the base with one thread and nothing reading until the segment count that query walked is reached, folds a copy of that down to one segment, and asks both of them the same questions with nothing else happening.
+Then it puts the writer threads back beside the first of those stores with the commits taken out of them, and finally it runs the writing condition again with the store asking the drive to order its writes rather than to finish them.
 
-Getting that count right was the first result, and it was not the obvious one.
+Getting the store those rows are read against right took two corrections and neither was the obvious one.
+The first is the segment count.
 A writing condition that finishes at thirteen segments started at one, so its middle query walked five, and a quiet row held at thirteen for a whole round came out slower than the writing row it was there to explain.
-Every query now records what its own view held, after its clock has stopped, and the middle of those is what the second quiet row gets folded to.
+Every query now records what its own view held, after its clock has stopped, and the middle of those is the count.
+The second is the documents, and it is the same mistake one level down.
+The store the middle query saw held what had been added by the middle of the round, so folding the end of the round back down to five segments leaves the middle's segment count with the end's documents, which is a store no query ever saw, and it hands the documents that were not there yet to whichever step of the decomposition comes next.
+With that in it the writers came out costing a negative amount three runs out of five.
+The store is now built forwards to the count instead of folded backwards to it.
 
-Same corpus, same machine, same five runs as the table above:
+Four readers, four writers, 50,000 queries a second, five runs on a machine with about a core of other work on it, each cell the middle of the five:
 
 | condition | segments a query walked | median | p95 | p99 |
 | --- | --- | --- | --- | --- |
-| quiet, half the corpus, one segment | 1 | 3.2 µs | 4.5 µs | 10.6 µs |
-| quiet, all of it, one segment | 1 | 4.0 µs | 8.7 µs | 15.4 µs |
-| quiet, all of it, spread out | 5 | 7.8 µs | 18.0 µs | 33.5 µs |
-| writing | 5 | 9.0 µs | 30.6 µs | 51.9 µs |
-| writing and folding | 6 | 11.0 µs | 31.1 µs | 52.0 µs |
+| quiet | 1 | 3.3 µs | 8.0 µs | 13.2 µs |
+| quiet, the documents the middle query saw, one segment | 1 | 3.7 µs | 8.1 µs | 13.2 µs |
+| quiet, those documents in five segments | 5 | 7.4 µs | 12.8 µs | 27.5 µs |
+| the writer threads beside it, committing nothing | 5 | 9.5 µs | 25.7 µs | 41.0 µs |
+| writing | 5 | 10.2 µs | 32.3 µs | 64.6 µs |
+| writing, syncs turned into barriers | 5 | 11.4 µs | 33.0 µs | 76.8 µs |
+| writing and folding | 6 | 11.9 µs | 33.0 µs | 54.8 µs |
 
-Each row is against the one above it rather than against the first, because the three costs multiply rather than add.
-Doubling the documents costs 25 percent at the median and 45 at p99.
-Holding the same documents across five segments rather than one costs 95 percent and 118 more.
-The writers themselves cost 15 percent and 55 more, and at p95 they cost 70, which is the shape to expect: a commit taking the store is a stall rather than a slower query, so it shows up in the tail and barely in the middle.
+The first four rows are read against the one above, because the costs multiply rather than add.
+The documents the writing had added by then cost 13 percent at the median and 13 at p99.
+Holding them across five segments rather than one costs 104 percent and 103 more, which is the largest step at both ends by a wide margin.
+The writer threads on the cores, doing everything a writer does except the commit, cost 22 percent and 49 more.
 
-So the segment count is the largest of the three at both ends of the distribution, and the writers are a bigger share of the tail than of the middle.
-Folding earns its keep by holding that count down, and a rate limit that paused the keeper to buy back a few microseconds at the median would be paying for them in segments.
-Getting inside the read p99 target wants both halves of that: fewer segments for a query to walk, and a commit that does less to a reader while it is happening.
+The last two rows cannot be read that way, and the reason is worth stating because it is the trap the first correction above was an instance of.
+Every row that is not a writing row holds one segment count for a whole round, while a writing row climbs from one segment to thirteen, so half of its queries walked fewer segments than any query in the row above it and a straight subtraction picks up that ramp rather than the thing it was asked about.
+Taken whole, the writing row comes out 1 to 22 percent above the row with the commits removed, which is not what a commit costs.
+Read only over the queries that walked five segments in both rows, which is what the two have in common, the commits cost 59 percent at the median, 11 at p95 and 25 at p99.
+
+That makes the commits the second largest of the four and the only one that is larger in the middle than in the tail, which is not the shape to expect from something that stalls a reader.
+So the last row asks which part of a commit does it.
+It writes exactly as the writing row does, same batches, same lock, same segment appended, same manifest slot, same view handed over, with the two syncs a commit costs turned into barriers rather than waits.
+Read at the five segments both of them walked it comes to -2 percent at the median, 2 at p95 and 7 at p99, so the syncs are not what the reader is paying for.
+They are not free to anybody else: the same ingest took 195.28 ms with them and 167.75 ms without, so they are 13 percent of the writing's own wall clock.
+What costs the reader is the rest of a commit, and that is a thing this engine controls rather than a thing the drive does.
+
+Folding earns its keep by holding the segment count down, and a rate limit that paused the keeper to buy back a few microseconds at the median would be paying for them in segments.
+Getting inside the read p99 target wants both of the large steps: fewer segments for a query to walk, and a commit that does less to a reader while it is happening.
 
 One more thing falls out of the same table, and it qualifies something this file says elsewhere.
 The middle query of the folding condition walked six segments and the middle query of the writing condition walked five, so inside a round this short the keeper is not saving a reader any segment walks at all.
-What it buys is the store it leaves behind, six segments rather than thirteen, and the reader that pays for it is the one asking questions during the run.
+What it buys is the store it leaves behind, seven segments rather than thirteen, and the reader that pays for it is the one asking questions during the run.
 That is a fair trade over a long ingest and it is not a free one, and a run that only reported the segment count at the end would have made it look free.
 
 ## What it costs when there is no core to spare
