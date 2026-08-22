@@ -864,6 +864,40 @@ In microseconds rather than percentages the search is still the larger addition,
 Both of them touch segment bytes and neither of the free two does, which is the shape to take into the next round of this.
 The four clock reads cost nothing measurable, incidentally: the quiet row's median is 3.3 µs here and 3.3 µs in the table above it, taken without them.
 
+## Whether a commit costs a reader by the commit or by the bytes
+
+Two suspects are gone by now.
+The syncs are not what a commit costs a reader, and neither is the view handover.
+What is left divides into two kinds of thing.
+One kind is paid once per commit whatever the commit held: extending the mapping, taking the lock, publishing the manifest.
+The other is paid by the byte, and the candidate there is that a segment written a moment ago is being read for the first time, where a store that has been sitting still has been read a quarter of a million times by the time its median query runs.
+The two predict different things, which means a run can tell them apart.
+Hold the number of commits a query has lived through the same and change how much each of them wrote.
+
+The same command does it with one more row.
+It commits the same way with an eighth of the documents in each batch, over an eighth of the files so that the store still ends the round with the same number of segments, and it reads that row against a control built the way it was built rather than the way the writing row was: the same files, the same batch size, the same pace, with the commits taken out.
+Reading the small batch row against the writing row directly would be wrong, because a store of six small segments holds fewer documents than a store of six full ones and is cheaper to query for that reason alone.
+So there are two subtractions, each of a row against its own control, and what is read is the two of them against each other.
+
+Nine runs kept out of eighty six on a shared machine, each cell the middle of the nine:
+
+| a commit holding | what its own control cost | the commits, at the median | at p95 | at p99 |
+| --- | --- | --- | --- | --- |
+| about 440 documents | 10.0 µs | 48 percent | -3 percent | 11 percent |
+| about 55 documents | 6.1 µs | 4 percent | 11 percent | 32 percent |
+
+The top row is the same subtraction the section above reports at 59 percent, taken again over nine runs instead of five, and 48 against 59 is the run to run spread on this machine rather than a disagreement.
+In microseconds rather than percentages the large commit adds 4.8 µs to a query and the small one adds 0.24 µs, which is 11 nanoseconds a document against 5.
+The cost follows the bytes.
+
+That rules out the whole per commit family.
+Extending the mapping, taking the lock and publishing the manifest all cost the same whether the commit added four hundred documents or fifty, and a commit that added fifty costs a reader four percent, which is close enough to nothing that the fixed part of a commit is not worth chasing.
+What is worth chasing is the segment that was written a moment ago and is being read cold, and that is a thing to do something about rather than a thing to accept: the writer knows exactly which bytes it just wrote, and the reader is about to walk them.
+
+Two honest limits on this.
+The p99 column does not agree with the median column and is noisy at both sizes, so what is claimed here is the median and not the tail.
+And the two rows do not start from the same floor, 10.0 µs against 6.1, which is why each is read against its own control and why the two percentages are compared rather than the two rows.
+
 ## What it costs when there is no core to spare
 
 Everything folding costs a reader on the machine above is the core the keeper takes, and that machine has ten of them for four writers, a keeper and a reader.
