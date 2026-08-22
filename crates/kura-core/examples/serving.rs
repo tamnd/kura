@@ -220,15 +220,30 @@ const KEEPING_UP: f64 = 0.99;
 /// sample of one and says more about what else the machine was doing.
 const ENOUGH: usize = 1_000;
 
+/// The four things a query does, in the order it does them.
+///
+/// Only timed when the run is asked for them, because timing them means four
+/// more clock reads inside something that takes a few microseconds, and the
+/// tables everywhere else in this repository are of a query with nothing in it
+/// but the query.
+const PARTS: [&str; 4] = [
+    "taking the view",
+    "opening the readers",
+    "building the searcher",
+    "running the query",
+];
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let Some(corpus) = args.next().map(PathBuf::from) else {
         eprintln!(
-            "usage: serving <corpus> [<directory>] [threads=<n>] [readers=<n>] [<queries per second> ...]"
+            "usage: serving <corpus> [<directory>] [threads=<n>] [readers=<n>] [parts] [<queries per second> ...]"
         );
         eprintln!("the corpus is a directory of text files, and the store goes in the directory");
         eprintln!("a rate is how many queries a second the reader offers, and without one it asks");
         eprintln!("as fast as it can");
+        eprintln!("parts times the four things a query does rather than the query, and it costs");
+        eprintln!("four clock reads a query to do it, so the two are not run together");
         std::process::exit(2);
     };
 
@@ -239,8 +254,11 @@ fn main() {
     let mut rates = Vec::new();
     let mut threads = THREADS;
     let mut readers = READERS;
+    let mut parts = false;
     for arg in args {
-        if let Some(count) = arg.strip_prefix("threads=") {
+        if arg == "parts" {
+            parts = true;
+        } else if let Some(count) = arg.strip_prefix("threads=") {
             match count.parse::<usize>() {
                 Ok(count) if count > 0 => threads = count,
                 _ => {
@@ -267,7 +285,7 @@ fn main() {
         }
     }
 
-    match run(&corpus, &directory, &rates, threads, readers) {
+    match run(&corpus, &directory, &rates, threads, readers, parts) {
         Ok(()) => (),
         Err(problem) => {
             eprintln!("serving: {problem}");
@@ -283,6 +301,7 @@ fn run(
     rates: &[f64],
     threads: usize,
     readers: usize,
+    parts: bool,
 ) -> Result<(), String> {
     let mut files = Vec::new();
     walk(corpus, &mut files)?;
@@ -318,11 +337,15 @@ fn run(
     );
     println!("writers       {threads} filling batches in the two writing conditions");
     println!("readers       {readers} sharing one schedule");
+    if parts {
+        println!("parts         timed, so the query times below carry four more clock reads");
+    }
     if rates.is_empty() {
         let load = Load {
             rate: None,
             threads,
             readers,
+            parts,
         };
         conditions(&base, directory, &queries, rest, load)?;
     } else {
@@ -331,6 +354,7 @@ fn run(
                 rate: Some(*rate),
                 threads,
                 readers,
+                parts,
             };
             conditions(&base, directory, &queries, rest, load)?;
         }
@@ -388,6 +412,20 @@ fn conditions(
     )?;
     loosely.tell("writing, ordered only");
 
+    if load.parts {
+        // The rows below this one are the decomposition of the writing row and
+        // they are a different question, asked of a query that is not carrying
+        // four extra clock reads. A run that printed both would be putting two
+        // measurements of different things in one table.
+        inside(&[
+            ("quiet", &quiet),
+            ("writing", &writing),
+            ("writing and folding", &folding),
+            ("writing, ordered only", &loosely),
+        ]);
+        return Ok(());
+    }
+
     // The count the second quiet row is held at is what the middle query of the
     // writing condition walked, not what the store held when the round was
     // over. The writing condition starts at one segment and climbs, so the
@@ -406,6 +444,47 @@ fn conditions(
 
     report(&quiet, &writing, &folding, &loosely, &apart, load);
     Ok(())
+}
+
+/// What the four things a query does cost in each condition.
+///
+/// The interesting column is not the largest one, it is the one that grows
+/// between the quiet row and the writing rows, because that is the part of a
+/// query the writing reaches.
+fn inside(conditions: &[(&str, &Answered)]) {
+    println!();
+    println!(
+        "{:<22} {:>13} {:>13} {:>13} {:>13}",
+        "the median of", PARTS[0], PARTS[1], PARTS[2], PARTS[3]
+    );
+    for (name, answered) in conditions {
+        answered.parted(name, 50);
+    }
+    println!();
+    println!(
+        "{:<22} {:>13} {:>13} {:>13} {:>13}",
+        "and of p99, ", PARTS[0], PARTS[1], PARTS[2], PARTS[3]
+    );
+    for (name, answered) in conditions {
+        answered.parted(name, 99);
+    }
+    let Some((_, quiet)) = conditions.first() else {
+        return;
+    };
+    println!();
+    for (name, answered) in conditions.iter().skip(1) {
+        let said = (0..PARTS.len())
+            .map(|part| {
+                format!(
+                    "{:.0} percent on {}",
+                    share(answered.part(part, 50), quiet.part(part, 50)),
+                    PARTS[part]
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("against quiet, {name} costs {said}");
+    }
 }
 
 /// Everything a run says under its table.
@@ -832,6 +911,9 @@ struct Asked {
     waited: Vec<f64>,
     /// How many segments each of them walked.
     walked: Vec<usize>,
+    /// How long each of the four things a query does took, in microseconds,
+    /// which is empty unless the run was asked for them.
+    parts: [Vec<f64>; PARTS.len()],
 }
 
 /// What one condition came to.
@@ -844,6 +926,8 @@ struct Answered {
     waited: Vec<f64>,
     /// How many segments each query walked.
     walked: Vec<usize>,
+    /// How long each of the four things a query does took, in microseconds.
+    parts: [Vec<f64>; PARTS.len()],
     /// How many segments the store held when it was over.
     segments: usize,
     /// How long the writing took in each round, on the two conditions that
@@ -938,6 +1022,24 @@ impl Answered {
         self.times.len() as f64 / self.span.as_secs_f64()
     }
 
+    /// What one of the four things a query does took at a percentile, in
+    /// microseconds.
+    fn part(&self, part: usize, percentile: usize) -> f64 {
+        percentile_of(&self.parts[part], percentile)
+    }
+
+    /// Prints the four of them at a percentile.
+    fn parted(&self, name: &str, percentile: usize) {
+        println!(
+            "{:<22} {:>10.2} µs {:>10.2} µs {:>10.2} µs {:>10.2} µs",
+            name,
+            self.part(0, percentile),
+            self.part(1, percentile),
+            self.part(2, percentile),
+            self.part(3, percentile),
+        );
+    }
+
     /// Prints it.
     fn tell(&self, name: &str) {
         println!(
@@ -966,6 +1068,8 @@ struct Load {
     threads: usize,
     /// How many threads ask questions.
     readers: usize,
+    /// Whether to time the four things a query does rather than the query.
+    parts: bool,
 }
 
 /// What is going on beside the queries.
@@ -1080,6 +1184,9 @@ fn rounds(
         pooled.times.extend(round.times);
         pooled.waited.extend(round.waited);
         pooled.walked.extend(round.walked);
+        for (held, theirs) in pooled.parts.iter_mut().zip(round.parts) {
+            held.extend(theirs);
+        }
         pooled.segments = round.segments;
         pooled.ingest.extend(round.ingest);
         pooled.span += round.span;
@@ -1112,7 +1219,7 @@ fn measure(
         let asking: Vec<_> = (0..load.readers)
             .map(|_| {
                 let (writer, stop, turn) = (&writer, &stop, &turn);
-                scope.spawn(move || ask(writer, queries, stop, load.rate, opened, turn))
+                scope.spawn(move || ask(writer, queries, stop, load, opened, turn))
             })
             .collect();
         let started = Instant::now();
@@ -1147,6 +1254,7 @@ fn measure(
         let took = started.elapsed();
         stop.store(true, Ordering::Release);
         let (mut times, mut waited, mut walked) = (Vec::new(), Vec::new(), Vec::new());
+        let mut parts: [Vec<f64>; PARTS.len()] = Default::default();
         for handle in asking {
             let theirs = handle
                 .join()
@@ -1154,11 +1262,14 @@ fn measure(
             times.extend(theirs.times);
             waited.extend(theirs.waited);
             walked.extend(theirs.walked);
+            for (held, theirs) in parts.iter_mut().zip(theirs.parts) {
+                held.extend(theirs);
+            }
         }
-        Ok::<_, String>((times, waited, walked, took))
+        Ok::<_, String>((times, waited, walked, parts, took))
     });
 
-    let (times, waited, walked, took) = outcome?;
+    let (times, waited, walked, parts, took) = outcome?;
     let segments = writer.view().len();
     drop(writer);
     std::fs::remove_file(&path).ok();
@@ -1167,6 +1278,7 @@ fn measure(
         times,
         waited,
         walked,
+        parts,
         segments,
         ingest: doing.files().map(|_| took).into_iter().collect(),
         span: took,
@@ -1186,13 +1298,14 @@ fn ask(
     writer: &Writer,
     queries: &[String],
     stop: &AtomicBool,
-    rate: Option<f64>,
+    load: Load,
     opened: Instant,
     turn: &AtomicU64,
 ) -> Result<Asked, String> {
     let mut times = Vec::new();
     let mut waited = Vec::new();
     let mut walked = Vec::new();
+    let mut parts: [Vec<f64>; PARTS.len()] = Default::default();
     while !stop.load(Ordering::Acquire) {
         // The turn is taken from the counter every reader shares, so which
         // question gets asked and when it was due are both properties of the
@@ -1201,7 +1314,7 @@ fn ask(
         // one posting list in cache rather than the query set.
         let mine = turn.fetch_add(1, Ordering::Relaxed);
         let query = &queries[mine as usize % queries.len()];
-        let due = rate.map(|rate| {
+        let due = load.rate.map(|rate| {
             let due = opened + Duration::from_secs_f64(mine as f64 / rate);
             if let Some(left) = due.checked_duration_since(Instant::now()) {
                 std::thread::sleep(left);
@@ -1210,14 +1323,32 @@ fn ask(
         });
         let started = Instant::now();
         // The whole of what a reader pays to see the newest commit, which is
-        // where the segment count shows up.
+        // where the segment count shows up. The clock is read between the four
+        // of them only when the run was asked for the parts, since four reads
+        // of it are a measurable share of something this short.
         let view = writer.view();
+        let took_view = load.parts.then(Instant::now);
         let readers = view.readers().map_err(|problem| problem.to_string())?;
+        let opened_readers = load.parts.then(Instant::now);
         let searcher = Searcher::over(&readers).map_err(|problem| problem.to_string())?;
+        let built = load.parts.then(Instant::now);
         let _ = searcher
             .search(query, 10)
             .map_err(|problem| problem.to_string())?;
         let done = Instant::now();
+        if let (Some(took_view), Some(opened_readers), Some(built)) =
+            (took_view, opened_readers, built)
+        {
+            let each = [
+                took_view.duration_since(started),
+                opened_readers.duration_since(took_view),
+                built.duration_since(opened_readers),
+                done.duration_since(built),
+            ];
+            for (held, took) in parts.iter_mut().zip(each) {
+                held.push(took.as_secs_f64() * 1_000_000.0);
+            }
+        }
         times.push(done.duration_since(started).as_secs_f64() * 1_000_000.0);
         if let Some(due) = due {
             waited.push(done.duration_since(due).as_secs_f64() * 1_000_000.0);
@@ -1231,6 +1362,7 @@ fn ask(
         times,
         waited,
         walked,
+        parts,
     })
 }
 
