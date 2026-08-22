@@ -1,6 +1,6 @@
 //! Command line access to a kura index.
 //!
-//! Nine commands, in three groups.
+//! Ten commands, in three groups.
 //!
 //! `index` builds an index out of a directory so there is something to ask
 //! questions of. `search` runs a query and prints what came back. `explain`
@@ -19,20 +19,23 @@
 //! file against judgments, and between them a ranking change stops being a
 //! matter of opinion. See [`eval`] for what the numbers mean.
 //!
-//! `verify`, `dump`, `repair` and `migrate` are the third group, and they are
-//! for the file rather than for the answers. `verify` reads an index all the way
-//! through and says whether it is intact. `dump` prints what is in it, one
-//! record to a line, for the questions that start with somebody not believing
-//! what came back. `repair` is what comes after a `verify` that failed, and it
-//! does the one repair a store supports, which is committing a manifest that
-//! leaves out the segments that no longer read. `migrate` reads a file written
-//! by an older build and writes today's format beside it.
+//! `verify`, `dump`, `compact`, `repair` and `migrate` are the third group, and
+//! they are for the file rather than for the answers. `verify` reads an index
+//! all the way through and says whether it is intact. `dump` prints what is in
+//! it, one record to a line, for the questions that start with somebody not
+//! believing what came back. `compact` folds the segments of a store into one,
+//! which is what a store that has been written to a hundred times needs before
+//! it is read a hundred thousand times. `repair` is what comes after a `verify`
+//! that failed, and it does the one repair a store supports, which is committing
+//! a manifest that leaves out the segments that no longer read. `migrate` reads
+//! a file written by an older build and writes today's format beside it.
 //!
 //! There are no dependencies here for the same reason there are none in the
 //! engine. Argument parsing is forty lines and a crate is forever.
 
 mod dump;
 mod eval;
+mod fold;
 mod migrate;
 mod repair;
 mod report;
@@ -110,6 +113,7 @@ usage:
   kura-cli eval <qrels> <run>                score a run file against judgments
   kura-cli verify <index>                    read an index through and report what is wrong
   kura-cli dump <index>                      print what is in an index, one record to a line
+  kura-cli compact <store>                   fold the segments of a store into one
   kura-cli repair <store>                    drop the segments that no longer read
   kura-cli migrate <index> -o <new>          write an older index out in today's format
 
@@ -131,6 +135,7 @@ options:
   --term <t>    for dump, only this term, which reads no others
   --limit <n>   for dump, stop after this many records
   --commit      for repair, write the manifest rather than only say what it would be
+  --keep <n>    for compact, leave the newest n segments where they are
 
 an <index> is either a single segment, which is what index writes by default,
 or a store holding any number of them, which is what --store writes into. Every
@@ -169,6 +174,15 @@ reads one index and writes another, and what to do with the original is left to
 whoever ran it. An index that is already in today's format is left alone and
 nothing is written.
 
+a compact rewrites the segments it folds rather than copying them, so it costs
+work proportional to what survives, and it writes as it goes rather than asking
+for a manifest afterwards. It does not make the file smaller. The segments it
+replaced stay where they are, because a query that started before the commit is
+still reading them, and the space comes back when the file is rewritten. What it
+gives back straight away is the segment count, which is what every lookup and
+every search pays per question. --keep leaves the newest few alone, which is
+what to do on a store something else is still writing to.
+
 a repair prints what it would do and writes nothing until it is given --commit,
 because what it does is throw documents away. It never touches a segment, only
 the manifest that names them, and the manifest it replaces stays in the store
@@ -191,6 +205,7 @@ fn run() -> Result<(), Failure> {
         "eval" => evaluate(&rest),
         "verify" => check(&rest),
         "dump" => show(&rest),
+        "compact" => squash(&rest),
         "repair" => mend(&rest),
         "migrate" => forward(&rest),
         "-h" | "--help" | "help" => {
@@ -298,6 +313,45 @@ fn check(args: &[String]) -> Result<(), Failure> {
     if outcome.failures > 0 {
         return Err(Failure::Damaged(path.to_path_buf(), outcome.failures));
     }
+    Ok(())
+}
+
+/// Folds the segments of a store into one.
+///
+/// Succeeding means the store is readable and holds what it held, which is true
+/// of a store that was folded and of one that had nothing to fold, so both are a
+/// zero exit. There is no dry run and no `--commit`, because nothing that was
+/// answering queries goes away. See [`fold`] for what it costs and for why the
+/// file does not get smaller.
+fn squash(args: &[String]) -> Result<(), Failure> {
+    let mut positional = Vec::new();
+    let mut keep = 0usize;
+    let mut at = 0;
+    while at < args.len() {
+        match args[at].as_str() {
+            "--keep" => {
+                at += 1;
+                let value = want(args, at, "--keep wants a number")?;
+                keep = value
+                    .parse()
+                    .map_err(|_| Failure::usage(format!("--keep wants a number, got {value}")))?;
+            }
+            other if other.starts_with("--") => {
+                return Err(Failure::usage(format!("unknown option {other}")));
+            }
+            other => positional.push(other),
+        }
+        at += 1;
+    }
+    let [path] = positional[..] else {
+        return Err(Failure::usage("wanted one store file"));
+    };
+    let path = Path::new(path);
+
+    let mut out = BufWriter::new(std::io::stdout());
+    fold::fold(path, keep, now(), &mut out)
+        .map_err(|trouble| Failure::Store(path.to_path_buf(), trouble))?;
+    out.flush().map_err(Failure::Stdout)?;
     Ok(())
 }
 
