@@ -47,6 +47,7 @@ use std::io::{BufWriter, Read as _, Write as _};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use kura_core::analysis::Analyzer;
@@ -54,7 +55,7 @@ use kura_core::bitmap::Bitmap;
 use kura_core::durability::Reach;
 use kura_core::file::{Store, Trouble};
 use kura_core::index::{Held, Reader, Writer};
-use kura_core::ingest::{self, Logged};
+use kura_core::ingest::{self, Batch, Logged};
 use kura_core::manifest;
 use kura_core::mapping::Map;
 use kura_core::policy::{Policy, Pressure};
@@ -62,6 +63,7 @@ use kura_core::residency;
 use kura_core::search::Searcher;
 use kura_core::segment::{Segment, Writer as SegmentWriter};
 use kura_core::store::Scratch;
+use kura_core::writer::Writer as SharedWriter;
 
 /// How many results a command prints when nobody says otherwise.
 const DEFAULT_HITS: usize = 10;
@@ -141,6 +143,8 @@ options:
                 platter, the power going, which is the default
                 device, the process dying but not the power going
                 ordered, nothing, but nothing written after it lands first
+  --threads <n> for index into a store, how many threads fill batches at once
+                (default 1, and above 1 there is no log)
   --total       for explain, walk for the total as well as the page
   --depth <n>   how deep a run file goes, for topics (default 1000)
   --tag <name>  what the run file calls this run (default kura)
@@ -177,6 +181,22 @@ carrying on is what is making the store slow to read. The run says how many
 folds it did and how much of its time went into them, and --no-fold turns the
 whole of it off, which leaves a store with as many segments as the run had
 batches.
+
+--threads is how many threads read and analyse files at the same time. Each of
+them fills a batch of its own and hands it to the store, and the batches that
+are ready when a commit finishes go into the next one together, so the run pays
+for one commit rather than for one per thread. The analysis is where an index
+run spends its time, so this is the option that uses the machine.
+
+Two things are different above one thread and the run says both. There is no
+log, because a record goes into it as its document arrives and the log is
+reached through the store, which one thread at a time holds, so a run that stops
+loses whatever it had not committed rather than leaving it for a recovery. And
+the folding happens once at the end rather than as the run goes, because a fold
+moves the segments that the batches being built are counting positions into.
+
+--memory is per thread, so eight threads at 128m is a gigabyte and not 128
+megabytes. Set it to what one thread should hold and multiply.
 
 --memory and --flush-every both take a plain number of bytes or a number with k,
 m or g after it, and each of them bounds how much of a corpus an index run holds
@@ -725,6 +745,21 @@ struct Marks {
 }
 
 impl Marks {
+    /// Keeps whichever of the two was taken later, which is whichever is larger.
+    ///
+    /// These are high water marks of the process rather than of a thread, so
+    /// there is one set of them and the largest reading is the current one.
+    fn take(&mut self, other: Self) {
+        if other
+            .read()
+            .zip(self.read())
+            .is_none_or(|(a, b)| a[2] > b[2])
+            && other.read().is_some()
+        {
+            *self = other;
+        }
+    }
+
     /// The three readings, or nothing if this system does not keep them.
     fn read(&self) -> Option<[u64; 3]> {
         match (&self.documents, &self.merged, &self.written) {
@@ -789,6 +824,14 @@ impl<'a> Steepest<'a> {
     /// Says that what is being measured is a fresh writer from here on.
     fn emptied(&mut self, held: u64) {
         self.before = held;
+    }
+
+    /// Keeps whichever of the two saw the steeper step.
+    fn take(&mut self, other: &Self) {
+        if other.step > self.step {
+            self.step = other.step;
+            self.file = other.file;
+        }
     }
 
     /// Prints the reading, if there was a document to take one from.
@@ -859,6 +902,13 @@ struct Plan {
     /// some hardware and none at all on other hardware, and the only way to
     /// find out which kind is in the machine is to be able to run it both ways.
     durability: Reach,
+    /// How many threads fill batches at once.
+    ///
+    /// One by default, and one means the path this program has always taken,
+    /// log and all. More than one is a different run with different properties,
+    /// which is why it is asked for rather than worked out from the number of
+    /// cores.
+    threads: usize,
 }
 
 impl Plan {
@@ -872,6 +922,7 @@ impl Plan {
         let mut unbounded = false;
         let mut fold = true;
         let mut durability = Reach::default();
+        let mut threads = 1usize;
         let mut at = 0;
         while at < args.len() {
             match args[at].as_str() {
@@ -904,6 +955,21 @@ impl Plan {
                         .ok_or_else(|| Failure::usage("--durability wants a reach"))?;
                     durability = reach(value)?;
                 }
+                "--threads" => {
+                    at += 1;
+                    let value = args
+                        .get(at)
+                        .ok_or_else(|| Failure::usage("--threads wants a number"))?;
+                    threads = value
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|count| *count > 0)
+                        .ok_or_else(|| {
+                            Failure::usage(format!(
+                                "--threads wants a number above zero, not {value}"
+                            ))
+                        })?;
+                }
                 "-o" => {
                     at += 1;
                     let path = args
@@ -919,43 +985,15 @@ impl Plan {
             return Err(Failure::usage("nothing to index"));
         }
         let out = out.ok_or_else(|| Failure::usage("no -o, so nowhere to write"))?;
-        if flush_every.is_some() && !into_store {
-            // A file that is one segment can hold one segment, and the whole of
-            // what this option does is write more than one.
-            return Err(Failure::usage("--flush-every needs --store to flush into"));
-        }
-        if (memory.is_some() || unbounded) && !into_store {
-            return Err(Failure::usage("--memory needs --store to flush into"));
-        }
-        if !fold && !into_store {
-            // A bare index is one segment and there is nothing in it to fold,
-            // so turning the folding off is turning off something that was
-            // never going to happen.
-            return Err(Failure::usage("--no-fold needs --store to not fold"));
-        }
-        if durability != Reach::default() && !into_store {
-            // A bare index is written and closed rather than committed, so
-            // there is no commit here for the reach to be about, and accepting
-            // the flag would be agreeing to something that does not happen.
-            return Err(Failure::usage("--durability needs --store to commit into"));
-        }
-        // A writer holds the compressor's match table before it has been given
-        // anything, so a budget under that is a segment per document rather than
-        // a small run, and somebody who asked for a kilobyte meant a megabyte.
-        let floor = Writer::new().held().total();
-        if memory.is_some_and(|budget| budget < floor) {
-            return Err(Failure::usage(format!(
-                "a writer holds {} before it has been given a document, so --memory under that is one segment per document",
-                report::bytes(floor)
-            )));
-        }
-        if memory.is_some() && flush_every.is_some() {
-            // Both would work, and a run that flushed on whichever tripped first
-            // would be a run nobody could read the numbers of afterwards.
-            return Err(Failure::usage(
-                "--memory and --flush-every are two answers to the same question, so pick one",
-            ));
-        }
+        agreeable(
+            into_store,
+            flush_every,
+            memory,
+            unbounded,
+            fold,
+            threads,
+            durability,
+        )?;
         // A run into a store is bounded unless somebody says otherwise, because
         // the alternative is a run whose memory is the size of what it was
         // pointed at and nobody asks for that on purpose. A run given
@@ -972,8 +1010,68 @@ impl Plan {
             memory,
             fold,
             durability,
+            threads,
         })
     }
+}
+
+/// Says which pair of options do not go together, if a pair of them do not.
+///
+/// Out of [`Plan::read`] because reading the arguments and agreeing to them are
+/// two jobs, and the second one is a list of refusals that grows every time an
+/// option is added.
+fn agreeable(
+    into_store: bool,
+    flush_every: Option<u64>,
+    memory: Option<u64>,
+    unbounded: bool,
+    fold: bool,
+    threads: usize,
+    durability: Reach,
+) -> Result<(), Failure> {
+    if flush_every.is_some() && !into_store {
+        // A file that is one segment can hold one segment, and the whole of
+        // what this option does is write more than one.
+        return Err(Failure::usage("--flush-every needs --store to flush into"));
+    }
+    if (memory.is_some() || unbounded) && !into_store {
+        return Err(Failure::usage("--memory needs --store to flush into"));
+    }
+    if !fold && !into_store {
+        // A bare index is one segment and there is nothing in it to fold,
+        // so turning the folding off is turning off something that was
+        // never going to happen.
+        return Err(Failure::usage("--no-fold needs --store to not fold"));
+    }
+    if threads > 1 && !into_store {
+        // A bare index is one segment written by one pass, and there is no
+        // commit in it for a second thread to hand anything to.
+        return Err(Failure::usage("--threads needs --store to write into"));
+    }
+    if durability != Reach::default() && !into_store {
+        // A bare index is written and closed rather than committed, so
+        // there is no commit here for the reach to be about, and accepting
+        // the flag would be agreeing to something that does not happen.
+        return Err(Failure::usage("--durability needs --store to commit into"));
+    }
+    // A writer holds the compressor's match table before it has been given
+    // anything, so a budget under that is a segment per document rather than
+    // a small run, and somebody who asked for a kilobyte meant a megabyte.
+    let floor = Writer::new().held().total();
+    if memory.is_some_and(|budget| budget < floor) {
+        return Err(Failure::usage(format!(
+            "a writer holds {} before it has been given a document, so --memory under that is one segment per document",
+            report::bytes(floor)
+        )));
+    }
+    if memory.is_some() && flush_every.is_some() {
+        // Both would work, and a run that flushed on whichever tripped first
+        // would be a run nobody could read the numbers of afterwards.
+        return Err(Failure::usage(
+            "--memory and --flush-every are two answers to the same question, so pick one",
+        ));
+    }
+    Ok(())
 }
 
 /// Reads a reach, or says which ones there are.
@@ -1053,6 +1151,15 @@ struct Folds {
 }
 
 impl Folds {
+    /// Takes in another thread's folding.
+    fn absorb(&mut self, other: &Self) {
+        self.count += other.count;
+        self.segments += other.segments;
+        self.documents += other.documents;
+        self.took += other.took;
+        self.stalled += other.stalled;
+    }
+
     /// Prints what the folding cost, or nothing if there was none.
     fn tell(&self, took: Duration) {
         if self.count == 0 {
@@ -1091,6 +1198,34 @@ impl<'a> Run<'a> {
             self.peak = held;
         }
         self.steepest.saw(file, held.total());
+    }
+
+    /// Takes in what one thread of a shared run did.
+    ///
+    /// The counters add. The peaks and the steepest step do not, they are the
+    /// largest any thread saw, because they are readings of one moment and two
+    /// threads did not have their largest moment together. The residency marks
+    /// are readings of the process rather than of a thread, so the largest is
+    /// also the right answer for them.
+    ///
+    /// `segments` and `syncs` are left alone, since they are properties of the
+    /// store afterwards and are read from it once.
+    fn absorb(&mut self, other: Self) {
+        self.bytes += other.bytes;
+        self.written += other.written;
+        self.documents += other.documents;
+        self.replaced += other.replaced;
+        self.skipped += other.skipped;
+        self.records += other.records;
+        self.logged += other.logged;
+        self.unlogged += other.unlogged;
+        self.commits.extend(other.commits);
+        self.folds.absorb(&other.folds);
+        if other.peak.total() > self.peak.total() {
+            self.peak = other.peak;
+        }
+        self.steepest.take(&other.steepest);
+        self.marks.take(other.marks);
     }
 
     /// Prints what the run's commits cost and which call made them durable.
@@ -1157,20 +1292,30 @@ impl<'a> Run<'a> {
                 self.documents - self.replaced,
                 self.replaced
             );
-            // What the log took, which is what a stop halfway through this run
-            // would have left behind for a recovery to put back.
-            print!(
-                "{} of them went through the log first, {}",
-                self.records,
-                report::bytes(self.logged)
-            );
-            if self.unlogged > 0 {
-                print!(
-                    ", and {} of them had no room in it and waited for the commit",
-                    self.unlogged
+            if plan.threads > 1 {
+                // Said rather than left to be worked out from a zero, because
+                // what it means is that a stop halfway through this run would
+                // have left nothing behind for a recovery to put back.
+                println!(
+                    "{} threads filled batches at once, so nothing went through the log and a run that stops loses whatever it had not committed",
+                    plan.threads
                 );
+            } else {
+                // What the log took, which is what a stop halfway through this
+                // run would have left behind for a recovery to put back.
+                print!(
+                    "{} of them went through the log first, {}",
+                    self.records,
+                    report::bytes(self.logged)
+                );
+                if self.unlogged > 0 {
+                    print!(
+                        ", and {} of them had no room in it and waited for the commit",
+                        self.unlogged
+                    );
+                }
+                println!();
             }
-            println!();
             self.tell_commits(plan.durability);
             self.folds.tell(took);
         }
@@ -1204,7 +1349,9 @@ fn index(args: &[String]) -> Result<(), Failure> {
 
     let started = Instant::now();
     let mut run = Run::default();
-    if plan.into_store {
+    if plan.into_store && plan.threads > 1 {
+        shared(&plan, &files, &mut run)?;
+    } else if plan.into_store {
         into_store(&plan, &files, &mut run)?;
     } else {
         into_file(&plan, &files, &mut run)?;
@@ -1396,6 +1543,174 @@ fn one_batch<'a>(
     run.replaced += replaced;
     run.written += size;
     Ok(taken)
+}
+
+/// Indexes into a store with several threads filling batches at once.
+///
+/// The reading is a syscall and the commit is two syncs, and between them is the
+/// analyser, which is where an index run actually spends its time. This gives
+/// that part of it to every core on the machine: each thread takes files off a
+/// shared counter, fills a batch of its own against the same view, and hands it
+/// to the writer, which commits whatever is ready together.
+///
+/// One file at a time off the counter rather than a slice each. A corpus where
+/// the largest file is four orders of magnitude larger than the median, which is
+/// every corpus of source code, split into equal counts leaves the thread that
+/// drew the large ones finishing long after the others.
+///
+/// Two things are different from the single threaded path, and the report says
+/// both. There is no log, because a record goes into the ring as its document
+/// arrives and the ring is reached through the store, which one thread at a time
+/// holds. And the folding happens after the threads are done rather than
+/// alongside them, because a fold moves the segments the batches in flight
+/// counted positions into and every one of them would be refused.
+fn shared<'a>(plan: &Plan, files: &'a [PathBuf], run: &mut Run<'a>) -> Result<(), Failure> {
+    let mut store = open_store(&plan.out, plan.durability)?;
+    let now = now();
+    let put_back = ingest::replay(&mut store, now, now)
+        .map_err(|trouble| Failure::Store(plan.out.clone(), trouble))?;
+    if !put_back.is_empty() {
+        println!(
+            "put back {} {} out of the log, {}, left by a run that did not finish",
+            put_back.documents,
+            if put_back.documents == 1 {
+                "document"
+            } else {
+                "documents"
+            },
+            report::bytes(put_back.bytes)
+        );
+    }
+    let writer =
+        SharedWriter::new(store).map_err(|trouble| Failure::Store(plan.out.clone(), trouble))?;
+
+    let next = AtomicUsize::new(0);
+    let parts = std::thread::scope(|scope| {
+        let running: Vec<_> = (0..plan.threads)
+            .map(|_| {
+                let (writer, next) = (&writer, &next);
+                scope.spawn(move || shard(writer, plan, files, next))
+            })
+            .collect();
+        running
+            .into_iter()
+            .map(|handle| {
+                handle.join().unwrap_or_else(|_| {
+                    Err(Failure::Store(
+                        plan.out.clone(),
+                        Trouble::Io(std::io::Error::other("an indexing thread stopped")),
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, Failure>>()
+    })?;
+    for part in parts {
+        run.absorb(part);
+    }
+
+    // Now that nothing is preparing a batch, the store can be moved about.
+    let mut store = writer.into_store();
+    settle(&mut store, plan, run)?;
+    run.segments = store.manifest().segments.len();
+    run.syncs = store.syncs();
+    Ok(())
+}
+
+/// One thread of a shared run, filling and handing over batches until the files
+/// are gone.
+fn shard<'a>(
+    writer: &SharedWriter,
+    plan: &Plan,
+    files: &'a [PathBuf],
+    next: &AtomicUsize,
+) -> Result<Run<'a>, Failure> {
+    let trouble = |trouble| Failure::Store(plan.out.clone(), trouble);
+    let mut run = Run::default();
+    loop {
+        // Whatever the last commit published, which is what every other thread
+        // is building against too. It costs no lock and no mapping of its own.
+        let view = writer.view();
+        let mut batch = match plan.memory {
+            Some(budget) => Batch::with_budget(&view, budget),
+            None => Batch::over(&view),
+        }
+        .map_err(trouble)?;
+        run.steepest.emptied(batch.held().total());
+
+        let mut pending = 0u64;
+        let mut drained = false;
+        loop {
+            let at = next.fetch_add(1, Ordering::Relaxed);
+            let Some(file) = files.get(at) else {
+                drained = true;
+                break;
+            };
+            let Ok(Some(content)) = read_text(file) else {
+                run.skipped += 1;
+                continue;
+            };
+            let text = String::from_utf8_lossy(&content);
+            run.bytes += content.len() as u64;
+            pending += content.len() as u64;
+            let path = file.to_string_lossy().into_owned();
+            batch
+                .add_keyed_with_fields(path.as_bytes(), &text, [(PATH_FIELD, path.as_bytes())])
+                .map_err(trouble)?;
+            run.saw(file, batch.held());
+
+            if batch.is_full() || plan.flush_every.is_some_and(|budget| pending >= budget) {
+                break;
+            }
+        }
+
+        if !batch.is_empty() {
+            let documents = batch.len();
+            let replaced = batch.replacements();
+            let read_documents = Some(residency::peak_resident());
+            let prepared = batch.finish().map_err(trouble)?;
+            let read_merged = Some(residency::peak_resident());
+            let size = prepared.size();
+            let now = now();
+            let committing = Instant::now();
+            writer.commit(prepared, now, now).map_err(trouble)?;
+            run.commits.push(committing.elapsed());
+            run.marks = Marks {
+                documents: read_documents,
+                merged: read_merged,
+                written: Some(residency::peak_resident()),
+            };
+            run.documents += documents;
+            run.replaced += replaced;
+            run.written += size;
+        }
+        if drained {
+            return Ok(run);
+        }
+    }
+}
+
+/// Folds a store until the policy has nothing more to ask for.
+///
+/// This is what a shared run does instead of folding as it goes. Every fold this
+/// makes is one the single threaded path would have made in the middle of the
+/// run, so the work is the same work and the documents after it did not wait for
+/// it. What a store is left in is the same either way.
+fn settle(store: &mut Store, plan: &Plan, run: &mut Run<'_>) -> Result<(), Failure> {
+    if !plan.fold {
+        return Ok(());
+    }
+    let policy = Policy::default();
+    while !policy.pressure(&store.manifest().segments).is_clear() {
+        let before = store.manifest().segments.len();
+        keep_up(store, plan, run)?;
+        if store.manifest().segments.len() == before {
+            // Nothing was folded, so asking again would ask the same question
+            // and get the same answer. A store over the cap with no fold due is
+            // one this path did not build.
+            return Ok(());
+        }
+    }
+    Ok(())
 }
 
 /// Indexes into a file of its own, which is one segment and holds no keys.
@@ -2772,6 +3087,94 @@ mod tests {
         }
         assert_eq!(bytes[0], bytes[1], "platter and device wrote differently");
         assert_eq!(bytes[1], bytes[2], "device and ordered wrote differently");
+    }
+
+    #[test]
+    fn a_thread_count_is_read_and_has_to_be_a_count_of_threads() {
+        let args = |extra: &[&str]| {
+            let mut args = vec!["corpus".to_string(), "-o".to_string(), "out".to_string()];
+            args.extend(extra.iter().map(|part| (*part).to_string()));
+            args
+        };
+        let plan = Plan::read(&args(&["--store"])).expect("a plan");
+        assert_eq!(plan.threads, 1, "a run nobody asked about is one thread");
+
+        let plan = Plan::read(&args(&["--store", "--threads", "8"])).expect("a plan");
+        assert_eq!(plan.threads, 8);
+
+        // One thread is what the run does anyway, so asking for it is not a
+        // second way of saying the same thing that has to be refused.
+        assert!(Plan::read(&args(&["--threads", "1"])).is_ok());
+
+        // Nowhere to hand a batch to, a number that is not one, no number at
+        // all, and the zero that would otherwise be a run with no threads in it.
+        assert!(Plan::read(&args(&["--threads", "4"])).is_err());
+        assert!(Plan::read(&args(&["--store", "--threads", "many"])).is_err());
+        assert!(Plan::read(&args(&["--store", "--threads"])).is_err());
+        assert!(Plan::read(&args(&["--store", "--threads", "0"])).is_err());
+    }
+
+    #[test]
+    fn a_run_of_several_threads_leaves_what_one_thread_leaves() {
+        // The whole of what --threads is allowed to change is how long the run
+        // takes. Two stores over the same corpus, one filled by one thread and
+        // one by four, have to hold the same documents and answer the same
+        // questions, or the option is not a way of going faster.
+        let dir = scratch_dir("threads-agree");
+        let corpus = documents(&dir.join("corpus"), 0, 200);
+
+        let one = dir.join("one.kura");
+        into(&corpus, &one, &["--flush-every", "1k"]).expect("the run of one");
+        let many = dir.join("many.kura");
+        into(&corpus, &many, &["--flush-every", "1k", "--threads", "4"]).expect("the run of four");
+
+        let a = Store::open(&one).expect("the store opens");
+        let b = Store::open(&many).expect("the store opens");
+        assert_eq!(a.manifest().live, 200);
+        assert_eq!(b.manifest().live, 200, "four threads lost documents");
+        assert_eq!(a.manifest().total, b.manifest().total);
+        drop((a, b));
+
+        for query in ["ledger", "invoice quarter", "ledger audit invoice"] {
+            assert_eq!(live(&one, query), live(&many, query), "{query}");
+            assert!(live(&many, query) > 0, "{query} found nothing either way");
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_second_run_of_several_threads_replaces_what_the_first_one_wrote() {
+        // The case a batch prepared against an old view has to get right. Four
+        // threads run over a corpus that is already in the store, so every key
+        // one of them writes is in a segment somewhere, and some of those
+        // segments arrived after the batch doing the writing was started. Every
+        // document has to end up live once and the ones it replaced dead.
+        let dir = scratch_dir("threads-replace");
+        let corpus = documents(&dir.join("corpus"), 0, 200);
+        let store = dir.join("twice.kura");
+
+        into(&corpus, &store, &["--flush-every", "1k", "--threads", "4"]).expect("the first run");
+        into(&corpus, &store, &["--flush-every", "1k", "--threads", "4"]).expect("the second run");
+
+        let opened = Store::open(&store).expect("the store opens");
+        assert_eq!(opened.manifest().live, 200, "a document went in twice");
+        // Not four hundred in all, which is what the same run of one thread
+        // leaves. The second run ends over the cap and folds on the way out,
+        // and a fold is where the replaced copies stop being written down.
+        assert_eq!(opened.manifest().total, opened.manifest().live);
+        drop(opened);
+
+        // And what it answers is what the same corpus answers when it was put
+        // there once, so the replacements did not take a live document with
+        // them on the way past.
+        let fresh = dir.join("once.kura");
+        into(&corpus, &fresh, &["--flush-every", "1k"]).expect("a run into an empty store");
+        for query in ["ledger", "invoice quarter"] {
+            assert_eq!(live(&store, query), live(&fresh, query), "{query}");
+        }
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

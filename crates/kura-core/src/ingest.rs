@@ -637,15 +637,13 @@ impl Pending<'_> {
     /// How long the segment will be, or zero if there is none.
     #[must_use]
     pub fn size(&self) -> u64 {
-        self.prepared.segment.as_ref().map_or(0, |(built, _)| {
-            u64::try_from(built.size()).unwrap_or(u64::MAX)
-        })
+        self.prepared.size()
     }
 
     /// How many documents it holds.
     #[must_use]
     pub fn documents(&self) -> u32 {
-        self.prepared.segment.as_ref().map_or(0, |&(_, docs)| docs)
+        self.prepared.documents()
     }
 
     /// Frees the log and commits the segment with its deletions.
@@ -830,6 +828,20 @@ pub struct Prepared {
 }
 
 impl Prepared {
+    /// How long the segment will be, or zero if there is none.
+    #[must_use]
+    pub fn size(&self) -> u64 {
+        self.segment.as_ref().map_or(0, |(built, _)| {
+            u64::try_from(built.size()).unwrap_or(u64::MAX)
+        })
+    }
+
+    /// How many documents it holds.
+    #[must_use]
+    pub fn documents(&self) -> u32 {
+        self.segment.as_ref().map_or(0, |&(_, docs)| docs)
+    }
+
     /// Publishes it.
     ///
     /// # Errors
