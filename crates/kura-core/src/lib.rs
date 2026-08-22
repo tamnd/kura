@@ -23,6 +23,7 @@ pub mod bitpack;
 pub mod bound;
 pub mod checksum;
 pub mod codec;
+pub mod compact;
 pub mod error;
 pub mod explain;
 #[cfg(feature = "fs")]

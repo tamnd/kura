@@ -288,6 +288,15 @@ pub enum Error {
         /// The kind that was needed and is not there.
         kind: u16,
     },
+
+    /// A segment holds a section that the pass rewriting it has no way to carry
+    /// across. That is a segment written by a build which knows about something
+    /// this one does not, and stopping is the point: the alternative is writing
+    /// a replacement without it and calling the two the same data.
+    UncarriedSection {
+        /// The kind that has nowhere to go.
+        kind: u16,
+    },
 }
 
 impl fmt::Display for Error {
@@ -436,6 +445,9 @@ impl fmt::Display for Error {
             Self::BadBlock => f.write_str("a compressed block does not decode to what it should"),
             Self::MissingSection { kind } => {
                 write!(f, "the segment has no section of kind {kind}")
+            }
+            Self::UncarriedSection { kind } => {
+                write!(f, "a section of kind {kind} cannot be carried across")
             }
         }
     }
