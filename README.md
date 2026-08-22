@@ -752,16 +752,20 @@ Four readers, four writers, 50,000 queries a second, five runs, each cell the mi
 
 | condition | segments at the end | median | p95 | p99 |
 | --- | --- | --- | --- | --- |
-| quiet | 1 | 5.5 µs | 14.8 µs | 73.6 µs |
-| writing | 14 | 13.0 µs | 43.2 µs | 180.5 µs |
-| writing and folding | 6 | 14.2 µs | 45.6 µs | 157.9 µs |
+| quiet | 1 | 3.2 µs | 4.5 µs | 10.6 µs |
+| writing | 13 | 9.0 µs | 30.6 µs | 51.9 µs |
+| writing and folding | 6 | 11.0 µs | 31.1 µs | 52.0 µs |
 
 Five times the load one reader could offer, and the story is the one the lower loads told.
-Writing costs the reader 136 percent at the median and 145 percent at p99.
-Folding beside it costs 9 percent at the median and comes out 13 percent below the writing at p99, which is another way of saying the tail is not where a fold shows up.
+Writing costs the reader 181 percent at the median and 390 percent at p99.
+Folding beside it costs 22 percent more than the writing alone at the median and lands on top of it at p99, within a fifth of a percent, which is another way of saying the tail is not where a fold shows up.
+
+An earlier set of five runs of the same command, taken while the machine had other work on it, put the quiet row at 5.5 µs at the median and 73.6 at p99 and the writing row at 13.0 and 180.5.
+The table above replaces it because every row in it comes from one set of runs on a quiet machine, which is what makes the rows comparable with each other.
+The ratios are larger than the earlier set gave for the same reason: a quiet row that is not really quiet flatters everything measured against it.
 
 That is also the first number this repository has for what a reader pays under a concurrent write at a load worth quoting, and it says the target has not been met.
-Read p99 under concurrent write is meant to land within 20 percent of the idle p99 and it is 145 percent over.
+Read p99 under concurrent write is meant to land within 20 percent of the idle p99 and it is 390 percent over.
 The fold is not what does it and no compaction policy will fix it, which leaves the writing itself, and that is where the work is.
 
 Four readers is not the ceiling of the harness but it is close to the ceiling of the machine.
@@ -770,6 +774,41 @@ Four readers, four writers and a keeper is nine threads on ten cores, so past th
 
 The wait is not worth reading too closely either.
 On this operating system a thread that asks to be woken in a hundred microseconds is woken about a third late, which is the timer and not the store, and the tail of the waiting moves by more between two runs of the quiet condition than it does between the conditions.
+
+## Where the cost of writing beside a reader goes
+
+The table above says writing costs a reader 181 percent at the median, and it does not say what the reader is paying for.
+The writing row differs from the quiet row in three things at once: by the end it holds twice the documents, it holds them across a dozen segments rather than one, and there are four writers on the cores while the query runs.
+So the same run adds two more rows, both quiet.
+It builds the store the writing condition ends up with, one thread and nothing reading, folds a copy of it down to one segment and another copy down to the segment count a query in the writing condition actually walked, and asks both of them the same questions with nothing else happening.
+
+Getting that count right was the first result, and it was not the obvious one.
+A writing condition that finishes at thirteen segments started at one, so its middle query walked five, and a quiet row held at thirteen for a whole round came out slower than the writing row it was there to explain.
+Every query now records what its own view held, after its clock has stopped, and the middle of those is what the second quiet row gets folded to.
+
+Same corpus, same machine, same five runs as the table above:
+
+| condition | segments a query walked | median | p95 | p99 |
+| --- | --- | --- | --- | --- |
+| quiet, half the corpus, one segment | 1 | 3.2 µs | 4.5 µs | 10.6 µs |
+| quiet, all of it, one segment | 1 | 4.0 µs | 8.7 µs | 15.4 µs |
+| quiet, all of it, spread out | 5 | 7.8 µs | 18.0 µs | 33.5 µs |
+| writing | 5 | 9.0 µs | 30.6 µs | 51.9 µs |
+| writing and folding | 6 | 11.0 µs | 31.1 µs | 52.0 µs |
+
+Each row is against the one above it rather than against the first, because the three costs multiply rather than add.
+Doubling the documents costs 25 percent at the median and 45 at p99.
+Holding the same documents across five segments rather than one costs 95 percent and 118 more.
+The writers themselves cost 15 percent and 55 more, and at p95 they cost 70, which is the shape to expect: a commit taking the store is a stall rather than a slower query, so it shows up in the tail and barely in the middle.
+
+So the segment count is the largest of the three at both ends of the distribution, and the writers are a bigger share of the tail than of the middle.
+Folding earns its keep by holding that count down, and a rate limit that paused the keeper to buy back a few microseconds at the median would be paying for them in segments.
+Getting inside the read p99 target wants both halves of that: fewer segments for a query to walk, and a commit that does less to a reader while it is happening.
+
+One more thing falls out of the same table, and it qualifies something this file says elsewhere.
+The middle query of the folding condition walked six segments and the middle query of the writing condition walked five, so inside a round this short the keeper is not saving a reader any segment walks at all.
+What it buys is the store it leaves behind, six segments rather than thirteen, and the reader that pays for it is the one asking questions during the run.
+That is a fair trade over a long ingest and it is not a free one, and a run that only reported the segment count at the end would have made it look free.
 
 ## What it costs when there is no core to spare
 
