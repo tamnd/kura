@@ -185,6 +185,58 @@ pub struct Store {
     /// that was counted is one that has already happened, so nothing reads this
     /// while it moves.
     syncs: Cell<u64>,
+    /// What the last fold in this process moved, so that a batch prepared
+    /// before it can be caught up through it rather than refused.
+    ///
+    /// Not in the file. A fold that a restart came after has no batch left in
+    /// flight to catch up, because the process that was preparing them is gone.
+    folded: Option<Fold>,
+}
+
+/// What a fold did to the positions and the identifiers under it.
+///
+/// A batch names segments by position and documents by identifier, and a fold
+/// moves both. That used to be the end of the batch: [`crate::ingest::Prepared`]
+/// no longer fitted and the analyser pass it had done was thrown away. This is
+/// what the fold
+/// knew as it went, kept so that the batch can be moved along with everything
+/// else instead.
+///
+/// One of these is held at a time. The next fold replaces it, and
+/// [`Store::forget_fold`] drops it for a caller that knows nothing is in flight.
+/// What it costs is four bytes per document of the run that was folded, which is
+/// less than the merged segment the fold was already holding in memory to write.
+#[derive(Debug)]
+pub struct Fold {
+    /// The positions it replaced, in the manifest as it was before it.
+    pub run: core::ops::Range<usize>,
+    /// Where the replacement is now, or `None` if nothing in the run survived
+    /// and the positions closed up over it.
+    pub into: Option<usize>,
+    /// Where the documents of the run went.
+    pub moved: crate::compact::Moved,
+    /// The layout of every prefix of the manifest as it was before it.
+    ///
+    /// This is how a batch is told apart from a batch of today. A batch carries
+    /// the layout of the segments it saw, and a batch from before this fold is
+    /// one whose layout is what this says a prefix of that length came to.
+    pub prefixes: Vec<u64>,
+}
+
+impl Fold {
+    /// How many positions the manifest lost, which is how far the segments
+    /// above the run moved down.
+    #[must_use]
+    pub fn shrank(&self) -> usize {
+        self.run.len() - usize::from(self.into.is_some())
+    }
+
+    /// Whether a batch that saw `base` segments, whose layout came to `layout`,
+    /// is one from before this fold.
+    #[must_use]
+    pub fn covers(&self, base: usize, layout: u64) -> bool {
+        self.prefixes.get(base) == Some(&layout)
+    }
 }
 
 /// Where the segment region ends, according to a manifest.
@@ -283,6 +335,7 @@ impl Store {
             segments,
             durability: Reach::default(),
             syncs: Cell::new(0),
+            folded: None,
         })
     }
 
@@ -327,6 +380,7 @@ impl Store {
             segments,
             durability: Reach::default(),
             syncs: Cell::new(0),
+            folded: None,
         })
     }
 
@@ -1092,12 +1146,23 @@ impl Store {
             bytes = described.len;
             Some(described)
         };
+        // Before the splice, because it is about the manifest the batches in
+        // flight were prepared against and that is the one about to go.
+        let prefixes = crate::manifest::prefixes(&self.manifest.segments);
+        let into = replacement.as_ref().map(|_| run.start);
+        let record = Fold {
+            run: run.clone(),
+            into,
+            moved: merged.moved,
+            prefixes,
+        };
         manifest.segments.splice(run, replacement);
         manifest.total = manifest
             .total
             .saturating_sub(held)
             .saturating_add(u64::from(documents));
         let epoch = self.commit(manifest, written)?;
+        self.folded = Some(record);
         Ok(Compacted {
             epoch,
             folded,
@@ -1107,6 +1172,25 @@ impl Store {
             bytes,
             stranded,
         })
+    }
+
+    /// What the last fold in this process moved, if there has been one.
+    ///
+    /// A batch that no longer fits the store asks this whether the reason is a
+    /// fold it can be moved through. Nothing else has any use for it.
+    #[must_use]
+    pub const fn folded(&self) -> Option<&Fold> {
+        self.folded.as_ref()
+    }
+
+    /// Forgets it.
+    ///
+    /// For a caller that knows nothing was in flight when the fold happened, or
+    /// that whatever was has since been committed or given up on. What it gives
+    /// back is the memory, and what it costs is that a batch from before the
+    /// fold is refused again rather than caught up.
+    pub fn forget_fold(&mut self) {
+        self.folded = None;
     }
 
     /// How many documents a committed descriptor says are deleted.
