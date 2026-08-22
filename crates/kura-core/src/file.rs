@@ -86,6 +86,7 @@ use std::path::Path;
 
 use crate::DocId;
 use crate::bitmap::Bitmap;
+use crate::compact;
 use crate::error::Error;
 use crate::index::{Keys, Reader};
 use crate::manifest::{
@@ -813,6 +814,127 @@ impl Store {
         self.commit(manifest, written)
     }
 
+    /// Folds a run of segments into one and commits it in their place.
+    ///
+    /// This is the other half of [`crate::compact`]. That module builds the
+    /// replacement, this one puts it in the file and makes it the store, and the
+    /// two are apart because a merge is a fold over bytes and has no business
+    /// knowing what a manifest is.
+    ///
+    /// The run is a range and not a list of positions, and that is the whole of
+    /// what stops this from quietly losing a document. Segments are listed
+    /// oldest first and a key written twice answers with the copy in the later
+    /// segment, so the merged segment has to sit where its newest source sat,
+    /// with every segment older than the run still before it and every segment
+    /// newer than the run still after it. Folding positions out of the middle of
+    /// the list cannot do that: a run of the first and the third leaves the
+    /// second holding a key the first also holds, and whichever place the
+    /// replacement takes, one of those two keys now answers with the wrong copy.
+    /// A range cannot express that selection, which is why it is a range.
+    ///
+    /// Which run to fold is not decided here. That is the policy, it belongs
+    /// with the thing that watches the store grow, and this is the mechanism it
+    /// calls: it folds the run it is given.
+    ///
+    /// Nothing is reclaimed. The sources stay exactly where they are, with the
+    /// bitmaps that go with them, and a view taken before the commit goes on
+    /// reading them for as long as it lives. What the commit changes is which
+    /// bytes are named, and the space under the ones that stopped being named
+    /// comes back when the file is rewritten or, if the run was at the end of
+    /// the region, the next time the store is opened.
+    ///
+    /// A run where nothing survived commits the sources going away with no
+    /// replacement written, because a segment holding no documents is a
+    /// descriptor to carry forever for nothing.
+    ///
+    /// The live count does not move across a compaction and is not touched here.
+    /// The run's segments held exactly as many live documents between them as
+    /// the merged segment holds, since that is what the merge kept. The total
+    /// does move, by the number of deleted documents left behind, and that is
+    /// the number a compaction policy is watching.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Trouble::Format`] with [`Error::MissingSection`] if the run is
+    /// empty or runs past the segments there are, [`Error::UncarriedSection`] if
+    /// a segment in it holds a section this build cannot carry across, a
+    /// decoding error if a segment or one of the deletion sets cannot be read,
+    /// and [`Trouble::Io`] if the write, the sync or the commit fails. Nothing
+    /// is committed unless all of it is, and a failure anywhere leaves the store
+    /// at the state it was at.
+    pub fn compact(
+        &mut self,
+        run: core::ops::Range<usize>,
+        created: u64,
+        written: u64,
+    ) -> Result<Compacted> {
+        if run.is_empty() || run.end > self.manifest.segments.len() {
+            return Err(Trouble::Format(Error::MissingSection { kind: 0 }));
+        }
+        // The view goes away before anything is written. It holds a mapping of
+        // the file, the merge holds nothing of it once it has returned, and the
+        // append that comes next grows the file past where that mapping ends.
+        let merged = {
+            let view = self.view()?;
+            let mut sources = Vec::with_capacity(run.len());
+            for at in run.clone() {
+                let bytes = view.bytes(at).ok_or(Error::MissingSection { kind: 0 })?;
+                sources.push(compact::Source::new(bytes, view.deleted(at)?)?);
+            }
+            compact::merge(&sources)?
+        };
+
+        let mut manifest = self.manifest.clone();
+        let sources = &manifest.segments[run.clone()];
+        let held: u64 = sources.iter().map(|segment| u64::from(segment.docs)).sum();
+        let stranded: u64 = sources
+            .iter()
+            .map(|segment| {
+                segment
+                    .len
+                    .saturating_add(u64::from(segment.tombstones_len))
+            })
+            .sum();
+        // One past the deepest source, which is what a size tiered policy reads
+        // to tell a segment that has been folded once from one that has been
+        // folded five times. A policy that numbers its levels some other way is
+        // free to write its own number in afterwards.
+        let level = sources
+            .iter()
+            .map(|segment| segment.level)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let documents = merged.documents;
+        let folded = run.len();
+
+        let mut bytes = 0;
+        let replacement = if documents == 0 {
+            None
+        } else {
+            let mut described =
+                self.append_segment_with(documents, created, |into| merged.segment.write_to(into))?;
+            described.level = level;
+            bytes = described.len;
+            Some(described)
+        };
+        manifest.segments.splice(run, replacement);
+        manifest.total = manifest
+            .total
+            .saturating_sub(held)
+            .saturating_add(u64::from(documents));
+        let epoch = self.commit(manifest, written)?;
+        Ok(Compacted {
+            epoch,
+            folded,
+            documents,
+            dropped: merged.dropped,
+            terms: merged.terms,
+            bytes,
+            stranded,
+        })
+    }
+
     /// How many documents a committed descriptor says are deleted.
     ///
     /// Read back rather than remembered, because the store does not hold the
@@ -962,6 +1084,34 @@ impl Store {
         self.log = Ring::new(ring, head, position, sequence)?;
         Ok(count)
     }
+}
+
+/// What a compaction did.
+///
+/// Made by [`Store::compact`]. Every number in it is about the run that was
+/// folded rather than about the store, because the store is what the manifest
+/// says afterwards and the caller can read that. These are the numbers that are
+/// gone the moment the call returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Compacted {
+    /// The epoch of the commit that made the fold visible.
+    pub epoch: u64,
+    /// How many segments went into it.
+    pub folded: usize,
+    /// How many documents came out, which is how many of them were live.
+    pub documents: u32,
+    /// How many were left behind because they had been deleted.
+    pub dropped: u64,
+    /// How many distinct terms the merged segment holds.
+    pub terms: u32,
+    /// How long the merged segment is, or zero if nothing survived and none was
+    /// written.
+    pub bytes: u64,
+    /// How many bytes of segment and tombstone the store has stopped naming.
+    ///
+    /// Not how much smaller the file is. It is the same size it was, and this is
+    /// what a rewrite of it would get back.
+    pub stranded: u64,
 }
 
 /// The segments of a store, mapped, ready to be read.
@@ -2808,6 +2958,263 @@ mod tests {
         // written somewhere else and the manifest is repointed.
         let view = store.view().expect("a view");
         assert_eq!(view.deleted(0).expect("read").expect("a set").len(), 3);
+    }
+
+    /// [`keyed`], with every document carrying its own key back as a stored
+    /// field.
+    ///
+    /// The key table and the stored documents are renumbered by the same pass of
+    /// a compaction, and a pass that got one of them right and the other wrong
+    /// leaves both halves readable, both halves answering, and the two answering
+    /// about different documents. Nothing catches that without a field to
+    /// compare the key against, which is what this writes.
+    fn identified(path: &Path, parts: &[usize]) -> Store {
+        let mut store = Store::create(path, STORE, 1_700_000_000).expect("a store");
+        let mut manifest = store.manifest().clone();
+        let mut from = 0;
+        for (n, &count) in parts.iter().enumerate() {
+            let mut writer = crate::index::Writer::new();
+            for at in from..from + count {
+                writer
+                    .add_keyed_with_fields(&key(at), &text(at), [("id", key(at).as_slice())])
+                    .expect("a document");
+            }
+            let docs = u32::try_from(writer.len()).expect("a test corpus fits");
+            let bytes = writer.finish().expect("a segment");
+            let described = store
+                .append_segment(&bytes, docs, 1_700_000_000 + n as u64)
+                .expect("appended");
+            manifest.segments.push(described);
+            manifest.total += u64::from(described.docs);
+            manifest.live += u64::from(described.docs);
+            from += count;
+        }
+        store.commit(manifest, 1_700_000_001).expect("committed");
+        store
+    }
+
+    /// Every key an [`identified`] store still answers with, paired with the
+    /// `id` the document it resolved to carries.
+    ///
+    /// The pair is the point. A key that resolves to a document naming a
+    /// different key is a renumbering that went wrong in one half of the
+    /// segment, and both halves answer perfectly well on their own.
+    fn resolutions(store: &Store, count: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let view = store.view().expect("a view");
+        let mut out = Vec::with_capacity(count);
+        for n in 0..count {
+            let key = key(n);
+            let Some((at, doc)) = view.document(&key).expect("a lookup") else {
+                continue;
+            };
+            let reader = view.reader(at).expect("a reader");
+            let fields = reader.store().expect("a store section");
+            let mut scratch = crate::store::Scratch::new();
+            let document = fields.get(doc, &mut scratch).expect("the document");
+            let held = document
+                .field("id")
+                .expect("the fields decode")
+                .expect("an id")
+                .to_vec();
+            out.push((key, held));
+        }
+        out
+    }
+
+    #[test]
+    fn a_compaction_keeps_every_live_document_under_the_key_it_was_written_under() {
+        let path = path("compactkeys");
+        let mut store = identified(&path, &[10, 10, 10]);
+        // Out of two different segments, so the fold has to renumber across a
+        // gap in each of them rather than just after the one.
+        store
+            .delete(0, &Bitmap::from_sorted(&[3]), 2)
+            .expect("deleted");
+        store
+            .delete(2, &Bitmap::from_sorted(&[7]), 3)
+            .expect("deleted");
+        let before = resolutions(&store, 30);
+        assert_eq!(before.len(), 28);
+        assert!(before.iter().all(|(key, held)| key == held));
+
+        let epoch = store.manifest().epoch;
+        let done = store
+            .compact(0..3, 1_700_000_200, 1_700_000_201)
+            .expect("compacted");
+        assert_eq!(done.folded, 3);
+        assert_eq!(done.documents, 28);
+        assert_eq!(done.dropped, 2);
+        assert_eq!(done.epoch, epoch + 1);
+        assert!(done.bytes > 0);
+        assert!(done.stranded > done.bytes);
+
+        assert_eq!(store.manifest().segments.len(), 1);
+        assert_eq!(store.manifest().live, 28);
+        assert_eq!(store.manifest().total, 28);
+        assert_eq!(counted(&store), 28);
+        assert_eq!(resolutions(&store, 30), before);
+        // The merged segment starts with nothing deleted, so the tombstones of
+        // the segments it replaced went with them.
+        let described = store.manifest().segments[0];
+        assert_eq!(described.tombstones_offset, 0);
+        assert_eq!(described.tombstones_len, 0);
+        assert_eq!(described.generation, 0);
+        assert_eq!(described.first_live, 0);
+        assert_eq!(described.docs, 28);
+        assert_eq!(described.created, 1_700_000_200);
+    }
+
+    #[test]
+    fn a_view_taken_before_a_compaction_still_answers_out_of_what_it_named() {
+        let path = path("compactview");
+        let mut store = keyed(&path, &[10, 10, 10]);
+        let view = store.view().expect("a view");
+        let before = answered(&view, EVERYTHING, 40);
+        assert_eq!(before.len(), 30);
+
+        store.compact(0..3, 1, 2).expect("compacted");
+        // The view is the store it was taken from. Its segments are still in the
+        // file, nothing overwrote them, and it goes on answering out of the
+        // three it named.
+        assert_eq!(view.len(), 3);
+        assert_eq!(answered(&view, EVERYTHING, 40), before);
+        // And the store answers with the same documents out of one segment, so
+        // every hit is in segment zero now.
+        let after = hits(&store, EVERYTHING, 40);
+        assert_eq!(after.len(), 30);
+        assert!(after.iter().all(|(at, _)| *at == 0));
+    }
+
+    #[test]
+    fn a_key_whose_newest_copy_is_outside_the_run_still_answers_with_that_copy() {
+        // The reason the run is a range. Segments are oldest first, a key that
+        // was written twice answers with the copy in the later segment, and a
+        // fold that moved an older copy past a newer one would answer with the
+        // document that was replaced.
+        let path = path("compactorder");
+        let mut store = keyed(&path, &[10, 10]);
+        extend(&mut store, &[(key(0), text(500))]);
+        let view = store.view().expect("a view");
+        assert_eq!(view.document(&key(0)).expect("a lookup"), Some((2, 0)));
+        drop(view);
+
+        store.compact(0..2, 1, 2).expect("compacted");
+        let view = store.view().expect("a view");
+        assert_eq!(view.len(), 2);
+        // The newest copy is where it always was, one segment later than the
+        // merged one, and it is still what the key answers with.
+        assert_eq!(view.document(&key(0)).expect("a lookup"), Some((1, 0)));
+        assert_eq!(view.document(&key(9)).expect("a lookup"), Some((0, 9)));
+    }
+
+    #[test]
+    fn a_run_that_is_empty_or_runs_past_the_segments_there_are_is_refused() {
+        let path = path("compactrun");
+        let mut store = stored(&path, &[10, 10]);
+        for run in [0..0, 1..1, 0..3, 2..2] {
+            let error = store.compact(run, 1, 2).expect_err("refused");
+            assert!(
+                matches!(error, Trouble::Format(Error::MissingSection { .. })),
+                "{error:?}"
+            );
+        }
+        assert_eq!(store.manifest().segments.len(), 2);
+        assert_eq!(store.manifest().epoch, 2);
+    }
+
+    #[test]
+    fn a_compaction_that_never_reached_the_commit_leaves_the_store_as_it_was() {
+        let path = path("compacttorn");
+        {
+            let mut store = identified(&path, &[10, 10]);
+            let view = store.view().expect("a view");
+            let mut sources = Vec::new();
+            for at in 0..view.len() {
+                let bytes = view.bytes(at).expect("the segment");
+                let deleted = view.deleted(at).expect("the deletions decode");
+                sources.push(compact::Source::new(bytes, deleted).expect("a source"));
+            }
+            let merged = compact::merge(&sources).expect("a merge");
+            drop(sources);
+            drop(view);
+            // The bytes land and the machine goes away before the manifest that
+            // would have named them.
+            store
+                .append_segment_with(merged.documents, 1, |into| merged.segment.write_to(into))
+                .expect("appended");
+        }
+        let store = Store::open(&path).expect("a store");
+        assert_eq!(store.manifest().segments.len(), 2);
+        assert_eq!(store.manifest().live, 20);
+        assert_eq!(store.manifest().total, 20);
+        assert_eq!(counted(&store), 20);
+        assert_eq!(resolutions(&store, 20).len(), 20);
+    }
+
+    #[test]
+    fn a_store_that_stopped_after_a_compaction_comes_back_compacted() {
+        let path = path("compactreopen");
+        let done = {
+            let mut store = identified(&path, &[10, 10, 10]);
+            store.compact(0..3, 1, 2).expect("compacted")
+        };
+        let mut store = Store::open(&path).expect("a store");
+        assert_eq!(store.manifest().segments.len(), 1);
+        assert_eq!(store.manifest().epoch, done.epoch);
+        assert_eq!(counted(&store), 30);
+        assert_eq!(resolutions(&store, 30).len(), 30);
+        // The segments the fold replaced are not named any more, so the next
+        // append has to go past the merged segment and not over it, which is
+        // what a store that worked out where to write from the manifest alone
+        // would get wrong.
+        extend(&mut store, &[(key(100), text(600))]);
+        assert_eq!(counted(&store), 31);
+        drop(store);
+        let store = Store::open(&path).expect("a store");
+        assert_eq!(counted(&store), 31);
+        assert_eq!(
+            store
+                .view()
+                .expect("a view")
+                .document(&key(0))
+                .expect("a lookup"),
+            Some((0, 0))
+        );
+    }
+
+    #[test]
+    fn a_run_where_everything_was_deleted_goes_away_without_a_replacement() {
+        let path = path("compactempty");
+        let mut store = identified(&path, &[4, 6]);
+        store
+            .delete(0, &Bitmap::from_sorted(&[0, 1, 2, 3]), 2)
+            .expect("deleted");
+        let done = store.compact(0..1, 1, 3).expect("compacted");
+        assert_eq!(done.folded, 1);
+        assert_eq!(done.documents, 0);
+        assert_eq!(done.dropped, 4);
+        assert_eq!(done.bytes, 0);
+        assert!(done.stranded > 0);
+
+        assert_eq!(store.manifest().segments.len(), 1);
+        assert_eq!(store.manifest().live, 6);
+        assert_eq!(store.manifest().total, 6);
+        assert_eq!(counted(&store), 6);
+        assert_eq!(resolutions(&store, 10).len(), 6);
+    }
+
+    #[test]
+    fn the_merged_segment_sits_one_level_past_the_deepest_of_its_sources() {
+        let path = path("compactlevel");
+        let mut store = stored(&path, &[10, 10, 10]);
+        assert!(store.manifest().segments.iter().all(|s| s.level == 0));
+        store.compact(0..2, 1, 2).expect("compacted");
+        assert_eq!(store.manifest().segments[0].level, 1);
+        assert_eq!(store.manifest().segments[1].level, 0);
+        store.compact(0..2, 3, 4).expect("compacted again");
+        assert_eq!(store.manifest().segments.len(), 1);
+        assert_eq!(store.manifest().segments[0].level, 2);
+        assert_eq!(counted(&store), 30);
     }
 
     /// Changes one byte of a file in place, which is what a torn write leaves.

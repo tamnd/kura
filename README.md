@@ -219,7 +219,53 @@ merged bytes            16497406
 
 The dictionary is the part that shrinks furthest, from 3,679,160 entries across the sixteen segments to 400,588, because fifteen of every sixteen copies of a term were held only by documents somebody had already deleted.
 The merge held 37.5 MB of its own beyond the mapped file, which is the segment it was building.
-What is not here yet is the commit that swaps the merged segment into the store in place of the segments it came from, so the store still grows by a segment a run.
+
+The other half is the commit that swaps the merged segment into the store in place of the segments it came from, and that is what `kura-cli compact` does:
+
+```sh
+./target/release/kura-cli compact /tmp/docs.kura
+```
+
+```
+  segments                       16
+    folding                      16
+  documents                   87104
+    live                      10888
+  file bytes              147644431
+
+  fold wall                    0.67 s
+  merged documents            10888
+    left behind               76216
+  merged terms               400588
+  merged bytes             16522592
+  stranded bytes          139040690
+
+  segments                        1
+  documents                   10888
+    live                      10888
+  file bytes              164171104
+  epoch                          18
+```
+
+The file gets bigger, which is the part worth saying out loud.
+A commit appends, so the merged segment goes on the end and the sixteen it replaced stay where they are, holding 139.0 MB that nothing reads any more.
+That space comes back when the file is rewritten and not before, because a query that started before the commit is still reading out of the segments the commit replaced.
+Reclaiming it is a separate piece of work from choosing what to fold.
+
+What changes immediately is what a query touches.
+The same three queries over the same store, both files warm, nine runs of each, the median of the search itself:
+
+| query | matches | postings decoded before | after | median before | median after |
+| --- | --- | --- | --- | --- | --- |
+| goroutine channel | 656 | 5,792 | 724 | 156 µs | 29 µs |
+| context deadline exceeded | 890 | 7,920 | 990 | 153 µs | 31 µs |
+| garbage collector mark | 531 | 5,272 | 659 | 166 µs | 28 µs |
+
+The match counts are the same on both sides, which is the check that matters: a fold that answered a different number would be a fold that lost or duplicated a document.
+What the fold takes away is the work of walking sixteen dictionaries and then throwing away seven postings in every eight, and the queries come out about five times faster for it.
+The part of the file a query reads goes from 132.7 MB to 15.8 MB at the same time, which is the number that decides how much of an index has to stay in memory.
+
+Choosing when to fold and what to fold is policy and is not here yet, so this is a command somebody runs rather than something the store does on its own.
 
 A run without `--store` writes a single segment and keys nothing, because a file is not a store and there is nothing in it to replace.
 
