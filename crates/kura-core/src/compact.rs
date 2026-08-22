@@ -305,6 +305,20 @@ fn numbering(sources: &[Source<'_>]) -> Result<(Vec<Vec<DocId>>, u32, u64)> {
 /// heap. There are as many sources as a compaction chose to fold, which is a
 /// handful.
 ///
+/// A heap is the usual answer to a merge of sorted runs and it is the wrong one
+/// here. A heap costs a comparison per entry per level, and the entries are the
+/// terms of every source added up, which for a corpus where most terms are in
+/// most segments is the source count times the merged term count. That is the
+/// same number of comparisons the scan does, multiplied by the depth of the
+/// heap. It would win only where the sources have little vocabulary in common,
+/// and segments of one corpus have almost all of it in common.
+///
+/// What the scan must not do is happen twice. Finding the smallest term is one
+/// pass over the fronts, and the sources holding that term are the ones the pass
+/// found it equal to, so [`smallest`] hands those back rather than leaving the
+/// caller to ask every source again. Asking again was a quarter of the merge on
+/// a sixteen segment fold, which is what `examples/folding` was written to find.
+///
 /// A term whose every posting belonged to a deleted document is not written at
 /// all. That is the case that makes a merged dictionary smaller than the sum of
 /// the ones it came from.
@@ -334,13 +348,15 @@ fn vocabulary(
     // bytes long.
     let mut list = posting::Writer::new();
     let mut term = Vec::new();
-    while smallest(&front, &mut term) {
+    let mut holders = Vec::with_capacity(sources.len());
+    while smallest(&front, &mut term, &mut holders) {
         let mut docs = 0u32;
-        for (index, source) in sources.iter().enumerate() {
-            let entry = match &front[index] {
-                Some((held, entry)) if *held == term => *entry,
-                _ => continue,
+        for &index in &holders {
+            let Some((_, entry)) = &front[index] else {
+                continue;
             };
+            let entry = *entry;
+            let source = &sources[index];
             let mut cursor = source.reader.list(entry)?.cursor();
             while let Some(doc) = cursor.advance()? {
                 let Some(&new) = mapping[index].get(doc as usize) else {
@@ -376,24 +392,44 @@ fn vocabulary(
     Ok(())
 }
 
-/// Copies the smallest term at the front of any source into `into`, and says
-/// whether there was one.
+/// Copies the smallest term at the front of any source into `into`, lists the
+/// sources holding it in `at`, and says whether there was one.
 ///
 /// It is copied rather than borrowed because the walk that produced it is about
-/// to be moved on, and because the caller compares it against every front while
-/// it does that.
-fn smallest(front: &[Option<(Vec<u8>, terms::Entry)>], into: &mut Vec<u8>) -> bool {
-    let Some(least) = front
-        .iter()
-        .flatten()
-        .map(|(held, _)| held.as_slice())
-        .min()
-    else {
-        return false;
-    };
-    into.clear();
-    into.extend_from_slice(least);
-    true
+/// to be moved on.
+///
+/// The list of holders comes out of the same pass because the pass already knows
+/// it. A source holds the smallest term exactly when its front compared equal to
+/// what the pass had, so recording the index there costs nothing and saves the
+/// caller a second comparison against every source. Both vectors are the
+/// caller's and are reused across terms, so neither allocates after the first
+/// few terms.
+fn smallest(
+    front: &[Option<(Vec<u8>, terms::Entry)>],
+    into: &mut Vec<u8>,
+    at: &mut Vec<usize>,
+) -> bool {
+    at.clear();
+    for (index, slot) in front.iter().enumerate() {
+        let Some((held, _)) = slot else { continue };
+        if at.is_empty() {
+            into.clear();
+            into.extend_from_slice(held);
+            at.push(index);
+            continue;
+        }
+        match held.as_slice().cmp(into.as_slice()) {
+            core::cmp::Ordering::Less => {
+                into.clear();
+                into.extend_from_slice(held);
+                at.clear();
+                at.push(index);
+            }
+            core::cmp::Ordering::Equal => at.push(index),
+            core::cmp::Ordering::Greater => {}
+        }
+    }
+    !at.is_empty()
 }
 
 /// Moves one dictionary walk on, into the buffer it is holding.
@@ -582,6 +618,32 @@ mod tests {
             Source::new(&first, None).expect("opens"),
             Source::new(&second, None).expect("opens"),
         ];
+        assert_eq!(merged(&sources), whole);
+    }
+
+    #[test]
+    fn a_term_is_taken_from_every_source_holding_it_and_from_no_other() {
+        // The same comparison of bytes, over sources chosen to make the walk
+        // across the dictionaries do every awkward thing it can. One term is in
+        // all five, one is in the first and the last with three sources in
+        // between that do not have it, one source is a single word so it runs
+        // out while the others are still going, and one holds a term that sorts
+        // after everything else so the walk ends with only it left.
+        let parts: [&[&str]; 5] = [
+            &["alpha common zulu", "alpha alpha"],
+            &["common"],
+            &["beta common", "beta beta beta"],
+            &["common gamma", "gamma"],
+            &["alpha common", "delta"],
+        ];
+        let together: Vec<&str> = parts.iter().flat_map(|part| part.iter().copied()).collect();
+        let whole = build(&together);
+
+        let built: Vec<Vec<u8>> = parts.iter().map(|part| build(part)).collect();
+        let sources: Vec<Source<'_>> = built
+            .iter()
+            .map(|bytes| Source::new(bytes, None).expect("opens"))
+            .collect();
         assert_eq!(merged(&sources), whole);
     }
 
