@@ -53,7 +53,7 @@ use kura_core::analysis::Analyzer;
 use kura_core::bitmap::Bitmap;
 use kura_core::file::{Store, Trouble};
 use kura_core::index::{Held, Reader, Writer};
-use kura_core::ingest::Batch;
+use kura_core::ingest::Logged;
 use kura_core::manifest;
 use kura_core::mapping::Map;
 use kura_core::residency;
@@ -78,17 +78,25 @@ const DEFAULT_TAG: &str = "kura";
 
 /// How long the log ring is in a store this tool makes.
 ///
-/// Well under the engine's default quarter of a gigabyte, because this tool
-/// writes a segment straight into the store, so it never writes a record and the
-/// ring is there for whatever opens the store next rather than for anything
-/// happening here. The size is fixed when the store is made and
-/// cannot be changed afterwards without moving every segment in the file, so it
-/// is not nothing, but eight megabytes is thousands of records and a store that
-/// wants more than that is a store a program made rather than one made here.
+/// Half the engine's default, and it is the batch that decides it rather than
+/// the log. Every document this tool indexes goes into the log first, and the
+/// records of one batch have to fit in the ring, so a ring smaller than a batch
+/// is a run that commits whenever the log fills rather than whenever the memory
+/// budget says.
 ///
-/// It also keeps the file small on a filesystem that reserves the space a file
-/// says it is long rather than handing it out as it is written to.
-const LOG_LEN: u64 = 8 << 20;
+/// That is not a failure and it is worth knowing what it does. The same corpus
+/// through a ring of eight megabytes came out as eleven segments and an index
+/// 18 percent larger, and it halved the peak resident memory, because a log that
+/// bounds a batch is a memtable trigger wearing a different hat. This picks the
+/// size that leaves a run looking like the run before the log existed, and the
+/// flush trigger is a decision to make on purpose rather than by accident.
+///
+/// The size is fixed when the store is made and cannot be changed afterwards
+/// without moving every segment in the file. The region is sparse, so a store of
+/// a few documents is a long file that occupies almost nothing, on every
+/// filesystem that hands space out as it is written to rather than when a file
+/// says how long it is.
+const LOG_LEN: u64 = 128 << 20;
 
 fn main() -> ExitCode {
     match run() {
@@ -879,6 +887,13 @@ struct Run<'a> {
     /// How many segments the index holds afterwards, which on a store counts
     /// the ones that were there before this run.
     segments: usize,
+    /// How many documents went into the log on the way in.
+    records: u64,
+    /// What those records came to.
+    logged: u64,
+    /// How many documents the log had no room for, which is a run whose batches
+    /// are larger than the ring the store was made with.
+    unlogged: u64,
     peak: Held,
     steepest: Steepest<'a>,
     marks: Marks,
@@ -915,6 +930,20 @@ impl<'a> Run<'a> {
                 self.documents - self.replaced,
                 self.replaced
             );
+            // What the log took, which is what a stop halfway through this run
+            // would have left behind for a recovery to put back.
+            print!(
+                "{} of them went through the log first, {}",
+                self.records,
+                report::bytes(self.logged)
+            );
+            if self.unlogged > 0 {
+                print!(
+                    ", and {} of them had no room in it and waited for the commit",
+                    self.unlogged
+                );
+            }
+            println!();
         }
         tell_held(self.peak);
         if let Some(budget) = plan.memory {
@@ -985,8 +1014,8 @@ fn one_batch<'a>(
     let trouble = |trouble| Failure::Store(plan.out.clone(), trouble);
     let view = store.view().map_err(trouble)?;
     let mut batch = match plan.memory {
-        Some(budget) => Batch::with_budget(&view, budget),
-        None => Batch::over(&view),
+        Some(budget) => Logged::with_budget(&view, store, budget),
+        None => Logged::over(&view, store),
     }
     .map_err(trouble)?;
     // The batch this measures is a new one, so the next document is a step from
@@ -1013,7 +1042,7 @@ fn one_batch<'a>(
         // rather than a second copy of everything.
         let path = file.to_string_lossy().into_owned();
         batch
-            .add_keyed_with_fields(path.as_bytes(), &text, [(PATH_FIELD, path.as_bytes())])
+            .add_keyed_with_fields(path.as_bytes(), &text, &[(PATH_FIELD, path.as_bytes())])
             .map_err(trouble)?;
         run.saw(file, batch.held());
 
@@ -1033,6 +1062,9 @@ fn one_batch<'a>(
     }
     let documents = batch.len();
     let replaced = batch.replacements();
+    run.records += batch.records();
+    run.logged += batch.logged();
+    run.unlogged += batch.unlogged();
 
     // Three readings of the same high water mark, taken either side of the two
     // things that happen after the last document has been read. Nothing lowers a
@@ -1043,17 +1075,14 @@ fn one_batch<'a>(
     let read_documents = Some(residency::peak_resident());
     let prepared = batch.finish().map_err(trouble)?;
     let read_merged = Some(residency::peak_resident());
-    let size = prepared
-        .segment
-        .as_ref()
-        .map_or(0, |(built, _)| built.size() as u64);
+    let size = prepared.size();
     let now = now();
     // Straight into the store rather than through a vector of the finished
     // segment, so the bytes are laid out where they are going. Building the
     // vector first cost 20.6 MB on a corpus whose segment came to 14.3 MB, which
     // is a copy of the largest thing this program makes for the length of one
     // call.
-    prepared.commit(store, now, now).map_err(trouble)?;
+    prepared.commit(now, now).map_err(trouble)?;
     run.marks = Marks {
         documents: read_documents,
         merged: read_merged,
@@ -1766,6 +1795,27 @@ mod tests {
         // One file holds the word and one hit is what a page of it should be,
         // whatever the counting says.
         assert_eq!(scores(&store, "debenture", 10).len(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_run_into_a_store_leaves_a_log_with_nothing_left_to_replay() {
+        // The tool writes every document into the log on the way in, and the
+        // commit frees what it wrote. A run that finished and left records
+        // behind would be a store that replays documents it already holds the
+        // next time it is opened.
+        let dir = scratch_dir("log-drained");
+        let corpus = documents(&dir.join("corpus"), 0, 30);
+        let store = dir.join("logged.kura");
+        into(&corpus, &store, &[]).expect("the run");
+
+        let mut opened = Store::open(&store).expect("the store opens");
+        assert_eq!(opened.manifest().live, 30);
+        assert_eq!(opened.manifest().wal_head, opened.manifest().wal_tail);
+        let mut records = 0;
+        opened.recover(|_| records += 1).expect("the log walks");
+        assert_eq!(records, 0, "the log still names records");
 
         let _ = fs::remove_dir_all(&dir);
     }

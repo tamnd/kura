@@ -177,31 +177,43 @@ The new documents and the deletions of the ones they replace land in one commit,
 A run says which it did:
 
 ```
-indexed 10888 documents, 106.4 MB of text into /tmp/docs.kura, 16.6 MB in 1.1s
+indexed 10888 documents, 106.4 MB of text into /tmp/docs.kura, 16.6 MB in 1.4s
 0 of them were new and 10888 replaced a document already in the store
+10888 of them went through the log first, 84.3 MB
 ```
+
+The third line is the write ahead log.
+Every document goes into it as it is taken, holding the tokens the analyser produced rather than the text it produced them from, so a store that comes back after a machine stopped mid run rebuilds what it had without running the analyser again and without depending on the analyser still being what it was.
+The records are freed when the segment they went into is committed, and the freeing and the commit are one write, so there is no window where a document is in both and none where it is in neither.
+
+It costs what writing the same corpus twice costs.
+The Go source tree indexed into a store took 1.08 s before the log and 1.30 s with it, and the log took 84.3 MB for 106.4 MB of text.
+The bytes come back as the ring wraps, and the ring is 128 MB in a store this tool makes.
+
+Replaying those records when a store opens is not wired up yet, so what the log buys today is the record and the ordering rather than the recovery.
 
 The Go source tree at go1.26.6, which is 10,888 text files and 106.4 MB, on an M4 with the files already in page cache, `--memory 32m`, eight runs of the same command one after another:
 
 | run | new | replaced | segments after | wall |
 | --- | --- | --- | --- | --- |
-| 1 | 10,888 | 0 | 2 | 2.1 s |
-| 2 | 0 | 10,888 | 4 | 1.1 s |
-| 3 | 0 | 10,888 | 6 | 1.1 s |
-| 4 | 0 | 10,888 | 8 | 1.8 s |
-| 5 | 0 | 10,888 | 10 | 1.9 s |
-| 6 | 0 | 10,888 | 12 | 1.1 s |
-| 7 | 0 | 10,888 | 14 | 1.0 s |
-| 8 | 0 | 10,888 | 16 | 1.0 s |
+| 1 | 10,888 | 0 | 2 | 1.9 s |
+| 2 | 0 | 10,888 | 4 | 1.2 s |
+| 3 | 0 | 10,888 | 6 | 1.2 s |
+| 4 | 0 | 10,888 | 8 | 1.3 s |
+| 5 | 0 | 10,888 | 10 | 1.3 s |
+| 6 | 0 | 10,888 | 12 | 1.4 s |
+| 7 | 0 | 10,888 | 14 | 1.2 s |
+| 8 | 0 | 10,888 | 16 | 1.3 s |
 
-Every document in a run after the first is a lookup, an index and a deletion rather than an append, and it costs about half what the first run cost, because the first run is the one that reads the files off disk rather than out of the page cache.
+Every document in a run after the first is a lookup, an index and a deletion rather than an append, and it costs about two thirds of what the first run cost, because the first run is the one that reads the files off disk rather than out of the page cache.
 A lookup asks the key index of every segment in turn, so the cost of one grows with the segment count, and the run that ended with sixteen segments was not slower than the run that ended with four.
 
 What it does cost is the file.
-The documents that were replaced are still in the segments they were written into, so the store grows by a segment a run: 74.4 MB after four runs and 140.7 MB after eight, with 10,888 live documents and 87,104 written throughout.
+The documents that were replaced are still in the segments they were written into, so the store grows by a segment a run: 69.8 MB of segments after four runs and 139.4 MB after eight, with 10,888 live documents and 87,104 written throughout.
+The file itself is 134.2 MB longer than that, which is the log region, and it is sparse, so a store of a handful of documents is a long file that occupies almost nothing.
 Reclaiming that is compaction.
 Half of it is here: `kura_core::compact::merge` folds segments into one holding their live documents, and the example beside it does that to a whole store and checks the result answers what the store answered.
-On the sixteen segment store the eight runs above left, 139.0 MB of segments holding 87,104 documents of which 10,888 are live:
+On the sixteen segment store the eight runs above left, 139.4 MB of segments holding 87,104 documents of which 10,888 are live:
 
 ```
 cargo run --release --example compact -- /tmp/docs.kura
@@ -209,11 +221,11 @@ cargo run --release --example compact -- /tmp/docs.kura
 
 ```
 merge wall                  0.36 s
-merge rate                 29885 docs/s
+merge rate                 30076 docs/s
 merged documents           10888
   left behind              76216
 merged terms              400588
-merged bytes            16497406
+merged bytes            16522592
   of the sources           11.9 %
 ```
 
@@ -231,24 +243,24 @@ The other half is the commit that swaps the merged segment into the store in pla
     folding                      16
   documents                   87104
     live                      10888
-  file bytes              147644431
+  file bytes              273637391
 
-  fold wall                    0.67 s
+  fold wall                    0.75 s
   merged documents            10888
     left behind               76216
   merged terms               400588
   merged bytes             16522592
-  stranded bytes          139040690
+  stranded bytes          139214498
 
   segments                        1
   documents                   10888
     live                      10888
-  file bytes              164171104
+  file bytes              290164064
   epoch                          18
 ```
 
 The file gets bigger, which is the part worth saying out loud.
-A commit appends, so the merged segment goes on the end and the sixteen it replaced stay where they are, holding 139.0 MB that nothing reads any more.
+A commit appends, so the merged segment goes on the end and the sixteen it replaced stay where they are, holding 139.2 MB that nothing reads any more.
 That space comes back when the file is rewritten and not before, because a query that started before the commit is still reading out of the segments the commit replaced.
 Reclaiming it is a separate piece of work from choosing what to fold.
 

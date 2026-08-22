@@ -478,7 +478,7 @@ impl Writer {
         text: &str,
         fields: impl IntoIterator<Item = (&'f str, &'f [u8])>,
     ) -> Result<DocId> {
-        self.insert(None, text, fields)
+        self.write(None, text, fields, None)
     }
 
     /// Adds a document under a primary key.
@@ -504,7 +504,7 @@ impl Writer {
     /// Returns [`Error::NotSorted`] if more documents are added than a document
     /// identifier can hold.
     pub fn add_keyed(&mut self, key: &[u8], text: &str) -> Result<DocId> {
-        self.insert(Some(key), text, core::iter::empty())
+        self.write(Some(key), text, core::iter::empty(), None)
     }
 
     /// Adds a document under a primary key, and keeps `fields` to hand back with
@@ -523,7 +523,43 @@ impl Writer {
         text: &str,
         fields: impl IntoIterator<Item = (&'f str, &'f [u8])>,
     ) -> Result<DocId> {
-        self.insert(Some(key), text, fields)
+        self.write(Some(key), text, fields, None)
+    }
+
+    /// Adds a document and fills `into` with the record the log would carry for
+    /// it, out of the same pass of the analyser.
+    ///
+    /// A store that logs what it takes has to write the document twice, once
+    /// into the index and once into the log, and the naive way to do that is to
+    /// analyse it twice. Analysis is the most expensive thing in the ingest
+    /// path, so this hands each token to the postings and to the record as it
+    /// comes out, and the second write costs an append and no analysis at all.
+    ///
+    /// It also makes the log hold exactly what the index was built from rather
+    /// than what a second run of the analyser produced, which is the property
+    /// the record was designed for.
+    ///
+    /// `into` is cleared first, so one record can be held across a run and
+    /// reused rather than allocated per document.
+    ///
+    /// # Errors
+    ///
+    /// As [`add_keyed_with_fields`](Self::add_keyed_with_fields).
+    pub fn add_logged<'f>(
+        &mut self,
+        key: Option<&[u8]>,
+        text: &str,
+        fields: &[(&'f str, &'f [u8])],
+        into: &mut upsert::Upsert,
+    ) -> Result<DocId> {
+        into.clear();
+        if let Some(key) = key {
+            into.key(key);
+        }
+        for (name, value) in fields {
+            into.field(name, value);
+        }
+        self.write(key, text, fields.iter().copied(), Some(into))
     }
 
     /// Adds a document out of a record the log holds, without analysing
@@ -557,7 +593,7 @@ impl Writer {
         while let Some(field) = walk.next_field()? {
             fields.push(field);
         }
-        self.insert(record.key(), *record, fields)
+        self.write(record.key(), *record, fields, None)
     }
 
     /// The one place a document is added, whether or not it was named.
@@ -566,11 +602,17 @@ impl Writer {
     /// document has one key or none by construction. A writer that let a key be
     /// attached to a document already added would have to answer what a second
     /// key for the same document means, and there is no good answer to that.
-    fn insert<'t, 'f>(
+    ///
+    /// `log`, when there is one, is filled with the tokens as they are produced,
+    /// which is what makes writing a document into the log cost one analysis
+    /// rather than two. A document arriving as a record is already in the log by
+    /// definition and passes none.
+    fn write<'t, 'f>(
         &mut self,
         key: Option<&[u8]>,
         text: impl Into<Words<'t>>,
         fields: impl IntoIterator<Item = (&'f str, &'f [u8])>,
+        log: Option<&mut upsert::Upsert>,
     ) -> Result<DocId> {
         let text = text.into();
         let doc =
@@ -590,9 +632,15 @@ impl Writer {
             key_bytes,
             budget: _,
         } = self;
-        let length = match text {
-            Words::Prose(text) => analyzer.analyze(text, |term, _| postings.count(term, stamp)),
-            Words::Tokens(record) => {
+        let length = match (text, log) {
+            (Words::Prose(text), None) => {
+                analyzer.analyze(text, |term, _| postings.count(term, stamp))
+            }
+            (Words::Prose(text), Some(log)) => analyzer.analyze(text, |term, _| {
+                postings.count(term, stamp);
+                log.token(term);
+            }),
+            (Words::Tokens(record), _) => {
                 let mut walk = record.tokens();
                 let mut length: u32 = 0;
                 while let Some(token) = walk.next_token()? {
@@ -1686,6 +1734,51 @@ mod tests {
             let bytes = logged(key, text, fields);
             let record = upsert::Record::read(&bytes).expect("the record reads");
             replayed.add_record(&record).expect("it goes in");
+        }
+
+        assert_eq!(
+            written.finish().expect("what was written decodes"),
+            replayed.finish().expect("what was replayed decodes"),
+        );
+    }
+
+    #[test]
+    fn the_record_a_document_fills_on_its_way_in_is_the_document_that_went_in() {
+        // The same claim from the other side. A document indexed and logged in
+        // one pass has to produce the record a second pass would have produced,
+        // otherwise a store logs one thing and holds another.
+        let corpus: [Document<'_>; 3] = [
+            (
+                b"docs/a.md",
+                "the quick brown fox jumps over the lazy dog",
+                &[("path", b"docs/a.md"), ("title", b"A")],
+            ),
+            (b"docs/b.md", "the dog barks", &[]),
+            (
+                b"docs/c.md",
+                "\u{5009} \u{5eab} and the quarter it covers",
+                &[("path", b"docs/c.md")],
+            ),
+        ];
+
+        let mut written = Writer::new();
+        let mut record = upsert::Upsert::new();
+        let mut records = Vec::new();
+        for (key, text, fields) in corpus {
+            written
+                .add_logged(Some(key), text, fields, &mut record)
+                .expect("a handful of documents fit");
+            records.push(record.bytes());
+            assert_eq!(
+                records.last().expect("just pushed"),
+                &logged(key, text, fields)
+            );
+        }
+
+        let mut replayed = Writer::new();
+        for bytes in &records {
+            let read = upsert::Record::read(bytes).expect("the record reads");
+            replayed.add_record(&read).expect("it goes in");
         }
 
         assert_eq!(
