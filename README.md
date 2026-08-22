@@ -190,7 +190,35 @@ It costs what writing the same corpus twice costs.
 The Go source tree indexed into a store took 1.08 s before the log and 1.30 s with it, and the log took 84.3 MB for 106.4 MB of text.
 The bytes come back as the ring wraps, and the ring is 128 MB in a store this tool makes.
 
-Replaying those records when a store opens is not wired up yet, so what the log buys today is the record and the ordering rather than the recovery.
+A run into a store puts back whatever the run before it left behind, before it indexes anything of its own, and says so:
+
+```
+put back 8871 documents out of the log, 68.9 MB, left by a run that did not finish
+```
+
+Killing an indexing run of the Go source tree with a signal it cannot catch, then running the same command again, is where that number came from.
+Walking the log to find those 8,871 records took 0.01 s and putting them back took 0.39 s, which is 23,038 documents a second against the 9,000 a second the same corpus indexes at from text, because a record holds the analysis and the text does not.
+The example beside it times the two halves separately on a store of your own, and writes to the store it is given, so point it at a copy:
+
+```sh
+cargo run --release --example replay -- /tmp/docs.kura
+```
+
+The commit that publishes them frees the log in the same write, so a machine that stops in the middle of a replay replays the same records again and lands in the same place, and one that stops after it has nothing left to replay.
+
+The order it happens in is the order that makes it safe rather than the order that reads well.
+The log is freed first and the segment published second, because the freed position only reaches the platter inside the manifest that the publish writes.
+Freeing it afterwards would leave a committed manifest naming records that are already in a segment, and the next machine to open the store would put those documents in twice.
+
+A log torn anywhere gives back what was promised and no more.
+The test for it copies a store, zeroes the log from every 4 KiB boundary in the window written since the last commit through to the end, and opens each copy: the documents whose commit returned are there every time, and the documents that were only logged come back as far as the tear and no further, in the order they were written.
+
+`kura-cli verify` says what a store is holding without touching it:
+
+```
+  log              128.0 MB
+    8871 records to replay, 68.9 MB
+```
 
 The Go source tree at go1.26.6, which is 10,888 text files and 106.4 MB, on an M4 with the files already in page cache, `--memory 32m`, eight runs of the same command one after another:
 

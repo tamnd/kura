@@ -88,6 +88,22 @@ pub enum Error {
         length: u32,
     },
 
+    /// A log record is a kind the replay has no way to apply.
+    ///
+    /// Skipping it is not an option. The record is there because something
+    /// promised a caller it would be applied, and a replay that walks past it
+    /// leaves a store missing a write it said it had taken, with nothing to say
+    /// so. A store written by a later build and opened by an earlier one is the
+    /// way this happens, and the earlier one refusing to open is the only honest
+    /// answer it has.
+    UnknownRecord {
+        /// The kind field of the record.
+        kind: u32,
+        /// Where in the log it was found, in ring positions rather than in file
+        /// offsets.
+        position: u64,
+    },
+
     /// A record does not fit in what is left of the log ring.
     ///
     /// The caller flushes what the log already holds and truncates it, which
@@ -345,6 +361,13 @@ impl fmt::Display for Error {
             }
             Self::BadRecord { length } => {
                 write!(f, "a log record cannot be {length} bytes long")
+            }
+            Self::UnknownRecord { kind, position } => {
+                write!(
+                    f,
+                    "the log holds a record of kind {kind} at {position} that this build \
+                     cannot apply"
+                )
             }
             Self::LogFull { needed, free } => {
                 write!(f, "log record needs {needed} bytes and {free} are free")

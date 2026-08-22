@@ -53,7 +53,7 @@ use kura_core::analysis::Analyzer;
 use kura_core::bitmap::Bitmap;
 use kura_core::file::{Store, Trouble};
 use kura_core::index::{Held, Reader, Writer};
-use kura_core::ingest::Logged;
+use kura_core::ingest::{self, Logged};
 use kura_core::manifest;
 use kura_core::mapping::Map;
 use kura_core::residency;
@@ -993,6 +993,25 @@ fn index(args: &[String]) -> Result<(), Failure> {
 /// new documents and hides the ones they replace together.
 fn into_store<'a>(plan: &Plan, files: &'a [PathBuf], run: &mut Run<'a>) -> Result<(), Failure> {
     let mut store = open_store(&plan.out)?;
+    // Before a document of this run goes in. The log holds whatever the run
+    // before this one had taken and not committed, and those documents belong in
+    // the store before it is asked to replace any of them, or a file indexed
+    // twice would be replaced by the copy that was interrupted.
+    let now = now();
+    let put_back = ingest::replay(&mut store, now, now)
+        .map_err(|trouble| Failure::Store(plan.out.clone(), trouble))?;
+    if !put_back.is_empty() {
+        println!(
+            "put back {} {} out of the log, {}, left by a run that did not finish",
+            put_back.documents,
+            if put_back.documents == 1 {
+                "document"
+            } else {
+                "documents"
+            },
+            report::bytes(put_back.bytes)
+        );
+    }
     let mut at = 0;
     while at < files.len() {
         at += one_batch(&mut store, plan, &files[at..], run)?;
@@ -1816,6 +1835,40 @@ mod tests {
         let mut records = 0;
         opened.recover(|_| records += 1).expect("the log walks");
         assert_eq!(records, 0, "the log still names records");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_run_puts_back_what_a_run_that_did_not_finish_left_in_the_log() {
+        // The other half of the same promise. A run that took documents and
+        // never committed leaves them in the log, and the next run over the same
+        // store puts them in a segment before it indexes anything of its own.
+        let dir = scratch_dir("log-replayed");
+        let corpus = documents(&dir.join("corpus"), 0, 12);
+        let store = dir.join("replayed.kura");
+        into(&corpus, &store, &[]).expect("the first run");
+
+        // A batch that is dropped rather than committed, which is the machine
+        // going away rather than anything the tool chooses to do.
+        {
+            let mut opened = Store::open(&store).expect("the store opens");
+            let view = opened.view().expect("a view");
+            let mut batch = Logged::over(&view, &mut opened).expect("a batch");
+            batch
+                .add_keyed(b"escrow.txt", "escrow ledger")
+                .expect("added");
+        }
+        assert_eq!(live(&store, "escrow"), 0, "nothing was committed");
+
+        into(&corpus, &store, &[]).expect("the second run");
+
+        assert_eq!(live(&store, "escrow"), 1, "the log put it back");
+        let mut opened = Store::open(&store).expect("the store opens");
+        assert_eq!(opened.manifest().live, 13);
+        let mut records = 0;
+        opened.recover(|_| records += 1).expect("the log walks");
+        assert_eq!(records, 0, "and the log was freed on the way past");
 
         let _ = fs::remove_dir_all(&dir);
     }

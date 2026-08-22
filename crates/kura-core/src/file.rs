@@ -1018,72 +1018,175 @@ impl Store {
     /// Returns [`Trouble::Io`] if the log cannot be read. Damage in the log is
     /// not an error: it is where the log ends, and a torn record at the end is
     /// the ordinary shape of a machine that lost power midway through a write.
-    pub fn recover(&mut self, mut each: impl FnMut(&Record<'_>)) -> Result<u64> {
-        let ring = self.superblock.wal_len;
-        let base = self.superblock.wal_offset;
-        let head = self.manifest.wal_head;
-        // One lap and no more. Past that the walk would be reading records it
-        // has already read, and a ring that somehow chains all the way round
-        // would otherwise never end.
-        let stop = head.saturating_add(ring);
-        let mut position = head;
-        let mut expected: Option<u64> = None;
-        let mut window = vec![0u8; WINDOW];
-        let mut count = 0u64;
-        'walk: while position < stop {
-            let physical = position % ring;
-            let lap = ring - physical;
-            if lap < MIN_RECORD as u64 {
-                // Too close to the end of the region for a record to start, so
-                // the writer wrapped here and so does this.
-                position += lap;
+    ///
+    /// This hands out the records and applies nothing. Turning them back into
+    /// documents is [`crate::ingest::replay`], which is the caller a store that
+    /// has just been opened wants.
+    pub fn recover(&mut self, each: impl FnMut(&Record<'_>)) -> Result<Walked> {
+        let walked = walk(
+            |buf, at| read_at(&self.file, buf, at),
+            &self.superblock,
+            &self.manifest,
+            each,
+        )?;
+        self.log = Ring::new(
+            self.superblock.wal_len,
+            self.manifest.wal_head,
+            walked.position,
+            walked.sequence,
+        )?;
+        Ok(walked)
+    }
+}
+
+/// What a walk of the log found.
+///
+/// Made by [`Store::recover`] and by [`walk_log`]. The position and the
+/// sequence are what a store needs to start writing again at the right place,
+/// and a tool that is only reporting what a log holds wants the counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Walked {
+    /// How many records were read, not counting the padding that fills the end
+    /// of a lap.
+    pub records: u64,
+    /// What their payloads came to.
+    pub bytes: u64,
+    /// Where the log really ends, which is where the next record goes.
+    pub position: u64,
+    /// The sequence the next record will be given.
+    pub sequence: u64,
+}
+
+/// Walks the records a log holds, oldest first, reading through `read`.
+///
+/// There are two ways into this and they read the log differently on purpose. A
+/// store reads through its descriptor a window at a time, because the region is
+/// a quarter of a gigabyte of mostly nothing and mapping it to walk the first
+/// few kilobytes would be a page table for nothing. A tool that has already
+/// mapped the whole file reads out of the bytes it has. Both go through this,
+/// which is the point: a second implementation of the walk would disagree with
+/// the first eventually, and the way it would disagree is that one of them finds
+/// a record the other does not.
+///
+/// The walk starts at the head the manifest committed and stops at the first
+/// record that is damaged, that runs off the end of the region, or whose
+/// sequence does not continue the one before it. It does not stop at the
+/// committed tail, because a store that stopped without warning has records past
+/// it and those are exactly the ones worth having.
+fn walk(
+    read: impl Fn(&mut [u8], u64) -> io::Result<()>,
+    superblock: &Superblock,
+    manifest: &Manifest,
+    mut each: impl FnMut(&Record<'_>),
+) -> Result<Walked> {
+    let ring = superblock.wal_len;
+    let base = superblock.wal_offset;
+    let head = manifest.wal_head;
+    // One lap and no more. Past that the walk would be reading records it has
+    // already read, and a ring that somehow chains all the way round would
+    // otherwise never end.
+    let stop = head.saturating_add(ring);
+    let mut position = head;
+    let mut expected: Option<u64> = None;
+    let mut window = vec![0u8; WINDOW];
+    let mut walked = Walked::default();
+    'walk: while position < stop {
+        let physical = position % ring;
+        let lap = ring - physical;
+        if lap < MIN_RECORD as u64 {
+            // Too close to the end of the region for a record to start, so the
+            // writer wrapped here and so does this.
+            position += lap;
+            continue;
+        }
+        let want = as_usize(lap.min(window.len() as u64));
+        // A source that cannot hand over the whole window is a file shorter than
+        // the region it claims, and that ends the walk where the bytes end
+        // rather than failing: it is the same fact as a torn record.
+        if read(&mut window[..want], base + physical).is_err() {
+            break 'walk;
+        }
+        let mut offset = 0;
+        while offset + MIN_RECORD <= want {
+            let span = as_usize(u64::from(span_of(&window[offset..])?));
+            if span > want - offset {
+                if span as u64 > lap - offset as u64 {
+                    // A record cannot claim more than the lap it is in, so
+                    // whatever this is, it is not one.
+                    break 'walk;
+                }
+                // It runs past the window rather than past the region, so widen
+                // the window and read it again from where it starts.
+                if span > window.len() {
+                    window.resize(span, 0);
+                }
+                break;
+            }
+            let Ok(record) = wal::decode(&window[offset..offset + span], position) else {
+                break 'walk;
+            };
+            if expected.is_some_and(|expected| record.sequence != expected) {
+                break 'walk;
+            }
+            offset += span;
+            position += span as u64;
+            if record.kind == wal::kind::PAD {
+                expected = Some(record.sequence);
                 continue;
             }
-            let want = as_usize(lap.min(window.len() as u64));
-            read_at(&self.file, &mut window[..want], base + physical)?;
-            let mut offset = 0;
-            while offset + MIN_RECORD <= want {
-                let span = as_usize(u64::from(span_of(&window[offset..])?));
-                if span > want - offset {
-                    if span as u64 > lap - offset as u64 {
-                        // A record cannot claim more than the lap it is in, so
-                        // whatever this is, it is not one.
-                        break 'walk;
-                    }
-                    // It runs past the window rather than past the region, so
-                    // widen the window and read it again from where it starts.
-                    if span > window.len() {
-                        window.resize(span, 0);
-                    }
-                    break;
-                }
-                let Ok(record) = wal::decode(&window[offset..offset + span], position) else {
-                    break 'walk;
-                };
-                if expected.is_some_and(|expected| record.sequence != expected) {
-                    break 'walk;
-                }
-                offset += span;
-                position += span as u64;
-                if record.kind == wal::kind::PAD {
-                    expected = Some(record.sequence);
-                    continue;
-                }
-                expected = Some(record.sequence.saturating_add(1));
-                each(&Record { position, ..record });
-                count += 1;
-            }
+            expected = Some(record.sequence.saturating_add(1));
+            each(&Record { position, ..record });
+            walked.records += 1;
+            walked.bytes = walked
+                .bytes
+                .saturating_add(u64::try_from(record.payload.len()).unwrap_or(u64::MAX));
         }
-        // The committed sequence is a floor and not a starting point. A replay
-        // that ended early because a record was torn would otherwise hand out
-        // numbers the ring has already seen, and those are the one thing that
-        // tells a stale lap from a live one.
-        let sequence = expected
-            .unwrap_or(self.manifest.wal_sequence)
-            .max(self.manifest.wal_sequence);
-        self.log = Ring::new(ring, head, position, sequence)?;
-        Ok(count)
     }
+    walked.position = position;
+    // The committed sequence is a floor and not a starting point. A replay that
+    // ended early because a record was torn would otherwise hand out numbers the
+    // ring has already seen, and those are the one thing that tells a stale lap
+    // from a live one.
+    walked.sequence = expected
+        .unwrap_or(manifest.wal_sequence)
+        .max(manifest.wal_sequence);
+    Ok(walked)
+}
+
+/// Walks the log of a store that has been mapped rather than opened.
+///
+/// The same walk [`Store::recover`] does, for a caller holding the bytes and no
+/// descriptor, which is what a tool that reports on a store without writing to
+/// it has. Nothing is applied and nothing moves: it says what is there.
+///
+/// # Errors
+///
+/// Returns [`Trouble::Format`] if the bytes are not a store or have no readable
+/// manifest. Damage in the log itself is not an error: it is where the log ends.
+pub fn walk_log(bytes: &[u8], each: impl FnMut(&Record<'_>)) -> Result<Walked> {
+    let superblock = Superblock::decode(bytes)?;
+    let front = as_usize(crate::manifest::WAL_OFFSET);
+    let front = bytes.get(..front).ok_or(Error::Truncated {
+        needed: front,
+        available: bytes.len(),
+    })?;
+    let Committed { manifest, .. } = crate::manifest::recover(
+        &front[as_usize(SLOT_A_OFFSET)..as_usize(SLOT_A_OFFSET) + SLOT_LEN],
+        &front[as_usize(SLOT_B_OFFSET)..as_usize(SLOT_B_OFFSET) + SLOT_LEN],
+    )?;
+    walk(
+        |buf, at| {
+            let at = as_usize(at);
+            let end = at
+                .checked_add(buf.len())
+                .ok_or(io::ErrorKind::InvalidInput)?;
+            buf.copy_from_slice(bytes.get(at..end).ok_or(io::ErrorKind::UnexpectedEof)?);
+            Ok(())
+        },
+        &superblock,
+        &manifest,
+        each,
+    )
 }
 
 /// What a compaction did.
