@@ -132,9 +132,10 @@ pub fn segment(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
 
 /// Rebuilds the sections that are worked out from the others.
 ///
-/// Two of them: the rounded document lengths, which are a function of the four
-/// byte lengths, and the block score ceilings, which are a function of the
-/// postings and the rounded lengths. Both are rebuilt rather than kept, because
+/// Three of them: the rounded document lengths, which are a function of the four
+/// byte lengths, and the block score ceilings at both widths, which are a
+/// function of the postings and the rounded lengths. All are rebuilt rather than
+/// kept, because
 /// a file old enough to be migrated is old enough that whatever it holds was
 /// computed by rules this build has moved on from, and recomputing is cheaper to
 /// reason about than deciding which old ones are still good.
@@ -159,7 +160,12 @@ fn derive(sections: &mut Vec<(u16, Vec<u8>)>) -> Result<()> {
     let short = rounded(norms)?;
     let built = ceilings(dictionary, postings, norms)?;
 
-    sections.retain(|(kind, _)| *kind != segment::kind::BOUNDS && *kind != segment::kind::ROUNDED);
+    sections.retain(|(kind, _)| {
+        !matches!(
+            *kind,
+            segment::kind::BOUNDS | segment::kind::WIDE_BOUNDS | segment::kind::ROUNDED
+        )
+    });
     // Straight after the lengths they were computed from, in the order the
     // indexer adds them. The order of the section table is part of what a byte
     // for byte comparison against a freshly built segment is comparing.
@@ -169,8 +175,10 @@ fn derive(sections: &mut Vec<(u16, Vec<u8>)>) -> Result<()> {
         .map_or(sections.len(), |at| at + 1);
     sections.insert(at, (segment::kind::ROUNDED, short));
     at += 1;
-    if let Some(built) = built {
-        sections.insert(at, (segment::kind::BOUNDS, built));
+    if let Some((narrow, wide)) = built {
+        sections.insert(at, (segment::kind::BOUNDS, narrow));
+        at += 1;
+        sections.insert(at, (segment::kind::WIDE_BOUNDS, wide));
     }
     Ok(())
 }
@@ -203,7 +211,11 @@ fn rounded(norms: &[u8]) -> Result<Vec<u8>> {
 /// to be decoded, which is why this is an offline tool's cost and not a
 /// reader's. The two have to agree byte for byte, and the fixture comparison in
 /// `tests/format.rs` is what says they do.
-fn ceilings(dictionary: &[u8], postings: &[u8], norms: &[u8]) -> Result<Option<Vec<u8>>> {
+fn ceilings(
+    dictionary: &[u8],
+    postings: &[u8],
+    norms: &[u8],
+) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
     let (documents, rest) = get_u32(norms)?;
     let (total, lengths) = get_u64(rest)?;
     let needed = (documents as usize).checked_mul(4).ok_or(Error::Overflow)?;
@@ -244,7 +256,10 @@ fn ceilings(dictionary: &[u8], postings: &[u8], norms: &[u8]) -> Result<Option<V
     if writer.is_empty() {
         return Ok(None);
     }
-    Ok(Some(writer.finish()))
+    // Read out before the narrow ones consume the writer, which is the same
+    // order the indexer does it in and for the same reason.
+    let wide = writer.wide().to_vec();
+    Ok(Some((writer.finish(), wide)))
 }
 
 /// Version 1 to version 2: the term dictionary gains its array of block keys.
