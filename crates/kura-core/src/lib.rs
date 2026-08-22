@@ -45,6 +45,7 @@ pub mod search;
 pub mod segment;
 pub mod store;
 pub mod terms;
+pub mod upsert;
 pub mod vector;
 pub mod wal;
 pub mod xxh3;
