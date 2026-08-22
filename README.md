@@ -741,7 +741,33 @@ The rest of it says the same thing as the saturated run, which is the point of r
 Writing costs the reader three to four times at the median and five to six at p99.
 Folding beside the writing costs 25 to 30 percent at the median and lands inside the run to run spread at p99, where the five runs at 10,000 a second gave the folding condition 67.5, 137.9, 152.5, 193.0 and 349.6 µs against 114.3, 128.3, 139.8, 250.5 and 458.1 for the writing alone.
 
-Above about 50,000 a second one reader thread offering a rate stops being a measurement on this machine, since the sleeping and waking costs more than the query and the reader falls behind while the writers run.
+Above about 10,000 a second one reader thread offering a rate stops being a measurement while the writers run, since going to sleep and being woken costs more than the query does.
+So `readers=<n>` puts several threads on it, sharing one schedule rather than each holding their own, which means the offered rate stays the rate the store is asked at rather than the rate times the reader count:
+
+```sh
+cargo run --release --example serving -- ./src /var/lib/kura readers=4 50000
+```
+
+Four readers, four writers, 50,000 queries a second, five runs, each cell the middle of the five:
+
+| condition | segments at the end | median | p95 | p99 |
+| --- | --- | --- | --- | --- |
+| quiet | 1 | 5.5 µs | 14.8 µs | 73.6 µs |
+| writing | 14 | 13.0 µs | 43.2 µs | 180.5 µs |
+| writing and folding | 6 | 14.2 µs | 45.6 µs | 157.9 µs |
+
+Five times the load one reader could offer, and the story is the one the lower loads told.
+Writing costs the reader 136 percent at the median and 145 percent at p99.
+Folding beside it costs 9 percent at the median and comes out 13 percent below the writing at p99, which is another way of saying the tail is not where a fold shows up.
+
+That is also the first number this repository has for what a reader pays under a concurrent write at a load worth quoting, and it says the target has not been met.
+Read p99 under concurrent write is meant to land within 20 percent of the idle p99 and it is 145 percent over.
+The fold is not what does it and no compaction policy will fix it, which leaves the writing itself, and that is where the work is.
+
+Four readers is not the ceiling of the harness but it is close to the ceiling of the machine.
+At 100,000 a second the quiet condition holds and the two writing conditions come in 1 to 8 percent short, at 200,000 the writing gets through about 124,000, and at 400,000 even the quiet condition tops out around 178,000.
+Four readers, four writers and a keeper is nine threads on ten cores, so past this the harness is measuring the scheduler.
+
 The wait is not worth reading too closely either.
 On this operating system a thread that asks to be woken in a hundred microseconds is woken about a third late, which is the timer and not the store, and the tail of the waiting moves by more between two runs of the quiet condition than it does between the conditions.
 

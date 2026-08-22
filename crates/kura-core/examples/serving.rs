@@ -1,10 +1,10 @@
 //! What a query costs while the store it is reading is being written to.
 //!
 //! Run it with `cargo run --release --example serving -- <corpus> [<directory>]
-//! [threads=<n>] [<queries per second> ...]`, where the corpus is a directory
-//! of text files and the directory is where the store goes, defaulting to the
-//! temporary directory. Every argument that is a number is an offered rate and
-//! the whole measurement is run again at each of them.
+//! [threads=<n>] [readers=<n>] [<queries per second> ...]`, where the corpus is
+//! a directory of text files and the directory is where the store goes,
+//! defaulting to the temporary directory. Every argument that is a number is an
+//! offered rate and the whole measurement is run again at each of them.
 //!
 //! Every other measurement in this repository is of one thing at a time. A run
 //! indexes and then it is asked questions, or it is asked questions and nothing
@@ -58,6 +58,15 @@
 //! keeping up long after it has stopped keeping up, because the queries it
 //! could not get to are the slow ones and they are the ones it left out.
 //!
+//! One thread offering a rate runs out of room well below where the store does,
+//! since going to sleep and being woken costs more than a query, so `readers=<n>`
+//! puts several on it. They share one schedule rather than each holding their
+//! own, so the offered rate stays the rate the store is asked at rather than the
+//! rate times the reader count, and a query goes to whichever thread is free.
+//! The count is printed, because a rate held by two threads and a rate held by
+//! twenty are different loads on the same machine, and because every reader is
+//! one more thing wanting a core.
+//!
 //! The wait is the number a budget is written against, and on an idle machine
 //! most of it is not the store. A reader that asks to be woken in a hundred
 //! microseconds is woken late, by about a third of whatever it asked for on
@@ -82,7 +91,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use kura_core::analysis::Analyzer;
@@ -108,6 +117,20 @@ const STORE: u128 = 0x006b_7572_612d_7365_7276_696e_6700_0001;
 /// rate limit is the one where there are none, and setting this to the core
 /// count is that case without needing a smaller machine to run it on.
 const THREADS: usize = 4;
+
+/// How many threads ask questions, unless the command line says otherwise.
+///
+/// One, because one is enough to say what a query costs and every reader beyond
+/// the first is a thread competing for the cores the writing and the folding
+/// want. It is not enough to say what a query costs at a load worth quoting,
+/// since one thread that sleeps between queries runs out of room at about fifty
+/// thousand a second on this machine while the store answers several times
+/// that, which is what `readers=<n>` is for.
+///
+/// They share one schedule rather than each holding their own, so the offered
+/// rate is the rate the store is asked at rather than the rate times the reader
+/// count, and a query goes to whichever thread is free.
+const READERS: usize = 1;
 
 /// How much text goes into a batch before it is handed over.
 ///
@@ -157,17 +180,26 @@ fn main() {
     };
 
     // Anything that reads as a number is a rate, anything of the shape
-    // threads=<n> is the writer count, and anything else is where the store
-    // goes, so the optional arguments can be given in any order.
+    // threads=<n> or readers=<n> is a thread count, and anything else is where
+    // the store goes, so the optional arguments can be given in any order.
     let mut directory = std::env::temp_dir();
     let mut rates = Vec::new();
     let mut threads = THREADS;
+    let mut readers = READERS;
     for arg in args {
         if let Some(count) = arg.strip_prefix("threads=") {
             match count.parse::<usize>() {
                 Ok(count) if count > 0 => threads = count,
                 _ => {
                     eprintln!("serving: {count} is not a number of threads");
+                    std::process::exit(2);
+                }
+            }
+        } else if let Some(count) = arg.strip_prefix("readers=") {
+            match count.parse::<usize>() {
+                Ok(count) if count > 0 => readers = count,
+                _ => {
+                    eprintln!("serving: {count} is not a number of readers");
                     std::process::exit(2);
                 }
             }
@@ -182,7 +214,7 @@ fn main() {
         }
     }
 
-    match run(&corpus, &directory, &rates, threads) {
+    match run(&corpus, &directory, &rates, threads, readers) {
         Ok(()) => (),
         Err(problem) => {
             eprintln!("serving: {problem}");
@@ -192,7 +224,13 @@ fn main() {
 }
 
 /// The whole measurement.
-fn run(corpus: &Path, directory: &Path, rates: &[f64], threads: usize) -> Result<(), String> {
+fn run(
+    corpus: &Path,
+    directory: &Path,
+    rates: &[f64],
+    threads: usize,
+    readers: usize,
+) -> Result<(), String> {
     let mut files = Vec::new();
     walk(corpus, &mut files)?;
     files.sort();
@@ -226,11 +264,22 @@ fn run(corpus: &Path, directory: &Path, rates: &[f64], threads: usize) -> Result
             .join(", ")
     );
     println!("writers       {threads} filling batches in the two writing conditions");
+    println!("readers       {readers} sharing one schedule");
     if rates.is_empty() {
-        conditions(&base, directory, &queries, rest, None, threads)?;
+        let load = Load {
+            rate: None,
+            threads,
+            readers,
+        };
+        conditions(&base, directory, &queries, rest, load)?;
     } else {
         for rate in rates {
-            conditions(&base, directory, &queries, rest, Some(*rate), threads)?;
+            let load = Load {
+                rate: Some(*rate),
+                threads,
+                readers,
+            };
+            conditions(&base, directory, &queries, rest, load)?;
         }
     }
 
@@ -244,11 +293,10 @@ fn conditions(
     directory: &Path,
     queries: &[String],
     rest: &[PathBuf],
-    rate: Option<f64>,
-    threads: usize,
+    load: Load,
 ) -> Result<(), String> {
     println!();
-    match rate {
+    match load.rate {
         Some(rate) => println!("offered       {rate:.0} queries a second"),
         None => println!("offered       as fast as the reader can ask"),
     }
@@ -257,7 +305,7 @@ fn conditions(
         "condition", "queries", "segs", "q/s", "median", "p95", "p99"
     );
 
-    let quiet = rounds(base, directory, "quiet", queries, None, rate, threads)?;
+    let quiet = rounds(base, directory, "quiet", queries, None, load)?;
     quiet.tell("quiet");
     let writing = rounds(
         base,
@@ -265,8 +313,7 @@ fn conditions(
         "writing",
         queries,
         Some((rest, false)),
-        rate,
-        threads,
+        load,
     )?;
     writing.tell("writing");
     let folding = rounds(
@@ -275,8 +322,7 @@ fn conditions(
         "folding",
         queries,
         Some((rest, true)),
-        rate,
-        threads,
+        load,
     )?;
     folding.tell("writing and folding");
 
@@ -293,7 +339,7 @@ fn conditions(
         share(folding.median(), quiet.median()),
         share(folding.p99(), quiet.p99()),
     );
-    if let Some(rate) = rate {
+    if let Some(rate) = load.rate {
         // A condition that did not hold the offered rate has a queue that grew
         // for the whole round, so its percentiles are how long the round was
         // rather than how long a query takes, and saying so is the difference
@@ -502,6 +548,21 @@ impl Answered {
     }
 }
 
+/// What the machine is being asked to do while the queries run.
+///
+/// One thing rather than three arguments threaded through four functions, since
+/// every one of them wants all three and none of them wants to change any.
+#[derive(Clone, Copy)]
+struct Load {
+    /// How many queries a second the readers offer between them, or nothing at
+    /// all if they ask as fast as they can.
+    rate: Option<f64>,
+    /// How many threads fill batches.
+    threads: usize,
+    /// How many threads ask questions.
+    readers: usize,
+}
+
 /// A percentile of a set of times.
 fn percentile_of(times: &[f64], percentile: usize) -> f64 {
     if times.is_empty() {
@@ -523,12 +584,11 @@ fn rounds(
     name: &str,
     queries: &[String],
     writing: Option<(&[PathBuf], bool)>,
-    rate: Option<f64>,
-    threads: usize,
+    load: Load,
 ) -> Result<Answered, String> {
     let mut pooled = Answered::default();
     for _ in 0..ROUNDS {
-        let round = measure(base, directory, name, queries, writing, rate, threads)?;
+        let round = measure(base, directory, name, queries, writing, load)?;
         pooled.times.extend(round.times);
         pooled.waited.extend(round.waited);
         pooled.segments = round.segments;
@@ -548,8 +608,7 @@ fn measure(
     name: &str,
     queries: &[String],
     writing: Option<(&[PathBuf], bool)>,
-    rate: Option<f64>,
-    threads: usize,
+    load: Load,
 ) -> Result<Answered, String> {
     let path = directory.join(format!("kura-serving-{name}.kura"));
     std::fs::remove_file(&path).ok();
@@ -560,16 +619,20 @@ fn measure(
     let stop = AtomicBool::new(false);
     let next = AtomicUsize::new(0);
     let keeper = Keeper::new(&writer);
+    let turn = AtomicU64::new(0);
     let outcome = std::thread::scope(|scope| {
-        let asking = {
-            let (writer, stop) = (&writer, &stop);
-            scope.spawn(move || ask(writer, queries, stop, rate))
-        };
+        let opened = Instant::now();
+        let asking: Vec<_> = (0..load.readers)
+            .map(|_| {
+                let (writer, stop, turn) = (&writer, &stop, &turn);
+                scope.spawn(move || ask(writer, queries, stop, load.rate, opened, turn))
+            })
+            .collect();
         let started = Instant::now();
         if let Some((files, folding)) = writing {
             let keeper = &keeper;
             let keeping = folding.then(|| scope.spawn(move || keeper.run(|| 1_700_000_003)));
-            let running: Vec<_> = (0..threads)
+            let running: Vec<_> = (0..load.threads)
                 .map(|_| {
                     let (writer, next) = (&writer, &next);
                     scope.spawn(move || add(writer, files, next))
@@ -592,9 +655,14 @@ fn measure(
         }
         let took = started.elapsed();
         stop.store(true, Ordering::Release);
-        let (times, waited) = asking
-            .join()
-            .unwrap_or_else(|_| Err("a reader stopped".into()))?;
+        let (mut times, mut waited) = (Vec::new(), Vec::new());
+        for handle in asking {
+            let (theirs, waits) = handle
+                .join()
+                .unwrap_or_else(|_| Err("a reader stopped".into()))?;
+            times.extend(theirs);
+            waited.extend(waits);
+        }
         Ok::<_, String>((times, waited, took))
     });
 
@@ -626,35 +694,39 @@ fn ask(
     queries: &[String],
     stop: &AtomicBool,
     rate: Option<f64>,
+    opened: Instant,
+    turn: &AtomicU64,
 ) -> Result<(Vec<f64>, Vec<f64>), String> {
     let mut times = Vec::new();
     let mut waited = Vec::new();
-    let opened = Instant::now();
-    let mut turn = 0u64;
     while !stop.load(Ordering::Acquire) {
-        for query in queries {
-            let due = rate.map(|rate| {
-                let due = opened + Duration::from_secs_f64(turn as f64 / rate);
-                turn += 1;
-                if let Some(left) = due.checked_duration_since(Instant::now()) {
-                    std::thread::sleep(left);
-                }
-                due
-            });
-            let started = Instant::now();
-            // The whole of what a reader pays to see the newest commit, which
-            // is where the segment count shows up.
-            let view = writer.view();
-            let readers = view.readers().map_err(|problem| problem.to_string())?;
-            let searcher = Searcher::over(&readers).map_err(|problem| problem.to_string())?;
-            let _ = searcher
-                .search(query, 10)
-                .map_err(|problem| problem.to_string())?;
-            let done = Instant::now();
-            times.push(done.duration_since(started).as_secs_f64() * 1_000_000.0);
-            if let Some(due) = due {
-                waited.push(done.duration_since(due).as_secs_f64() * 1_000_000.0);
+        // The turn is taken from the counter every reader shares, so which
+        // question gets asked and when it was due are both properties of the
+        // schedule rather than of the thread that happened to be free. Two
+        // readers asking the same term at the same moment would be measuring
+        // one posting list in cache rather than the query set.
+        let mine = turn.fetch_add(1, Ordering::Relaxed);
+        let query = &queries[mine as usize % queries.len()];
+        let due = rate.map(|rate| {
+            let due = opened + Duration::from_secs_f64(mine as f64 / rate);
+            if let Some(left) = due.checked_duration_since(Instant::now()) {
+                std::thread::sleep(left);
             }
+            due
+        });
+        let started = Instant::now();
+        // The whole of what a reader pays to see the newest commit, which is
+        // where the segment count shows up.
+        let view = writer.view();
+        let readers = view.readers().map_err(|problem| problem.to_string())?;
+        let searcher = Searcher::over(&readers).map_err(|problem| problem.to_string())?;
+        let _ = searcher
+            .search(query, 10)
+            .map_err(|problem| problem.to_string())?;
+        let done = Instant::now();
+        times.push(done.duration_since(started).as_secs_f64() * 1_000_000.0);
+        if let Some(due) = due {
+            waited.push(done.duration_since(due).as_secs_f64() * 1_000_000.0);
         }
     }
     Ok((times, waited))
