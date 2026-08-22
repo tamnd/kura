@@ -321,9 +321,30 @@ Twenty seven times the commits a second for the same documents, the same segment
 The column that matters as much is the median, which does not move: a group of thirty two costs one writer's latency, because the group is waiting for the same sync a single commit was waiting for anyway.
 The same run on the same laptop while it was busy gave 72 commits a second at a group of one and 1,839 at a group of thirty two, which is the same shape a quarter of the way down, since the sync is the whole of the cost and its spread belongs to the machine.
 
+A four core Linux box on ext4 over SATA, where a single fsync costs three times what it costs on the laptop:
+
+| group | syncs | syncs per 1,000 documents | commits/s | median | p99 |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 256 | 500.0 | 18 | 26.033 ms | 557.732 ms |
+| 8 | 32 | 62.5 | 90 | 71.642 ms | 232.347 ms |
+| 32 | 8 | 15.6 | 527 | 70.033 ms | 94.644 ms |
+
+Twenty nine times there, and the multiple is larger for the reason the drive is slower: the more of a commit is the wait, the more of it a group takes away.
+That box was carrying a load average of 65 across its four cores, so the latencies are an upper bound and not a measurement of the drive.
+The sync counts are the same on a busy machine as on an idle one, which is most of why they are the column worth quoting.
+
+A batch does not have to have been prepared against the state it is committed into, which is the part of this that is not about syncs at all.
+Building a batch is an analyser pass over however many documents it holds, and a commit by somebody else in the middle of that used to throw the pass away, because a batch names segments by position and holds the whole answer for each one it deletes from.
+Now it is joined onto what happened instead.
+Its deletions are unioned with what each segment hides now, its own segment's position is remapped, and its keys are looked up again in the segments that arrived while it was being built, so a key two writers used ends up with one live document and it belongs to whoever committed last.
+A batch prepared against the current state has nothing above it and pays for none of that.
+
+What is still refused is a compaction, which folds a run of segments into one and moves every position after it.
+Nothing else moves a segment, so nothing else refuses a batch.
+
 What is not here yet is the thing that forms the group.
 Every write path in the engine takes the store by exclusive reference, so the writers that would arrive while a sync is in flight cannot exist yet, and a caller that has several batches ready hands them over itself.
-The shared writer is the next piece of work, and this is the half of it that had to be right first.
+The shared writer is the next piece of work, and these are the halves of it that had to be right first.
 
 The Go source tree at go1.26.6, which is 10,888 text files and 106.4 MB, on an M4 with the files already in page cache, `--memory 32m`, eight runs of the same command one after another:
 
