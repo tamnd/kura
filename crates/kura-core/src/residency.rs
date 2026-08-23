@@ -703,6 +703,15 @@ mod tests {
     /// Enough to be worth counting pages of, and nothing like [`REGION`].
     const WARM: usize = 4 << 20;
 
+    /// How many times the second pass over [`REGION`] is taken before the
+    /// quietest of them is believed.
+    ///
+    /// Five, because the burst that used to fail the test showed up in about
+    /// one window in six and five tries puts the chance of every one of them
+    /// catching it at well under a percent, while the passes themselves are a
+    /// few milliseconds each over pages that are already resident.
+    const TRIES: usize = 5;
+
     #[test]
     fn a_page_is_a_positive_power_of_two() {
         let page = platform::page_size();
@@ -747,20 +756,38 @@ mod tests {
         core::hint::black_box(&region);
         let first = first.finish();
 
-        let second = Probe::start(&[]);
-        for at in (0..REGION).step_by(page) {
-            region[at] = 2;
-        }
-        core::hint::black_box(&region);
-        let second = second.finish();
-
         let Some(first) = first.faults else {
             // A platform that says it cannot answer is allowed to say so, and
             // this test is about the ones that can.
             assert!(first.note.is_some());
             return;
         };
-        let second = second.faults.expect("the same platform answered once");
+
+        // The quietest of several passes rather than one of them, because the
+        // counter is process wide on three platforms out of four and the other
+        // test threads are faulting into the same window. A pass over pages
+        // that are already resident faults nothing, so the other threads can
+        // only ever add, and the lowest reading is the one closest to what this
+        // pass actually cost.
+        //
+        // The quietest and not the average, because what the suite does is
+        // bursty rather than steady. Measured over six runs of the whole suite
+        // the readings were 6, 40, 179, 183, 295 and 1046, and the last of
+        // those is what used to fail the test against a threshold of about six
+        // hundred. An average carries the burst and a minimum steps around it.
+        let mut second = u64::MAX;
+        for _ in 0..TRIES {
+            let pass = Probe::start(&[]);
+            for at in (0..REGION).step_by(page) {
+                region[at] = 2;
+            }
+            core::hint::black_box(&region);
+            second = second.min(
+                pass.finish()
+                    .faults
+                    .expect("the same platform answered once"),
+            );
+        }
 
         // Counts rather than sizes, and a floor of forty rather than one page
         // per page of the region. Linux hands anonymous memory over two megabytes
@@ -771,12 +798,12 @@ mod tests {
             first >= 40,
             "the first pass over {REGION} bytes faulted {first} times"
         );
-        // Not zero, because the other test threads are faulting too and the
-        // counter is process wide on three platforms out of four. A tenth is far
-        // below anything a real second pass could cost and far above the noise.
+        // Not zero, because even the quietest window can catch a thread that
+        // was faulting all the way through it. A tenth is far below anything a
+        // real second pass could cost.
         assert!(
             second < first / 10,
-            "the second pass faulted {second} times against {first} for the first"
+            "the quietest of {TRIES} second passes faulted {second} times against {first} for the first"
         );
     }
 
