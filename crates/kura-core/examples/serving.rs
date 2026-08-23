@@ -1687,7 +1687,7 @@ fn ask(
         let took_view = load.parts.then(Instant::now);
         let readers = view.readers().map_err(|problem| problem.to_string())?;
         let opened_readers = load.parts.then(Instant::now);
-        let searcher = Searcher::over(&readers).map_err(|problem| problem.to_string())?;
+        let searcher = Searcher::over(readers).map_err(|problem| problem.to_string())?;
         let built = load.parts.then(Instant::now);
         let _ = searcher
             .search(query, 10)

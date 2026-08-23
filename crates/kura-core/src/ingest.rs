@@ -1199,7 +1199,7 @@ mod tests {
     fn count(store: &Store, query: &str) -> u64 {
         let view = store.view().expect("a view");
         let readers = view.readers().expect("readers");
-        let searcher = Searcher::over(&readers).expect("a searcher");
+        let searcher = Searcher::over(readers).expect("a searcher");
         searcher.count(query).expect("counted")
     }
 
@@ -1446,7 +1446,7 @@ mod tests {
         write(&mut store, &[(b"a", "the second ledger")]);
 
         let readers = before.readers().expect("readers");
-        let searcher = Searcher::over(&readers).expect("a searcher");
+        let searcher = Searcher::over(readers).expect("a searcher");
         assert_eq!(searcher.count("ledger").expect("counted"), 1);
         assert_eq!(searcher.count("first").expect("counted"), 1);
         assert_eq!(count(&store, "second"), 1);

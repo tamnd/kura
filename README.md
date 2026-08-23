@@ -1014,27 +1014,66 @@ The queries are picked the same way the serving example picks them.
 
 The Go source tree at go1.26.6, 10,750 documents indexed into 22 segments and folded down from there, on an M4 of ten cores, 200 asks of each query at each rung:
 
-| segments | live | opening | opening unchecked | median | p95 | p99 |
-| --- | --- | --- | --- | --- | --- | --- |
-| 1 | 16 MB | 0.9 µs | 0.8 µs | 2.2 µs | 3.0 µs | 3.2 µs |
-| 2 | 16 MB | 1.0 µs | 1.0 µs | 3.2 µs | 10.8 µs | 10.9 µs |
-| 4 | 16 MB | 1.5 µs | 1.2 µs | 4.1 µs | 12.6 µs | 12.8 µs |
-| 8 | 17 MB | 2.1 µs | 1.8 µs | 6.1 µs | 9.8 µs | 9.9 µs |
-| 16 | 19 MB | 3.7 µs | 3.1 µs | 10.7 µs | 17.0 µs | 17.1 µs |
+| segments | live | opening | again | unchecked | median | p95 | p99 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 16 MB | 7.3 µs | 0.00 µs | 0.8 µs | 2.2 µs | 3.0 µs | 3.0 µs |
+| 2 | 16 MB | 8.5 µs | 0.00 µs | 1.0 µs | 3.3 µs | 11.0 µs | 13.2 µs |
+| 4 | 16 MB | 12.0 µs | 0.00 µs | 1.2 µs | 4.1 µs | 12.6 µs | 13.8 µs |
+| 8 | 17 MB | 20.1 µs | 0.00 µs | 2.0 µs | 6.2 µs | 10.0 µs | 15.2 µs |
+| 16 | 19 MB | 32.3 µs | 0.00 µs | 3.6 µs | 10.4 µs | 16.9 µs | 17.8 µs |
 
 The query behaves the way the claim says.
 Four segments is about twice the median of one and sixteen is about five times it, so what a segment costs is roughly a fixed amount on top of the work the query would do anyway.
 Earlier text here put four segments at 20 to 30 percent slower than one, which was too kind to it, and that line has been corrected.
 
-The opening column is there because the first run of this found something much larger than the thing it was built to measure.
-Opening a reader over a one segment store cost 873 µs, four hundred times the query it was opened for, and it barely moved as the segment count climbed.
-Opening a segment hashed every section in it against the digest in its table before handing back a reader, so an open cost what the store held rather than what the query wanted, and sixteen megabytes at about 19 GB/s is 870 µs.
-That was most of the quiet median in the section above, and it scaled with the store, so a large one would have opened in seconds.
+The three opening columns are three different questions and are not to be subtracted from each other carelessly.
+Unchecked opens a set of readers of its own on a view that has already answered a query, keeping nothing back for a second caller, so it is what every query paid before a view started keeping what it opened.
+Again is the same call on that same warm view now, which is what every query after the first one pays.
+Opening builds a view of its own each time, so it pays the first touch of a fresh mapping as well as the opening itself, and it is what the first query after a commit really costs.
 
+The again column read 0.00 µs at every rung in two of three runs and 0.04 at the top rung in the third, which is one tick of the clock.
+So the segment count no longer reaches a repeated query at all, where it used to cost it 0.8 µs at one segment and 3.6 at sixteen.
+The first query after a commit pays 7.3 µs at one segment and 32.3 at sixteen, and that is paid once for every query that follows it until the next commit.
+At sixteen segments the crossover is nine queries: a view asked ten times has already paid for itself, and the serving example gets through about twelve thousand between commits.
+
+The unchecked column is also what says the digests are not being hashed on the query path.
+The first run of this found something much larger than the thing it was built to measure: opening a reader over a one segment store cost 873 µs, four hundred times the query it was opened for, and it barely moved as the segment count climbed.
+Opening a segment hashed every section in it against the digest in its table before handing back a reader, so an open cost what the store held rather than what the query wanted, and sixteen megabytes at about 19 GB/s is 870 µs.
 A reader now opens without checking the digests, which is what the key lookup path had been doing all along.
 The structure is still checked, the footer included, so every slice a reader hands out is still inside the mapping, and a byte that changed on disk is still caught by `kura-cli verify`, which is the tool whose job it is to ask.
-Opening one segment went from 873 µs to 0.9 µs.
-The unchecked column is what is left of the comparison: it opens the same segments through the same call the fix uses, so the two columns agree, and a run where they stop agreeing is a run where the hashing has come back.
+Every rung holds the same documents, so a column that hashed everything it opened would be flat and enormous, and this one grows with the segment count instead.
+
+## What a view keeps between queries
+
+A view is a snapshot of one commit.
+Nothing it describes can change while it is alive, because a commit makes a new view rather than editing this one, so a reader it opened over a segment stays right for as long as anybody holds the view.
+It follows that opening those readers once and handing the same ones back is safe, and that is what a view now does.
+
+The decomposition in the serving example says what that was worth, on the same corpus with four writers committing as fast as they can fill batches:
+
+```sh
+cargo run --release --example serving -- ./src /var/lib/kura threads=4 parts
+```
+
+The median of opening the readers, before this and after it, over three runs of each:
+
+| condition | before | after |
+| --- | --- | --- |
+| quiet | 0.58 to 0.88 µs | 0.00 µs |
+| writing | 1.04 to 1.50 µs | 0.00 µs |
+| writing and folding | 1.12 to 2.00 µs | 0.00 µs |
+| writing, ordered only | 1.21 to 1.67 µs | 0.00 µs |
+| writing, smaller batches | 1.12 to 1.46 µs | 0.00 µs |
+
+The whole query went with it.
+On the pair of runs whose running the query column agreed most closely, the quiet median went from 3.2 µs to 2.6 and the writing median from 5.5 to 3.0.
+The four parts add up to the whole in both, which is the check that says the opening really left rather than moving somewhere else: 0.04 for the view plus 0.58 for the opening plus 2.62 for the query is 3.24 before, and the same three with nothing in the middle is 2.66 after.
+The rest of this file was measured before the change and the tables in it still say what they said, so the numbers above are the ones to read for what opening costs today.
+
+The p99 of that column went from 5.96 µs to 0.04, which is the more interesting half.
+Opening still happens, once per view, and a view lasts a commit.
+The writing run answers 171,424 questions across fourteen commits, so about one query in twelve thousand is the one that opens, and a share that small does not reach a p99 at all.
+It reaches the maximum, which is where it belongs: a tail that one query in twelve thousand pays is a tail, and a cost every query paid was not.
 
 ## Bounding what an index run holds at once
 

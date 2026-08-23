@@ -23,8 +23,12 @@
 //! one of them and nothing about the other.
 //!
 //! Opening is what a reader pays before it asks anything: a reader per segment
-//! and a searcher over them. A server that holds a searcher open across queries
-//! pays this once per commit rather than once per query.
+//! and a searcher over them. A view opens its readers the first time anybody
+//! asks and hands the same ones back afterwards, so this is two numbers rather
+//! than one. The opening column is a view nothing has asked anything of yet,
+//! which is what the first query after a commit pays, and the again column is
+//! the same call on a view that has already answered one, which is what every
+//! query after that pays.
 //!
 //! Asking is the query itself against a searcher that is already open, which is
 //! the part no amount of caching removes.
@@ -37,9 +41,20 @@
 //! same however many segments they are cut into, so the whole ladder paid the
 //! same 900 microseconds against a query of 2. It does not any more, and the
 //! unchecked column is what is left of that: it opens the same segments through
-//! [`kura_core::segment::Segment::open_without_checksum`] directly, so the two
-//! columns now agree and a run where they stop agreeing is a run where the
-//! hashing has come back.
+//! [`kura_core::segment::Segment::open_without_checksum`] directly on the same
+//! warm view, holding nothing back for a second caller. That is what a query
+//! paid before a view kept what it opened, so it is the number the again column
+//! is to be read against. It is also what says the hashing has not come back,
+//! because it grows with the segment count rather than with the bytes: the
+//! ladder holds the same documents on every rung, so a column that hashed
+//! everything it opened would be flat and enormous instead.
+//!
+//! The opening column is not to be read against unchecked, because the two
+//! differ in more than one thing. Opening builds a view of its own each time
+//! and unchecked runs on a view that has been asked already, so opening pays
+//! the first touch of a fresh mapping and unchecked does not. Opening is what
+//! the first query after a commit really costs, and that first touch is part of
+//! what it really costs, which is why it is left in.
 //!
 //! The file size is in the table because the ladder is built by folding, and a
 //! fold appends the segment it made rather than replacing the ones it read, so
@@ -125,8 +140,17 @@ fn run(corpus: &Path, directory: &Path) -> Result<(), String> {
     );
     println!();
     println!(
-        "{:>9} {:>10} {:>10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>12}",
-        "segments", "file", "live", "opening", "unchecked", "median", "p95", "p99", "postings"
+        "{:>9} {:>10} {:>10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>12}",
+        "segments",
+        "file",
+        "live",
+        "opening",
+        "again",
+        "unchecked",
+        "median",
+        "p95",
+        "p99",
+        "postings"
     );
 
     let mut floor = None;
@@ -150,8 +174,12 @@ fn run(corpus: &Path, directory: &Path) -> Result<(), String> {
             floor.opening
         );
         println!(
-            "opening the same segment straight through open_without_checksum is {:.1} µs, and the two agreeing is what says no digest is being hashed on the query path",
+            "opening the same segment straight through open_without_checksum is {:.1} µs, which is what a query paid before a view kept what it opened",
             floor.unchecked
+        );
+        println!(
+            "asking a view that has already answered one for its readers is {:.2} µs, which is what every query after the first pays",
+            floor.again
         );
     }
     Ok(())
@@ -243,10 +271,14 @@ fn fill(path: &Path, files: &[PathBuf]) -> Result<(Vec<String>, usize, usize), S
 struct Rung {
     /// How long each query took, in microseconds, pooled across the queries.
     times: Vec<f64>,
-    /// How long opening a searcher over the store took, in microseconds.
-    opening: f64,
-    /// How long the same opening took with the digests left unchecked, in
+    /// How long opening a searcher over a view nothing has asked yet took, in
     /// microseconds.
+    opening: f64,
+    /// How long the same call took on a view that has already answered one, in
+    /// microseconds.
+    again: f64,
+    /// How long the same opening took with the digests left unchecked and
+    /// nothing kept for a second caller, in microseconds.
     unchecked: f64,
     /// How many postings the queries decoded between them.
     postings: u64,
@@ -275,11 +307,12 @@ impl Rung {
     /// Prints it.
     fn tell(&self, segments: usize) {
         println!(
-            "{:>9} {:>7} MB {:>7} MB {:>8.1} µs {:>8.1} µs {:>8.1} µs {:>8.1} µs {:>8.1} µs {:>12}",
+            "{:>9} {:>7} MB {:>7} MB {:>8.1} µs {:>8.2} µs {:>8.1} µs {:>8.1} µs {:>8.1} µs {:>8.1} µs {:>12}",
             segments,
             self.bytes / 1_000_000,
             self.live / 1_000_000,
             self.opening,
+            self.again,
             self.unchecked,
             self.median(),
             self.at(95),
@@ -367,7 +400,7 @@ fn ask(store: &Store, queries: &[String]) -> Result<Rung, String> {
     // faults the first pass takes.
     {
         let readers = view.readers().map_err(|problem| problem.to_string())?;
-        let searcher = Searcher::over(&readers).map_err(|problem| problem.to_string())?;
+        let searcher = Searcher::over(readers).map_err(|problem| problem.to_string())?;
         for query in queries {
             searcher
                 .search(query, 10)
@@ -375,15 +408,33 @@ fn ask(store: &Store, queries: &[String]) -> Result<Rung, String> {
         }
     }
 
+    // A view of its own for each try, because a view opens its readers the
+    // first time anybody asks and hands the same ones back afterwards, so a
+    // loop over one view would be timing the handing back. Building the view
+    // is outside the timer: what is wanted here is the opening rather than the
+    // mapping, and the two are separate costs a commit pays.
     let mut opening = Vec::with_capacity(ASKS);
     for _ in 0..ASKS {
+        let fresh = store.view().map_err(|problem| problem.to_string())?;
         let started = Instant::now();
-        let readers = view.readers().map_err(|problem| problem.to_string())?;
-        let searcher = Searcher::over(&readers).map_err(|problem| problem.to_string())?;
+        let readers = fresh.readers().map_err(|problem| problem.to_string())?;
+        let searcher = Searcher::over(readers).map_err(|problem| problem.to_string())?;
         opening.push(started.elapsed().as_secs_f64() * 1_000_000.0);
         std::hint::black_box(&searcher);
     }
     opening.sort_by(f64::total_cmp);
+
+    // The same call on the view the warm up already asked, which is what every
+    // query after the first one pays.
+    let mut again = Vec::with_capacity(ASKS);
+    for _ in 0..ASKS {
+        let started = Instant::now();
+        let readers = view.readers().map_err(|problem| problem.to_string())?;
+        let searcher = Searcher::over(readers).map_err(|problem| problem.to_string())?;
+        again.push(started.elapsed().as_secs_f64() * 1_000_000.0);
+        std::hint::black_box(&searcher);
+    }
+    again.sort_by(f64::total_cmp);
 
     let mut skipped = Vec::with_capacity(ASKS);
     for _ in 0..ASKS {
@@ -396,7 +447,7 @@ fn ask(store: &Store, queries: &[String]) -> Result<Rung, String> {
     skipped.sort_by(f64::total_cmp);
 
     let readers = view.readers().map_err(|problem| problem.to_string())?;
-    let searcher = Searcher::over(&readers).map_err(|problem| problem.to_string())?;
+    let searcher = Searcher::over(readers).map_err(|problem| problem.to_string())?;
     let mut times = Vec::with_capacity(ASKS * queries.len());
     let mut postings = 0;
     for query in queries {
@@ -419,6 +470,7 @@ fn ask(store: &Store, queries: &[String]) -> Result<Rung, String> {
     Ok(Rung {
         times,
         opening: opening[opening.len() / 2],
+        again: again[again.len() / 2],
         unchecked: skipped[skipped.len() / 2],
         postings,
         bytes: 0,
