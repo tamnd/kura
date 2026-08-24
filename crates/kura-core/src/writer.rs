@@ -511,7 +511,7 @@ mod tests {
         let store = writer.store();
         let view = store.view().expect("a view");
         let readers = view.readers().expect("readers");
-        let searcher = Searcher::over(&readers).expect("a searcher");
+        let searcher = Searcher::over(readers).expect("a searcher");
         searcher.count(query).expect("counted")
     }
 

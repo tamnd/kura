@@ -84,7 +84,7 @@ fn main() {
     let segment = kura_core::segment::Segment::open(&laid_out).expect("what was written reads");
     let index = kura_core::index::Reader::open(&segment).expect("an index");
     let readers = view.readers().expect("every segment opens");
-    let store_side = Searcher::over(&readers).expect("a searcher");
+    let store_side = Searcher::over(readers).expect("a searcher");
     let merged_side = Searcher::new(&index);
 
     let mut walk = index.entries();

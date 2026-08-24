@@ -291,7 +291,7 @@ fn counted(store: &Path) -> (u64, u64) {
     let live = store.manifest().live;
     let view = store.view().expect("a view");
     let readers = view.readers().expect("readers");
-    let searcher = Searcher::over(&readers).expect("a searcher");
+    let searcher = Searcher::over(readers).expect("a searcher");
     let found = searcher.count(EVERYWHERE).expect("counted");
     (live, found)
 }

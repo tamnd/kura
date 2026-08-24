@@ -1239,6 +1239,7 @@ impl Store {
         let ranges = crate::manifest::locate(&self.superblock, &self.manifest, map.len())?;
         let deletions = crate::manifest::tombstones(&self.superblock, &self.manifest, map.len())?;
         Ok(View {
+            opened: std::sync::OnceLock::new(),
             map,
             epoch: self.manifest.epoch,
             segments: self.manifest.segments.clone(),
@@ -1489,8 +1490,20 @@ pub struct Compacted {
 /// reach it. That is the behaviour a query wants: a page of results computed
 /// halfway across a set of segments that changed underneath it is a page that
 /// never described anything.
-#[derive(Debug)]
 pub struct View {
+    /// Every segment open and ready to be searched, once anybody has asked.
+    ///
+    /// Declared first so that it is dropped before the mapping it reads out of,
+    /// which costs nothing and keeps the order right in the file as well as in
+    /// the argument for why this is safe.
+    ///
+    /// The lifetime is a lie that [`readers`](Self::readers) tells and then
+    /// takes back. What these borrow is the mapped region rather than this
+    /// value, and a region stays where it is for as long as the [`Map`] naming
+    /// it is alive, so a `View` that is moved does not move them. The public
+    /// method hands them back borrowed from `&self`, so nothing outside can
+    /// hold one for longer than the view.
+    opened: std::sync::OnceLock<Vec<Reader<'static>>>,
     /// The whole store file.
     map: Map,
     /// Which commit this is a view of, so a writer that read the store here can
@@ -1504,6 +1517,25 @@ pub struct View {
     /// Where each segment's deletions sit, for the segments that have any,
     /// checked at the same time and against the same rules.
     deletions: Vec<Option<core::ops::Range<usize>>>,
+}
+
+impl std::fmt::Debug for View {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Written out rather than derived, for the reason `Map` gives: an open
+        // reader holds the postings of its segment as a slice, and a derived
+        // Debug on this would print the whole store down somebody's terminal.
+        f.debug_struct("View")
+            .field("epoch", &self.epoch)
+            .field("map", &self.map)
+            .field("segments", &self.segments.len())
+            .field("ranges", &self.ranges.len())
+            .field(
+                "deletions",
+                &self.deletions.iter().filter(|at| at.is_some()).count(),
+            )
+            .field("opened", &self.opened.get().is_some())
+            .finish()
+    }
 }
 
 impl View {
@@ -1661,17 +1693,65 @@ impl View {
         Ok(Lookup { keys, deleted })
     }
 
-    /// Opens every segment, oldest first, each with its deletions applied.
+    /// Every segment open, oldest first, each with its deletions applied.
     ///
     /// The order is the order the manifest lists them in, which is the order a
     /// hit's identifier is worked out from, so it is the order a searcher has to
     /// be given them in.
     ///
+    /// Opened on the first call and kept, so the second query against a view
+    /// gets them back rather than building them again. That is the whole reason
+    /// this returns a slice rather than a vector. A view is a snapshot of one
+    /// commit, so what is open here cannot go stale: a commit makes a new view
+    /// and this one keeps describing what it always described.
+    ///
+    /// It matters because opening was a real share of what a query paid and is
+    /// now nothing. On the Go toolchain source with four writers committing as
+    /// fast as they can fill batches, `examples/serving parts` had it at 1.1 to
+    /// 1.5 µs of a 5.5 µs query before this, and 0.6 to 0.9 of a 3.2 µs query
+    /// with nothing writing. Both read 0.00 µs now. That run commits fourteen
+    /// times while answering 171,424 questions, so the one query that opens is
+    /// lost among the twelve thousand that follow it.
+    ///
+    /// It also takes the segment count off the query. `examples/layers` folds
+    /// the same documents down to one, two, four, eight and sixteen segments
+    /// and opens them each way on the same view: opening a set of its own cost
+    /// 0.8, 1.0, 1.2, 2.0 and 3.6 µs down the ladder, and asking a view that
+    /// has already answered one costs 0.00 µs at every rung.
+    ///
+    /// The same shape of fix is already on the key path, where
+    /// [`lookup`](Self::lookup) is the handle and its own doc comment has the
+    /// numbers.
+    ///
+    /// Two threads asking at once is one wasted open and no more: both build,
+    /// the first to finish wins, and the loser's readers are dropped. Readers
+    /// hold slices and a decoded deletion set, so dropping one frees a little
+    /// memory and touches nothing shared.
+    ///
     /// # Errors
     ///
-    /// As [`reader`](Self::reader), for the first segment that has one.
-    pub fn readers(&self) -> Result<Vec<Reader<'_>>> {
-        (0..self.len()).map(|at| self.reader(at)).collect()
+    /// As [`reader`](Self::reader), for the first segment that has one. An
+    /// error is not remembered, so a later call tries again and gets the same
+    /// error, which is what a caller retrying a damaged store should see.
+    pub fn readers(&self) -> Result<&[Reader<'_>]> {
+        if let Some(open) = self.opened.get() {
+            return Ok(open);
+        }
+        let open: Vec<Reader<'_>> = (0..self.len())
+            .map(|at| self.reader(at))
+            .collect::<Result<Vec<_>>>()?;
+        // SAFETY: every slice in a reader points into the mapped region, which
+        // `self.map` names and which stays where it is until the `Map` is
+        // dropped. `map` is never replaced while the view is alive, and
+        // `opened` is declared above it so it is dropped first, so nothing here
+        // can be read after the region has gone. The borrow handed back is tied
+        // to `&self` by the signature, so no caller can hold one for longer
+        // than the view either. `Reader` owns nothing that borrows from the
+        // `View` value itself, which is what makes moving a view harmless.
+        let open: Vec<Reader<'static>> = unsafe { std::mem::transmute(open) };
+        // The winner's, which are ours unless somebody got here first, in which
+        // case ours are dropped here and theirs are handed back.
+        Ok(self.opened.get_or_init(|| open))
     }
 }
 
@@ -2738,7 +2818,7 @@ mod tests {
     /// documents come back rather than in what order.
     fn answered(view: &View, query: &str, k: usize) -> Vec<(usize, u32)> {
         let readers = view.readers().expect("readers");
-        let searcher = crate::search::Searcher::over(&readers).expect("a searcher");
+        let searcher = crate::search::Searcher::over(readers).expect("a searcher");
         searcher
             .search(query, k)
             .expect("searched")
@@ -2750,6 +2830,72 @@ mod tests {
     /// [`answered`], for a caller that has not taken a view yet.
     fn hits(store: &Store, query: &str, k: usize) -> Vec<(usize, u32)> {
         answered(&store.view().expect("a view"), query, k)
+    }
+
+    #[test]
+    fn a_view_opens_its_readers_once_and_hands_the_same_ones_back() {
+        // The whole point of the cache. A view is a snapshot of one commit, so
+        // the second question asked of it cannot need different readers from
+        // the first, and opening was most of what a query paid.
+        let path = path("readers-kept");
+        let store = stored(&path, &[4, 4, 4]);
+        let view = store.view().expect("a view");
+        let first = view.readers().expect("readers");
+        assert_eq!(first.len(), 3);
+        let again = view.readers().expect("readers");
+        assert!(
+            std::ptr::eq(first.as_ptr(), again.as_ptr()),
+            "the second call opened them again"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn readers_that_are_already_open_survive_the_view_being_moved() {
+        // The property the unsafe block in `readers` rests on. A reader holds
+        // slices into the mapped region rather than into the view, so a view
+        // that moves after its readers are open takes nothing with it. If that
+        // were wrong this would read freed memory, which is worth a test even
+        // though a test cannot prove it right.
+        let path = path("readers-moved");
+        let store = stored(&path, &[3, 3]);
+        let view = store.view().expect("a view");
+        let before: Vec<u32> = view
+            .readers()
+            .expect("readers")
+            .iter()
+            .map(super::Reader::documents)
+            .collect();
+        let moved = Box::new(view);
+        let after: Vec<u32> = moved
+            .readers()
+            .expect("readers")
+            .iter()
+            .map(super::Reader::documents)
+            .collect();
+        assert_eq!(before, after);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn two_threads_opening_the_readers_at_once_agree_on_which_they_got() {
+        // `get_or_init` picks a winner and drops the loser's, and both callers
+        // are handed the winner's. A test rather than a comment because the
+        // failure it guards against is two threads walking away with slices
+        // into different vectors, only one of which the view is keeping.
+        let path = path("readers-raced");
+        let store = stored(&path, &[2, 2, 2]);
+        let view = store.view().expect("a view");
+        // The address rather than the pointer, because a raw pointer is not
+        // something a thread can hand back and the question here is only
+        // whether the two of them are the same one.
+        let at = || view.readers().expect("readers").as_ptr() as usize;
+        let (mine, theirs) = std::thread::scope(|scope| {
+            let (one, two) = (scope.spawn(at), scope.spawn(at));
+            (one.join().expect("a thread"), two.join().expect("a thread"))
+        });
+        assert_eq!(mine, theirs, "two threads, two vectors");
+        let _ = std::fs::remove_file(&path);
     }
 
     /// The key document `n` of a keyed store is written under.
@@ -2789,7 +2935,7 @@ mod tests {
     fn counted(store: &Store) -> u64 {
         let view = store.view().expect("a view");
         let readers = view.readers().expect("readers");
-        let searcher = crate::search::Searcher::over(&readers).expect("a searcher");
+        let searcher = crate::search::Searcher::over(readers).expect("a searcher");
         searcher.count(EVERYTHING).expect("counted")
     }
 

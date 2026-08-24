@@ -2646,7 +2646,7 @@ mod tests {
         let store = Store::open(path).expect("the store opens");
         let view = store.view().expect("a view");
         let readers = view.readers().expect("readers");
-        let searcher = Searcher::over(&readers).expect("a searcher");
+        let searcher = Searcher::over(readers).expect("a searcher");
         searcher.count(query).expect("counted")
     }
 
