@@ -188,7 +188,7 @@ The records are freed when the segment they went into is committed, and the free
 
 It costs what writing the same corpus twice costs.
 The Go source tree indexed into a store took 1.08 s before the log and 1.30 s with it, and the log took 84.3 MB for 106.4 MB of text.
-The bytes come back as the ring wraps, and the ring is 128 MB in a store this tool makes.
+The bytes come back as the ring wraps, and the ring is 128 MB in a store this tool makes unless `--log` says otherwise.
 
 A run into a store puts back whatever the run before it left behind, before it indexes anything of its own, and says so:
 
@@ -448,7 +448,7 @@ A lookup asks the key index of every segment in turn, so the cost of one grows w
 
 What it does cost is the file.
 The documents that were replaced are still in the segments they were written into, so the store grows by a segment a run: 68.9 MB of segments after four runs and 137.7 MB after eight, with 10,884 live documents and 87,072 written throughout.
-The file itself is 134.4 MB longer than that, which is the log region, and it is sparse, so a store of a handful of documents is a long file that occupies almost nothing.
+The file itself is 134.4 MB longer than that, which is the log region at its default length, and it is sparse, so a store of a handful of documents is a long file that occupies almost nothing.
 Reclaiming that is compaction.
 Half of it is here: `kura_core::compact::merge` folds segments into one holding their live documents, and the example beside it does that to a whole store and checks the result answers what the store answered.
 On the sixteen segment store the eight runs above left, 137.7 MB of segments holding 87,072 documents of which 10,884 are live:
@@ -672,7 +672,8 @@ The segments it replaced stay exactly where they are, because a query that start
 `reclaim` writes it out again beside itself holding only what the manifest names.
 
 The store below is the Go toolchain source at go1.26.6, indexed six times over into the same store on an M4 of ten cores, which is what a directory that is watched rather than indexed once looks like.
-Every run after the first replaced all 10,884 documents, so 58,106 were written and 10,884 of them are live, and the store folded itself five times along the way to stay under the level zero cap.
+Every run after the first replaced all 10,884 documents, so 65,304 were written and 10,884 of them are live.
+Each run was one commit and so left one segment, which is six against a level zero cap of eight, so nothing folded along the way and the fold below is the one the command asked for.
 
 ```sh
 kura-cli compact /tmp/go.kura
@@ -680,28 +681,69 @@ kura-cli reclaim /tmp/go.kura -o /tmp/go-fresh.kura
 ```
 
 ```
-  file bytes              349589709
+  file bytes              248770765
     superblock and log    134352896
     segments               16343040
-    stranded              198893773
+    stranded               98074829
 
-  writing /tmp/go-fresh.kura and giving back about 198893773 bytes
+  writing /tmp/go-fresh.kura and giving back about 98074829 bytes
 
-  rewrite wall                 0.03 s
-  was                     349589709
+  rewrite wall                 0.02 s
+  segments                        1
+  documents                   10884
+  was                     248770765
   now                     150692045
-  saved                   198897664
+  saved                    98078720
 ```
 
-349.6 MB to 150.7 MB in thirty milliseconds, and the prediction printed before it wrote anything was 3,891 bytes out, which is less than a page.
+248.8 MB to 150.7 MB in twenty milliseconds, and the prediction printed before it wrote anything was 3,891 bytes out, which is less than a page.
 The command prints what the file is made of first and refuses a store with anything in its log, so the run that decides whether to do this is a run that wrote nothing.
 
-The 16.3 MB line is the index and the 134.4 MB above it is the superblock, the two manifest slots and the log ring, which `kura-cli` sizes at 128 MB.
-So the floor a rewrite can reach is the log rather than the postings, and on a store this small the log is nine tenths of what comes out.
-That is the honest number and it is the argument for the log being a size somebody chooses rather than a constant.
+The 16.3 MB line is the index and the 134.4 MB above it is the superblock, the two manifest slots and the log ring, which `kura-cli` sizes at 128 MB by default.
+So the floor a plain rewrite reaches is the log rather than the postings, and on a store this small the log is nine tenths of what comes out.
+That is the honest number and it is the whole of the argument for the log being a size somebody picks.
 
-What comes out is the same store.
-It carries the same identifier, the same creation time and the same log size, its segments keep the level a fold gave them and the generation a reader tells deletions apart by, `verify` reads it through with everything passing, and the queries it answers come back with the same documents in the same order at the same scores.
+### The log is the other nine tenths
+
+`--log` on `reclaim` gives the new store a log of its own length, and this is the only command that can, because the segments start where the log ends and so the number is fixed for as long as a store exists.
+
+```sh
+kura-cli reclaim /tmp/go.kura -o /tmp/go-archive.kura --log 4m
+```
+
+```
+  file bytes              248770765
+    superblock and log    134352896
+    segments               16343040
+    stranded               98074829
+    log becomes             4329472
+
+  writing /tmp/go-archive.kura and giving back about 228098253 bytes
+
+  rewrite wall                 0.02 s
+  segments                        1
+  documents                   10884
+  was                     248770765
+  now                      20668621
+  saved                   228102144
+```
+
+20.7 MB, which is the 16.3 MB of index and the 4.3 MB the log was asked for, and the prediction was again 3,891 bytes out.
+The two files answer identically: the same documents in the same order at the same scores for every query tried, and `verify` reads the smaller one through with everything passing.
+Shrinking a log is safe here and nowhere else, because a rewrite is refused unless the log is already consumed, so the region it drops is a region with nothing in it, and the new store starts its own ring empty at the length it was given.
+A store that came out of this is a store that can still be written to, and a later run that wants a longer log again asks for one the same way.
+
+`--log` is also on the index run that creates a store, which is the other end of the same problem.
+Building the store above with `--log 32m` instead leaves a file that reclaims to 50.0 MB rather than 150.7, and it changes the run as well as the file: three commits rather than one, 29.8 MB held at once rather than 53.4, and 81.7 MB peak resident rather than 100.2.
+That is the log doing the memtable's job, since every document goes into the log before it is committed and a batch has to end when the ring fills.
+The run says so when it opens the store rather than leaving it to be worked out afterwards from the segment count.
+
+```
+the log is 32.0 MB and the memory budget is 128.0 MB, so a batch ends when the log fills rather than when the budget does
+```
+
+What comes out of either rewrite is the same store.
+It carries the same identifier, the same creation time and, unless `--log` said otherwise, the same log size, its segments keep the level a fold gave them and the generation a reader tells deletions apart by, `verify` reads it through with everything passing, and the queries it answers come back with the same documents in the same order at the same scores.
 Nothing is renamed and nothing is deleted, because the rename is the step that destroys something and it belongs to whoever decided to do this.
 
 ## What a query costs while the store is being written to
