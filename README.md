@@ -603,6 +603,34 @@ When to run it is still the caller's, and the rate limit that turns this from a 
 
 A run without `--store` writes a single segment and keys nothing, because a file is not a store and there is nothing in it to replace.
 
+### The same fan out from a library
+
+What `--threads` does is available to a caller that is not the tool, and it does not take thirty lines of channel and scope to get at.
+`ingest::spread` takes a stream of documents and a thread count, analyses them in a batch per thread, and commits all of the batches together, so a reader sees one update rather than one per thread:
+
+```rust
+let done = ingest::spread(
+    &mut store,
+    8,
+    documents,
+    |document| document.id.as_bytes(),
+    |batch, document| batch.add_keyed(document.id.as_bytes(), &document.text).map(|_| ()),
+    now,
+    now,
+)?;
+```
+
+There are two closures because the fan out has to know the key before the document is analysed.
+A worker is picked by the hash of the key, so every copy of a key lands in the same batch and a key handed over twice in one call is decided by the order it was handed over in, which is what a caller means by handing it over twice.
+Anything else would decide it by which batch happened to be earlier in the group.
+The queues in front of the workers are bounded, so a producer quicker than the analysers waits instead of pulling the whole input into memory.
+
+It leaves one segment per worker where a single batch leaves one, and it says how many in what it returns, along with how many documents were taken and how many of them replaced a copy the store already held.
+Merging them first would cost a pass over everything just written, to save a fold that the compaction policy is going to do anyway on its own schedule and off the caller's thread.
+
+The three callers that had written this by hand are what it came from.
+The benchmark runner is the one with a number attached: replacing 5,000 documents in a store of 82,789 took 9.6 s on one thread and 2.3 s across ten, on a machine that was busy for both, so the ratio is what to read there and not either figure.
+
 ## Keeping the store in shape while a run writes into it
 
 An index run into a store commits a batch at a time and every commit adds a segment, so a run that was bounded at 8 MB of memory over the Go toolchain source used to leave nine segments behind and a run bounded at 4 MB left twenty two.
