@@ -940,34 +940,33 @@ The same command will time the four separately, which is a different question fr
 cargo run --release --example serving -- ./src /var/lib/kura readers=4 parts 50000
 ```
 
-The numbers this section reports were taken before a view cached the readers it opens, and reading them is the reason it does.
-Same corpus and machine, five runs, each cell the middle of the five:
+Same corpus and machine, five runs, each cell the middle of the five.
+The run prints two more conditions that the section below reads and this one leaves alone:
 
 | the median of | taking the view | opening the readers | building the searcher | running the query |
 | --- | --- | --- | --- | --- |
-| quiet | 0.04 µs | 0.58 µs | 0.00 µs | 2.71 µs |
-| writing | 0.08 µs | 3.17 µs | 0.04 µs | 7.08 µs |
-| writing and folding | 0.08 µs | 3.62 µs | 0.04 µs | 8.67 µs |
+| quiet | 0.04 µs | 0.00 µs | 0.00 µs | 2.46 µs |
+| writing | 0.08 µs | 0.04 µs | 0.04 µs | 6.58 µs |
+| writing and folding | 0.08 µs | 0.04 µs | 0.04 µs | 11.12 µs |
 
 | and of p99 | taking the view | opening the readers | building the searcher | running the query |
 | --- | --- | --- | --- | --- |
-| quiet | 0.25 µs | 2.42 µs | 0.04 µs | 11.50 µs |
-| writing | 0.33 µs | 16.79 µs | 0.04 µs | 42.38 µs |
-| writing and folding | 0.29 µs | 15.62 µs | 0.04 µs | 40.50 µs |
+| quiet | 0.12 µs | 0.04 µs | 0.04 µs | 3.88 µs |
+| writing | 1.75 µs | 0.04 µs | 0.08 µs | 36.75 µs |
+| writing and folding | 0.33 µs | 0.08 µs | 0.08 µs | 44.42 µs |
 
-Two of the four were free and are still free.
-Taking a view is 40 nanoseconds with nothing writing and 80 with four writers committing as fast as they can fill batches, and building a searcher over readers that are already open does not appear in the numbers at all.
-That is worth saying plainly because the view handover was the first suspect for what a commit costs a reader, and it is not it.
+Three of the four are now nothing.
+Taking a view is 40 nanoseconds with nothing writing and 80 with four writers committing as fast as they can fill batches, opening the readers is 0.00 to 0.04 µs in every cell of both tables, and building a searcher over readers that are already open is the same.
+Opening used to be the column that multiplied, 0.58 µs quiet against 3.17 under a write, and it is a per view cost spread over the queries that ran against the view rather than a per query one since #186, so what it reads here is a different measurement rather than the same one having got smaller.
+"What a view keeps between queries" further down is where that change is read on its own.
 
-The other two are where the writing landed, and they did not grow by the same amount or in the same way.
-Opening the readers was 447 percent more under a concurrent write at the median and 594 percent more at p99.
-Running the query was 161 percent more at the median and 268 at p99.
-In microseconds rather than percentages the search was still the larger addition, 4.37 against 2.59 at the median, but opening the readers was the one that multiplied, and it was pure overhead: it is the work of getting ready to answer rather than answering.
+That leaves the whole of what the writing costs in one column.
+Running the query is 168 percent more under a concurrent write at the median, 6.58 µs against 2.46, and 847 percent more at p99, 36.75 against 3.88.
+The four parts add up to the whole query the run reports beside them, 2.50 against a whole query median of 2.5 quiet and 6.74 against 6.8 writing, so nothing large is being spent between them and there is no fifth thing to look for.
 
-A cost that is pure overhead and that every query on the same view pays again is a cost to pay once, so a view now opens its readers on the first query that asks for them and hands the same set to every query after it.
-The column is not per query any more, it is per view spread over the queries that ran against it, which is a different measurement rather than a smaller number in the same one.
-Under a write that means one query in a few thousand pays the opening and the median query pays nothing.
-What that column reads today is in "What a view keeps between queries" further down, and the numbers here are left as they were taken because they are the argument for the change rather than a description of what the code does now.
+The one column that moved the other way is worth naming because it was not visible before.
+Taking a view has a p99 of 1.75 µs under a write against 0.12 quiet, and it is the least stable number in the table, 0.33 to 4.62 µs across the five runs where the quiet figure was 0.12 in all five.
+In microseconds it is nothing next to a 36.75 µs query, so it is not where the work is, but it is the one part of a query that touches what a committing writer publishes, and a tail that wanders by a factor of fourteen run to run is a tail with a lock in it.
 
 ## Whether a commit costs a reader by the commit or by the bytes
 
@@ -1094,23 +1093,27 @@ The case that would argue for a rate limit is the one with nothing spare, which 
 cargo run --release --example serving -- ./src /var/lib/kura threads=10 10000
 ```
 
-Ten writers on ten cores, 10,000 queries a second, five runs, each cell the middle of the five, taken before a view cached its readers:
+Ten writers on ten cores, 10,000 queries a second, five runs, each cell the middle of the five:
 
 | condition | segments at the end | median | p95 | p99 |
 | --- | --- | --- | --- | --- |
-| quiet | 1 | 4.8 µs | 14.4 µs | 27.2 µs |
-| writing | 15 | 9.9 µs | 50.9 µs | 200.4 µs |
-| writing and folding | 8 | 17.2 µs | 61.1 µs | 186.1 µs |
+| quiet | 1 | 2.6 µs | 2.9 µs | 4.0 µs |
+| writing | 17 | 6.5 µs | 21.1 µs | 100.2 µs |
+| writing and folding | 9 | 7.6 µs | 17.5 µs | 42.9 µs |
 
-So the cost of folding to a reader does grow when the cores run out.
-With four writers on this machine the folding row and the writing row are a wash at the median at the same rate, and with ten writers the folding row is 74 percent above it.
-It is still not in the tail, and the tail belongs to the writing at every load and every writer count tried here.
+So the cost of folding to a reader still shows at the median when the cores run out, 17 percent above the writing row, and it is paid back in the tail.
+The folding row is below the writing row at p95, 17.5 µs against 21.1, and less than half of it at p99, 42.9 against 100.2.
+The segment counts beside them are the reason to believe that is the keeper rather than the run: the writing row ends at 17 segments and the folding row at 9, and what a segment count costs a query is the section below.
 
-The three rows here are all pre #186, so all three floors are higher than they would be today, and the four writer number they are set against is not.
-What is being read off this table is the direction of a comparison inside it rather than any of its cells, and that a folding row above a writing row at the median stays above it when both floors come down by the same amount.
+That inverts what these two rows said when they were taken with four writers and cores to spare, where folding was above writing everywhere, 11.3 µs against 6.8 at the median and 46.0 against 42.4 at p99.
+Both readings are the same trade seen from two sides.
+A keeper wants a core, and where there is one to take the reader never notices the segments it saved; where there is not, the core it takes costs a few microseconds at the median and the segments it saved are worth more than that by p95.
+
+The wall is the other half of the price and it is not small.
+Ten writers put the first pass through in 89.55 ms with nothing folding and 155.94 ms with a keeper beside them, which is 74 percent more ingest wall for a tail less than half as long.
 
 That is worth stating as a conclusion rather than a table, because it is what a rate limit would have been built against.
-A compactor that yields when read p99 goes over a budget would never fire, on this machine, at any of these loads: p99 does not move when the folding starts.
+A compactor that yields when read p99 goes over a budget would never fire, on this machine, at any of these loads: p99 does not move when the folding starts, and at ten writers it falls.
 What moves is the median, by a few microseconds, and what moves it is a thread wanting a core.
 A limit that watched the median and paused the keeper would be buying back those microseconds by letting the segment count climb, and the section below is what a segment count costs.
 
@@ -1182,7 +1185,7 @@ The median of opening the readers, before this and after it, over three runs of 
 The whole query went with it.
 On the pair of runs whose running the query column agreed most closely, the quiet median went from 3.2 µs to 2.6 and the writing median from 5.5 to 3.0.
 The four parts add up to the whole in both, which is the check that says the opening really left rather than moving somewhere else: 0.04 for the view plus 0.58 for the opening plus 2.62 for the query is 3.24 before, and the same three with nothing in the middle is 2.66 after.
-The serving tables above have been taken again since the change and say so where they have not.
+The serving tables above have all been taken again since the change.
 
 The p99 of that column went from 5.96 µs to 0.04, which is the more interesting half.
 Opening still happens, once per view, and a view lasts a commit.
