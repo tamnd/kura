@@ -631,6 +631,27 @@ Merging them first would cost a pass over everything just written, to save a fol
 The three callers that had written this by hand are what it came from.
 The benchmark runner is the one with a number attached: replacing 5,000 documents in a store of 82,789 took 9.6 s on one thread and 2.3 s across ten, on a machine that was busy for both, so the ratio is what to read there and not either figure.
 
+### The fold at the end of a wide build
+
+A run that analyses on every core still has to make one segment out of what those cores produced, and until recently that last step used one of them.
+`Writer::build_on` takes the thread count as well as the parts:
+
+```rust
+let segment = index::Writer::build_on(parts, 10)?;
+```
+
+Every part already knows its own vocabulary in order, so the merged vocabulary is cut into ranges of terms and each range is merged on its own.
+A worker takes the terms in one range out of every part and produces a piece of the posting blob with its dictionary entries and its ceilings beside it, and joining the pieces is a concatenation with a shift, because everything in a piece is numbered against its own blob.
+The cuts are taken at even strides through the largest part's vocabulary and found in the others by binary search, and there are several ranges per thread rather than one, because a handful of terms carry most of the postings in any corpus and ranges equal in terms are not equal in work.
+
+The segment it writes is the segment one thread writes, byte for byte.
+The merged order comes from the term order and the part order, neither of which depends on where the cuts fall, so the tests compare the bytes rather than the answers.
+On the benchmark corpus of 82,789 documents and 464.0 MB in ten parts, the two files came out identical apart from fifty two bytes of timestamp in the superblock and the manifest.
+
+What it saves, on a machine that was busy throughout and alternating between the two so that neither got the quiet half: the fold took 2.3 s, 3.4 s and 4.0 s on one thread against 0.5 s, 1.5 s and 1.2 s on ten.
+The ratio is what to read there rather than any of the figures, and it is between two and five.
+Before this the fold was around a third of an index phase whose other stages were already wide, which is what held a whole run's parallelism down to twice on a machine with ten cores.
+
 ## Keeping the store in shape while a run writes into it
 
 An index run into a store commits a batch at a time and every commit adds a segment, so a run that was bounded at 8 MB of memory over the Go toolchain source used to leave nine segments behind and a run bounded at 4 MB left twenty two.

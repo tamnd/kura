@@ -250,6 +250,32 @@ impl Writer {
         self.filled = 0;
     }
 
+    /// Takes everything another writer holds, as though its terms had been
+    /// pushed here after the ones already in.
+    ///
+    /// `base` is where the other writer's posting blob landed in the blob this
+    /// one's offsets are against, which is the whole of what has to be corrected
+    /// for: an entry names a term by the offset of its posting list, and a
+    /// writer that merged a range of the vocabulary on its own numbered those
+    /// offsets from its own piece of the blob.
+    ///
+    /// The other writer has to be between terms, which a writer that has had
+    /// [`finish_term`](Self::finish_term) called for every term it took is.
+    /// Nothing here reads the term in progress, so anything left pending is
+    /// dropped rather than written wrongly.
+    pub(crate) fn append(&mut self, other: &Self, base: u64) {
+        let start = u32::try_from(self.payload.len()).unwrap_or(u32::MAX);
+        for entry in other.directory.chunks_exact(ENTRY) {
+            let (offset, rest) = get_u64(entry).unwrap_or((0, &[][..]));
+            let (at, _) = get_u32(rest).unwrap_or((0, &[][..]));
+            put_u64(&mut self.directory, offset.saturating_add(base));
+            put_u32(&mut self.directory, at.saturating_add(start));
+        }
+        self.payload.extend_from_slice(&other.payload);
+        self.wide.extend_from_slice(&other.wide);
+        self.terms = self.terms.saturating_add(other.terms);
+    }
+
     /// The section, laid out.
     #[must_use]
     pub fn finish(self) -> Vec<u8> {
