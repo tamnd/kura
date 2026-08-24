@@ -223,6 +223,23 @@ The test for it copies a store, zeroes the log from every 4 KiB boundary in the 
 
 That last line is the one to read before believing any of the others.
 
+### What the keys cost
+
+A document nobody can name is a document nobody can replace, so everything above is paid for by keeping a key beside every document.
+The example measures what that comes to by indexing the same documents twice in one process, once through `add` and once through `add_keyed`, alternating which of the two goes first so that a machine drifting under somebody else's work does not land on one case:
+
+```sh
+cargo run --release --example keyed -- ./src 64
+```
+
+The size it reports is exact, because the same documents through the same writer come to the same bytes every time.
+On 5,992 files of Go source, 64.1 MB of text, the segment goes from 9.8 MB to 10.5 MB, which is 8 percent, or 129 bytes for each document.
+That is the whole of what a key costs a store at rest: the key itself, and what it takes to find it again.
+
+The time it reports is not exact, and the example prints every round rather than only their middle so that a reader can tell which they are looking at.
+Six rounds of each case on a busy laptop ran between 1.03 s and 4.30 s, and the quickest round of each case was 1.05 s plain against 1.03 s keyed.
+Two numbers that close, with that spread behind them, say the key table is not where an index run spends its time, and they do not say anything finer than that.
+
 ### Which call, and what it does not promise
 
 Saying a returned commit survives a power cut is a claim about a platform call, and the obvious call does not mean the same thing everywhere.
