@@ -28,6 +28,15 @@
 //! in, exactly as it is decided between commits, and the store that comes out is
 //! the one the same batches committed one at a time would have made.
 //!
+//! # Several batches at once, on several cores
+//!
+//! Analysing a document is the expensive part of writing one and it is the part
+//! that has nothing shared in it, so a run that does it on one thread leaves
+//! most of a machine idle. [`spread`] is a batch per thread over one stream of
+//! documents, with one [`commit_all`] at the end. It is what a caller writing
+//! the fan out by hand would write, in one place, with the ordering that makes
+//! it safe already decided.
+//!
 //! # The log
 //!
 //! A batch holds everything in memory until it commits, so a machine that stops
@@ -53,6 +62,7 @@ use crate::file::{Appending, Fold, Lookup, Result, Store, Trouble, View};
 use crate::index::{self, Held};
 use crate::segment::Writer as SegmentWriter;
 use crate::upsert::{self, Upsert};
+use crate::xxh3;
 
 /// Documents on their way into a store, with the ones they replace.
 ///
@@ -1161,6 +1171,203 @@ fn union(
         }
     }
     Ok(())
+}
+
+/// How many documents a worker can have waiting in front of it.
+///
+/// The queues are what stops a producer quicker than the analysers from pulling
+/// the whole input into memory, so the number is a memory bound before it is a
+/// throughput one: the documents in flight are this many per thread, plus the
+/// segments the batches are building, and a caller sizing a machine can add that
+/// up. Deep enough that a worker held up by one long document is not idle when
+/// it comes back, and shallow enough that ten threads of it is tens of documents
+/// and not thousands.
+const QUEUED: usize = 64;
+
+/// What a [`spread`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Spread {
+    /// How many documents were handed over.
+    ///
+    /// The same number the caller's iterator produced, unless a worker stopped
+    /// early with an error, in which case it is how far the producer got before
+    /// it noticed. The error is what comes back in that case and this is not
+    /// read.
+    pub documents: usize,
+    /// How many of them replaced a document the store already held.
+    ///
+    /// A caller that asked to replace five thousand documents wants to know that
+    /// it replaced five thousand and not four thousand nine hundred and
+    /// ninety-eight, and nothing else in the return says so.
+    pub replaced: usize,
+    /// How many segments the commit added, which is one per worker that was
+    /// given anything.
+    pub segments: usize,
+    /// The epoch the commit left the store at.
+    pub epoch: u64,
+}
+
+/// Writes a stream of documents into a store across several threads, as one
+/// commit.
+///
+/// Analysing a document is the expensive part of writing one and it is the part
+/// that has nothing shared in it, so a run that does it on one thread leaves
+/// most of a machine idle. A batch cannot be shared across threads, and the
+/// answer is a batch per thread with one commit at the end: each worker analyses
+/// its share into a segment of its own, and [`commit_all`] puts all of them in
+/// the store together, so a reader sees one update rather than one per thread.
+///
+/// That shape was written by hand in three places before it was written here.
+/// It is thirty lines of channel and scope every time, in a file whose subject
+/// is something else, and every one of those lines is a place to get the
+/// ordering wrong.
+///
+/// The caller hands over documents and a thread count, not threads. `key` says
+/// what a document is keyed by, and `add` puts it in the batch it was given,
+/// with whatever fields it carries. They are two closures rather than one
+/// because the fan out has to know the key before the document is analysed, and
+/// what a document is analysed into is the caller's business.
+///
+/// ```no_run
+/// # use kura_core::file::Store;
+/// # use kura_core::ingest;
+/// # fn go(store: &mut Store, documents: Vec<(String, String)>, now: u64) -> kura_core::file::Result<()> {
+/// let done = ingest::spread(
+///     store,
+///     8,
+///     documents,
+///     |(path, _)| path.as_bytes(),
+///     |batch, (path, text)| batch.add_keyed(path.as_bytes(), &text).map(|_| ()),
+///     now,
+///     now,
+/// )?;
+/// assert_eq!(done.replaced, done.documents);
+/// # Ok(())
+/// # }
+/// ```
+///
+/// # Which worker gets a document
+///
+/// By the hash of its key, so every copy of a key lands in the same batch. A
+/// caller that hands the same key over twice in one call is saying the second is
+/// the one it wants, and that only holds if one batch sees both: two batches
+/// that each wrote a key are resolved by the order the batches are in, which is
+/// not the order the documents were given in. Hashing makes the two the same
+/// question.
+///
+/// A document with an empty key replaces nothing, so nothing depends on where it
+/// goes and it goes to the workers in turn.
+///
+/// The queues are bounded, so a worker that is behind holds up the documents
+/// hashed to it and not the ones hashed elsewhere, and a producer quicker than
+/// the analysers waits rather than growing.
+///
+/// # What it leaves
+///
+/// One segment per worker that was given anything, where a single batch leaves
+/// one. That is the trade and it is not hidden: a store already at its level
+/// cap gets there sooner, and a query in between walks more segments. Merging
+/// them first would cost a pass over everything just written, to save a fold
+/// that the compaction policy is going to do anyway on its own schedule and off
+/// the caller's thread.
+///
+/// Each worker opens the key index of every segment in the store, because that
+/// is what a batch does and there is one batch each. On a store of many segments
+/// that is the fixed cost of the call, and it is why this is for a stream of
+/// documents and not for three of them.
+///
+/// # Errors
+///
+/// As [`Batch::over`], [`Batch::finish`] and [`commit_all`], and whatever `add`
+/// returns. An error from a worker stops that worker, and the producer stops
+/// when it finds a queue with nobody behind it, so nothing is committed and the
+/// store is where it was. A panic in `add` is not caught: it is raised again on
+/// the calling thread once the other workers have stopped.
+pub fn spread<T, K, A>(
+    store: &mut Store,
+    threads: usize,
+    documents: impl IntoIterator<Item = T>,
+    key: K,
+    add: A,
+    created: u64,
+    written: u64,
+) -> Result<Spread>
+where
+    T: Send,
+    K: Fn(&T) -> &[u8],
+    A: Fn(&mut Batch<'_>, T) -> Result<()> + Sync,
+{
+    let threads = threads.max(1);
+    let width = u64::try_from(threads).unwrap_or(u64::MAX);
+    let mut taken = 0usize;
+
+    // The view goes out of scope before the commit, because the commit needs the
+    // store back and the view is what is holding it.
+    let batches = {
+        let view = store.view()?;
+        let add = &add;
+        std::thread::scope(|scope| -> Result<Vec<(Prepared, usize)>> {
+            let mut queues = Vec::with_capacity(threads);
+            let mut workers = Vec::with_capacity(threads);
+            for _ in 0..threads {
+                let (sender, receiver) = std::sync::mpsc::sync_channel::<T>(QUEUED);
+                queues.push(sender);
+                let view = &view;
+                workers.push(scope.spawn(move || -> Result<(Prepared, usize)> {
+                    let mut batch = Batch::over(view)?;
+                    while let Ok(document) = receiver.recv() {
+                        add(&mut batch, document)?;
+                    }
+                    let replaced = batch.replacements();
+                    Ok((batch.finish()?, replaced))
+                }));
+            }
+
+            let mut turn = 0usize;
+            for document in documents {
+                let bytes = key(&document);
+                let at = if bytes.is_empty() {
+                    turn = (turn + 1) % threads;
+                    turn
+                } else {
+                    usize::try_from(xxh3::hash64(bytes) % width).unwrap_or(0)
+                };
+                if queues[at].send(document).is_err() {
+                    // Nobody is behind that queue any more, which means the
+                    // worker stopped with an error the join below is about to
+                    // return. Handing the rest to the others would bury it under
+                    // whatever they went on to do.
+                    break;
+                }
+                taken += 1;
+            }
+            // A worker stops when its queue closes and not before, so the queues
+            // go before the join and not after it.
+            queues.clear();
+
+            workers
+                .into_iter()
+                .map(|worker| match worker.join() {
+                    Ok(done) => done,
+                    // The caller's closure panicked, so the caller gets the
+                    // panic. Turning it into an error here would put a message
+                    // about ingest in front of a bug that is somewhere else.
+                    Err(panicked) => std::panic::resume_unwind(panicked),
+                })
+                .collect()
+        })?
+    };
+
+    let replaced = batches.iter().map(|(_, count)| count).sum();
+    let parts: Vec<Prepared> = batches.into_iter().map(|(part, _)| part).collect();
+    let segments = parts.iter().filter(|part| part.segment.is_some()).count();
+    let epoch = commit_all(store, parts, created, written)?;
+    Ok(Spread {
+        documents: taken,
+        replaced,
+        segments,
+        epoch,
+    })
 }
 
 #[cfg(test)]
@@ -2280,6 +2487,153 @@ mod tests {
         assert_eq!(store.manifest().segments.len(), segments);
         assert_eq!(store.manifest().epoch, epoch + 1, "still a commit");
         assert_eq!(count(&store, "ledger"), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A corpus of `count` documents keyed by their number, each holding the
+    /// word it is given.
+    fn corpus(count: usize, word: &str) -> Vec<(Vec<u8>, String)> {
+        (0..count)
+            .map(|n| {
+                (
+                    format!("document-{n}").into_bytes(),
+                    format!("the quarter {word} for account {n}"),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_spread_replaces_what_the_store_held_and_commits_once() {
+        let path = path("spread");
+        let mut store = empty(&path);
+        let loading = corpus(200, "ledger");
+        let first: Vec<(&[u8], &str)> = loading
+            .iter()
+            .map(|(key, text)| (key.as_slice(), text.as_str()))
+            .collect();
+        write(&mut store, &first);
+        let segments = store.manifest().segments.len();
+        let epoch = store.manifest().epoch;
+
+        let done = spread(
+            &mut store,
+            4,
+            corpus(200, "statement"),
+            |(key, _)| key.as_slice(),
+            |batch, (key, text)| batch.add_keyed(&key, &text).map(|_| ()),
+            1_700_000_002,
+            2,
+        )
+        .expect("spread");
+
+        assert_eq!(done.documents, 200);
+        assert_eq!(
+            done.replaced, 200,
+            "every one of them had a copy in the store"
+        );
+        assert_eq!(
+            store.manifest().epoch,
+            epoch + 1,
+            "one commit, not one each"
+        );
+        assert_eq!(
+            store.manifest().segments.len(),
+            segments + done.segments,
+            "the segments it says it left are the segments it left"
+        );
+        assert_eq!(count(&store, "statement"), 200);
+        assert_eq!(count(&store, "ledger"), 0);
+        assert_eq!(store.manifest().live, 200);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_key_given_twice_in_one_spread_leaves_the_later_document() {
+        let path = path("spread-twice");
+        let mut store = empty(&path);
+        // Enough threads that a key landing anywhere but by its hash would put
+        // the two copies in different batches, where the order they were given
+        // in stops deciding anything.
+        let documents = vec![
+            (b"a".to_vec(), "the first ledger".to_string()),
+            (b"b".to_vec(), "the other ledger".to_string()),
+            (b"a".to_vec(), "the second ledger".to_string()),
+            (b"a".to_vec(), "the third ledger".to_string()),
+        ];
+
+        let done = spread(
+            &mut store,
+            8,
+            documents,
+            |(key, _)| key.as_slice(),
+            |batch, (key, text)| batch.add_keyed(&key, &text).map(|_| ()),
+            1_700_000_002,
+            2,
+        )
+        .expect("spread");
+
+        assert_eq!(done.documents, 4);
+        assert_eq!(done.replaced, 2, "the two earlier copies of the same key");
+        assert_eq!(count(&store, "ledger"), 2);
+        assert_eq!(count(&store, "third"), 1);
+        assert_eq!(count(&store, "first"), 0);
+        assert_eq!(count(&store, "second"), 0);
+        assert_eq!(store.manifest().live, 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_spread_of_documents_with_no_key_adds_all_of_them() {
+        let path = path("spread-unkeyed");
+        let mut store = empty(&path);
+
+        let done = spread(
+            &mut store,
+            4,
+            (0..50).map(|n| format!("the quarter ledger for account {n}")),
+            |_| b"",
+            |batch, text| batch.add(&text).map(|_| ()),
+            1_700_000_002,
+            2,
+        )
+        .expect("spread");
+
+        assert_eq!(done.documents, 50);
+        assert_eq!(done.replaced, 0, "a document with no key replaces nothing");
+        assert_eq!(count(&store, "ledger"), 50);
+        assert_eq!(store.manifest().live, 50);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_worker_that_fails_leaves_the_store_where_it_was() {
+        let path = path("spread-fails");
+        let mut store = empty(&path);
+        write(&mut store, &[(b"a", "the first quarter ledger")]);
+        let segments = store.manifest().segments.len();
+        let epoch = store.manifest().epoch;
+
+        let failed = spread(
+            &mut store,
+            4,
+            corpus(200, "statement"),
+            |(key, _)| key.as_slice(),
+            |batch, (key, text)| {
+                if key.ends_with(b"-137") {
+                    return Err(Trouble::Format(Error::MissingSection { kind: 0 }));
+                }
+                batch.add_keyed(&key, &text).map(|_| ())
+            },
+            1_700_000_002,
+            2,
+        );
+
+        assert!(failed.is_err(), "the error the closure returned");
+        assert_eq!(store.manifest().segments.len(), segments, "nothing added");
+        assert_eq!(store.manifest().epoch, epoch, "and nothing committed");
+        assert_eq!(count(&store, "ledger"), 1);
+        assert_eq!(count(&store, "statement"), 0);
         let _ = std::fs::remove_file(&path);
     }
 }
