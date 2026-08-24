@@ -132,6 +132,7 @@ usage:
   kura-cli dump <index>                      print what is in an index, one record to a line
   kura-cli compact <store>                   fold the segments of a store into one
   kura-cli reclaim <store> -o <new>          write a store out at the size of what it holds
+                                             and, with --log, at a log size of its own
   kura-cli repair <store>                    drop the segments that no longer read
   kura-cli migrate <index> -o <new>          write an older index out in today's format
 
@@ -143,6 +144,9 @@ options:
                 writer holds this much, or none to let it hold everything
                 (default 128m)
   --flush-every <size>  for index, start a new segment once this much text has gone in
+  --log <size>  how long the log ring is, for the index run that makes a store
+                and for reclaim, which is the only thing that can change it
+                (default 128m)
   --no-fold     for index into a store, leave the segments where they are
                 rather than folding when level zero fills
   --durability <reach>  for index into a store, what a commit survives:
@@ -226,6 +230,21 @@ case where somebody wants segments of a size rather than a ceiling on memory.
 Neither of them bounds the whole process. A run also holds the allocator's slack
 and the file it is reading, and on a real corpus the process peaks tens of
 megabytes above what the writer says it holds.
+
+--log is the third number that ends a batch and the only one that is a property
+of the store rather than of the run. Every document goes into the log before it
+is committed, so a log smaller than the budget is a run whose batches end when
+the log fills, and the run says so when it opens the store. That is a way to
+size segments as much as it is a way to size a file, and it is worth knowing
+which of the two numbers is doing the work.
+
+A log is fixed when a store is made, because the segments start where it ends,
+so --log is read on the run that creates the store and a run pointed at one that
+already carries a different figure is refused rather than handed the old one.
+reclaim is the one command that can change it, since it writes a second store,
+and a --log there is how a store whose file is mostly log gives the rest back.
+The region is sparse, so a long log costs the length of the file and not the
+space on the disk, on every filesystem that hands space out as it is written to.
 
 a dump is tab separated with a comment line naming its columns, and every line
 says which segment it came from. It prints terms and stored fields, which is to
@@ -450,15 +469,25 @@ fn squash(args: &[String]) -> Result<(), Failure> {
 /// where the file went. A refusal fails, because the store is still whatever it
 /// was and a script should not carry on from a rewrite that did not happen. See
 /// [`reclaim`] for what it refuses and why the rename is not its job.
+///
+/// `--log` is here and on no other command that opens a store, because the
+/// segments start where the log ends and so a store's log is fixed for as long
+/// as that store exists. This one writes a second store, which is the only
+/// moment the number can be picked again.
 fn shrink(args: &[String]) -> Result<(), Failure> {
     let mut positional = Vec::new();
     let mut into: Option<PathBuf> = None;
+    let mut log: Option<u64> = None;
     let mut at = 0;
     while at < args.len() {
         match args[at].as_str() {
             "-o" => {
                 at += 1;
                 into = Some(PathBuf::from(want(args, at, "-o wants a file")?));
+            }
+            "--log" => {
+                at += 1;
+                log = Some(size(want(args, at, "--log wants a size")?)?);
             }
             other if other.starts_with("--") => {
                 return Err(Failure::usage(format!("unknown option {other}")));
@@ -474,7 +503,7 @@ fn shrink(args: &[String]) -> Result<(), Failure> {
     let into = into.ok_or_else(|| Failure::usage("reclaim wants -o, and never writes in place"))?;
 
     let mut out = BufWriter::new(std::io::stdout());
-    let outcome = reclaim::reclaim(path, &into, now(), &mut out)
+    let outcome = reclaim::reclaim(path, &into, now(), log, &mut out)
         .map_err(|trouble| Failure::Store(path.to_path_buf(), trouble))?;
     out.flush().map_err(Failure::Stdout)?;
 
@@ -951,6 +980,13 @@ struct Plan {
     into_store: bool,
     flush_every: Option<u64>,
     memory: Option<u64>,
+    /// How long the log ring is in the store this run makes.
+    ///
+    /// Only ever read on the run that creates the store, because the segments
+    /// start where the log ends and so the number is fixed for as long as the
+    /// file exists. A run pointed at a store that is already there and carrying
+    /// a different figure is refused rather than quietly given the old one.
+    log: Option<u64>,
     /// Whether the run keeps the store it is writing to in shape as it goes.
     ///
     /// On by default, because a run that leaves a store with forty segments in
@@ -981,6 +1017,7 @@ impl Plan {
         let mut into_store = false;
         let mut flush_every: Option<u64> = None;
         let mut memory: Option<u64> = None;
+        let mut log: Option<u64> = None;
         let mut unbounded = false;
         let mut fold = true;
         let mut durability = Reach::default();
@@ -1009,6 +1046,10 @@ impl Plan {
                         unbounded = false;
                         memory = Some(size(value)?);
                     }
+                }
+                "--log" => {
+                    at += 1;
+                    log = Some(size(want(args, at, "--log wants a size")?)?);
                 }
                 "--durability" => {
                     at += 1;
@@ -1047,93 +1088,100 @@ impl Plan {
             return Err(Failure::usage("nothing to index"));
         }
         let out = out.ok_or_else(|| Failure::usage("no -o, so nowhere to write"))?;
-        agreeable(
-            into_store,
-            flush_every,
-            memory,
-            unbounded,
-            fold,
-            threads,
-            durability,
-        )?;
-        // A run into a store is bounded unless somebody says otherwise, because
-        // the alternative is a run whose memory is the size of what it was
-        // pointed at and nobody asks for that on purpose. A run given
-        // --flush-every has already said how it wants to be bounded, and a bare
-        // index has nowhere to flush a second segment to.
-        if into_store && memory.is_none() && flush_every.is_none() && !unbounded {
-            memory = Some(DEFAULT_MEMORY);
-        }
-        Ok(Self {
+        let mut plan = Self {
             inputs,
             out,
             into_store,
             flush_every,
             memory,
+            log,
             fold,
             durability,
             threads,
-        })
+        };
+        plan.agreeable(unbounded)?;
+        // A run into a store is bounded unless somebody says otherwise, because
+        // the alternative is a run whose memory is the size of what it was
+        // pointed at and nobody asks for that on purpose. A run given
+        // --flush-every has already said how it wants to be bounded, and a bare
+        // index has nowhere to flush a second segment to. After the refusals
+        // rather than before them, so that what they read is what was typed.
+        if plan.into_store && plan.memory.is_none() && plan.flush_every.is_none() && !unbounded {
+            plan.memory = Some(DEFAULT_MEMORY);
+        }
+        Ok(plan)
     }
-}
 
-/// Says which pair of options do not go together, if a pair of them do not.
-///
-/// Out of [`Plan::read`] because reading the arguments and agreeing to them are
-/// two jobs, and the second one is a list of refusals that grows every time an
-/// option is added.
-fn agreeable(
-    into_store: bool,
-    flush_every: Option<u64>,
-    memory: Option<u64>,
-    unbounded: bool,
-    fold: bool,
-    threads: usize,
-    durability: Reach,
-) -> Result<(), Failure> {
-    if flush_every.is_some() && !into_store {
-        // A file that is one segment can hold one segment, and the whole of
-        // what this option does is write more than one.
-        return Err(Failure::usage("--flush-every needs --store to flush into"));
+    /// Says which pair of options do not go together, if a pair of them do not.
+    ///
+    /// Apart from [`Plan::read`] because reading the arguments and agreeing to
+    /// them are two jobs, and the second one is a list of refusals that grows
+    /// every time an option is added.
+    ///
+    /// `unbounded` is the one thing not on the plan, because `--memory none` and
+    /// no `--memory` at all are the same field and a refusal has to tell them
+    /// apart.
+    fn agreeable(&self, unbounded: bool) -> Result<(), Failure> {
+        let Self {
+            into_store,
+            flush_every,
+            memory,
+            log,
+            fold,
+            threads,
+            durability,
+            ..
+        } = *self;
+        if flush_every.is_some() && !into_store {
+            // A file that is one segment can hold one segment, and the whole of
+            // what this option does is write more than one.
+            return Err(Failure::usage("--flush-every needs --store to flush into"));
+        }
+        if (memory.is_some() || unbounded) && !into_store {
+            return Err(Failure::usage("--memory needs --store to flush into"));
+        }
+        if log.is_some() && !into_store {
+            // A bare index writes a segment and nothing around it, so there is no
+            // superblock for a log to be named in and no ring for a record to go
+            // into. The documents of such a run are never logged at all.
+            return Err(Failure::usage("--log needs --store to be the log of"));
+        }
+        if !fold && !into_store {
+            // A bare index is one segment and there is nothing in it to fold,
+            // so turning the folding off is turning off something that was
+            // never going to happen.
+            return Err(Failure::usage("--no-fold needs --store to not fold"));
+        }
+        if threads > 1 && !into_store {
+            // A bare index is one segment written by one pass, and there is no
+            // commit in it for a second thread to hand anything to.
+            return Err(Failure::usage("--threads needs --store to write into"));
+        }
+        if durability != Reach::default() && !into_store {
+            // A bare index is written and closed rather than committed, so
+            // there is no commit here for the reach to be about, and accepting
+            // the flag would be agreeing to something that does not happen.
+            return Err(Failure::usage("--durability needs --store to commit into"));
+        }
+        // A writer holds the compressor's match table before it has been given
+        // anything, so a budget under that is a segment per document rather than
+        // a small run, and somebody who asked for a kilobyte meant a megabyte.
+        let floor = Writer::new().held().total();
+        if memory.is_some_and(|budget| budget < floor) {
+            return Err(Failure::usage(format!(
+                "a writer holds {} before it has been given a document, so --memory under that is one segment per document",
+                report::bytes(floor)
+            )));
+        }
+        if memory.is_some() && flush_every.is_some() {
+            // Both would work, and a run that flushed on whichever tripped first
+            // would be a run nobody could read the numbers of afterwards.
+            return Err(Failure::usage(
+                "--memory and --flush-every are two answers to the same question, so pick one",
+            ));
+        }
+        Ok(())
     }
-    if (memory.is_some() || unbounded) && !into_store {
-        return Err(Failure::usage("--memory needs --store to flush into"));
-    }
-    if !fold && !into_store {
-        // A bare index is one segment and there is nothing in it to fold,
-        // so turning the folding off is turning off something that was
-        // never going to happen.
-        return Err(Failure::usage("--no-fold needs --store to not fold"));
-    }
-    if threads > 1 && !into_store {
-        // A bare index is one segment written by one pass, and there is no
-        // commit in it for a second thread to hand anything to.
-        return Err(Failure::usage("--threads needs --store to write into"));
-    }
-    if durability != Reach::default() && !into_store {
-        // A bare index is written and closed rather than committed, so
-        // there is no commit here for the reach to be about, and accepting
-        // the flag would be agreeing to something that does not happen.
-        return Err(Failure::usage("--durability needs --store to commit into"));
-    }
-    // A writer holds the compressor's match table before it has been given
-    // anything, so a budget under that is a segment per document rather than
-    // a small run, and somebody who asked for a kilobyte meant a megabyte.
-    let floor = Writer::new().held().total();
-    if memory.is_some_and(|budget| budget < floor) {
-        return Err(Failure::usage(format!(
-            "a writer holds {} before it has been given a document, so --memory under that is one segment per document",
-            report::bytes(floor)
-        )));
-    }
-    if memory.is_some() && flush_every.is_some() {
-        // Both would work, and a run that flushed on whichever tripped first
-        // would be a run nobody could read the numbers of afterwards.
-        return Err(Failure::usage(
-            "--memory and --flush-every are two answers to the same question, so pick one",
-        ));
-    }
-    Ok(())
 }
 
 /// Reads a reach, or says which ones there are.
@@ -1479,7 +1527,7 @@ fn index(args: &[String]) -> Result<(), Failure> {
 /// as the batch before it left it, and every batch is one commit that adds the
 /// new documents and hides the ones they replace together.
 fn into_store<'a>(plan: &Plan, files: &'a [PathBuf], run: &mut Run<'a>) -> Result<(), Failure> {
-    let mut store = open_store(&plan.out, plan.durability)?;
+    let mut store = open_store(&plan.out, plan)?;
     // Before a document of this run goes in. The log holds whatever the run
     // before this one had taken and not committed, and those documents belong in
     // the store before it is asked to replace any of them, or a file indexed
@@ -1677,7 +1725,7 @@ fn one_batch<'a>(
 /// alongside them, because a fold moves the segments the batches in flight
 /// counted positions into and every one of them would be refused.
 fn shared<'a>(plan: &Plan, files: &'a [PathBuf], run: &mut Run<'a>) -> Result<(), Failure> {
-    let mut store = open_store(&plan.out, plan.durability)?;
+    let mut store = open_store(&plan.out, plan)?;
     let stamp = now();
     let put_back = ingest::replay(&mut store, stamp, stamp)
         .map_err(|trouble| Failure::Store(plan.out.clone(), trouble))?;
@@ -1997,7 +2045,7 @@ fn size(value: &str) -> Result<u64, Failure> {
         .ok_or_else(|| Failure::usage(format!("{value} is larger than this machine can count")))?;
     if bytes == 0 {
         return Err(Failure::usage(
-            "a size of zero would flush after every document",
+            "a size of zero leaves nothing to work with, whether it is a budget, a flush or a log",
         ));
     }
     Ok(bytes)
@@ -2013,15 +2061,52 @@ fn fresh(memory: Option<u64>) -> Writer {
 /// Once for the run rather than once a batch. A store is a file and opening it
 /// reads and checks the manifest, which is work that says the same thing every
 /// time it is done.
-fn open_store(path: &Path, durability: Reach) -> Result<Store, Failure> {
+///
+/// This is where `--log` lands, and it only does anything on the run that makes
+/// the store. A log is fixed when a store is made, because the segments start
+/// where it ends, so a run pointed at a store that is already there and carrying
+/// a different figure is refused rather than quietly handed the old one. That
+/// leaves the same command runnable twice, which is the case that matters, and
+/// names the mismatch in the one case that would otherwise be silent.
+fn open_store(path: &Path, plan: &Plan) -> Result<Store, Failure> {
     let now = now();
     let mut store = if path.exists() {
         Store::open(path)
     } else {
-        Store::create_with_log(path, identity(path, now), now, LOG_LEN)
+        Store::create_with_log(path, identity(path, now), now, plan.log.unwrap_or(LOG_LEN))
     }
     .map_err(|trouble| Failure::Store(path.to_path_buf(), trouble))?;
-    store.set_durability(durability);
+
+    let held = store.superblock().wal_len;
+    if let Some(asked) = plan.log {
+        // Against what a creation would have rounded the figure to rather than
+        // against the figure, so that --log 1000 twice is agreement and not a
+        // complaint that 1000 is not 4096.
+        let page = u64::from(manifest::PAGE);
+        if asked.div_ceil(page) * page != held {
+            return Err(Failure::usage(format!(
+                "{} was made with a log of {} and --log asks for {}, and a log is fixed when a store is made because the segments start where it ends, so reclaim it into a new store to change it",
+                path.display(),
+                report::bytes(held),
+                report::bytes(asked)
+            )));
+        }
+    }
+    // Both numbers end a batch and the smaller of them ends it first, so a run
+    // whose log is under its budget is a run the budget will never end. That is
+    // not a failure and it is the shape of the run, which makes it worth saying
+    // once rather than working out afterwards from the segment count.
+    if let Some(budget) = plan.memory
+        && held < budget
+    {
+        println!(
+            "the log is {} and the memory budget is {}, so a batch ends when the log fills rather than when the budget does",
+            report::bytes(held),
+            report::bytes(budget)
+        );
+    }
+
+    store.set_durability(plan.durability);
     Ok(store)
 }
 
@@ -2970,6 +3055,80 @@ mod tests {
     }
 
     #[test]
+    fn a_log_a_run_asked_for_is_the_log_the_store_it_made_has() {
+        // Eight megabytes rather than the default, so a store that came out with
+        // the default would fail this rather than pass it by coincidence, and a
+        // whole number of pages so the figure and the file agree exactly.
+        let dir = scratch_dir("log-asked-for");
+        let corpus = documents(&dir.join("corpus"), 0, 20);
+        let store = dir.join("small-log.kura");
+
+        into(&corpus, &store, &["--log", "8m"]).expect("the run");
+        let opened = Store::open(&store).expect("the store opens");
+        assert_eq!(opened.superblock().wal_len, 8 << 20);
+        assert_ne!(opened.superblock().wal_len, LOG_LEN);
+        // The segments start where the log ends, so the whole of what a shorter
+        // log buys is a file that starts its segments earlier.
+        assert_eq!(
+            opened.superblock().segments_offset,
+            manifest::WAL_OFFSET + (8 << 20)
+        );
+        assert_eq!(opened.manifest().live, 20);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_log_that_is_not_the_one_the_store_has_is_refused_and_the_same_one_is_not() {
+        // The command that made the store has to be runnable a second time, and
+        // the command that would silently do nothing has to say so. Both come
+        // out of the same comparison, which is why they are one test.
+        let dir = scratch_dir("log-mismatch");
+        let corpus = documents(&dir.join("corpus"), 0, 20);
+        let store = dir.join("made.kura");
+
+        into(&corpus, &store, &["--log", "8m"]).expect("the first run");
+        into(&corpus, &store, &["--log", "8m"]).expect("the same run again");
+
+        let refused = into(&corpus, &store, &["--log", "16m"]).expect_err("a refusal");
+        let said = refused.to_string();
+        assert!(
+            said.contains("8.0 MB"),
+            "it should name the log it has: {said}"
+        );
+        assert!(
+            said.contains("16.0 MB"),
+            "it should name the log asked for: {said}"
+        );
+        assert!(
+            said.contains("reclaim"),
+            "it should say what can change it: {said}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_log_rounds_up_to_a_page_and_the_rounded_figure_is_what_a_second_run_agrees_with() {
+        // A store rounds a log up to a whole page when it makes one, so a run
+        // that compared the figure it was given against the figure in the file
+        // would refuse the command that had just created it.
+        let dir = scratch_dir("log-rounds");
+        let corpus = documents(&dir.join("corpus"), 0, 8);
+        let store = dir.join("odd.kura");
+
+        into(&corpus, &store, &["--log", "5000"]).expect("the first run");
+        let held = Store::open(&store)
+            .expect("the store opens")
+            .superblock()
+            .wal_len;
+        assert_eq!(held, u64::from(manifest::PAGE) * 2);
+        into(&corpus, &store, &["--log", "5000"]).expect("the same run again");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_run_that_flushes_several_times_replaces_what_the_run_before_it_wrote() {
         // Every batch has to take its own view, because the batch before it
         // committed one and a batch working from a view older than the store is
@@ -3258,6 +3417,28 @@ mod tests {
         assert!(Plan::read(&args(&["--store", "--memory", "4096"])).is_err());
         // And the size itself still has to be a size.
         assert!(Plan::read(&args(&["--store", "--memory"])).is_err());
+    }
+
+    #[test]
+    fn a_log_is_read_off_the_arguments_and_needs_a_store_to_be_the_log_of() {
+        let args = |extra: &[&str]| {
+            let mut args = vec!["corpus".to_string(), "-o".to_string(), "out".to_string()];
+            args.extend(extra.iter().map(|part| (*part).to_string()));
+            args
+        };
+        let plan = Plan::read(&args(&["--store", "--log", "8m"])).expect("a plan");
+        assert_eq!(plan.log, Some(8 << 20));
+
+        // A run without one is a run that takes whatever the store has, and a
+        // run that makes the store takes the default.
+        assert_eq!(Plan::read(&args(&["--store"])).expect("a plan").log, None);
+
+        // A bare index writes a segment and nothing around it, so there is no
+        // superblock for a log to be named in.
+        assert!(Plan::read(&args(&["--log", "8m"])).is_err());
+        // And the size itself still has to be a size.
+        assert!(Plan::read(&args(&["--store", "--log"])).is_err());
+        assert!(Plan::read(&args(&["--store", "--log", "0"])).is_err());
     }
 
     #[test]

@@ -28,6 +28,19 @@
 //! deletions apart by, so a store that has been through this is a store that
 //! makes the same decisions afterwards as it would have made before.
 //!
+//! # The log is the one number worth choosing again
+//!
+//! A store's log region is fixed when the store is made, because the segments
+//! start where it ends, so this is the only place it can change at all. That
+//! makes it worth offering: a log is often most of a small store, since a run
+//! picks a size for the largest corpus it might see and then indexes a corpus
+//! that fits in a fraction of it. [`rewrite`] carries the source's log across
+//! and [`rewrite_with_log`] takes one, which is how an archival copy is made.
+//!
+//! Shrinking it is safe here and nowhere else. A rewrite is refused unless the
+//! log is already consumed, so there is nothing in the region to lose, and the
+//! new store starts its own ring empty at the size it was given.
+//!
 //! The tombstones are decoded and written again rather than copied byte for
 //! byte. It costs a decode per segment that has any, and it buys the check that
 //! a set naming a document its segment does not have is refused here, on a file
@@ -93,12 +106,35 @@ impl Reclaimed {
 ///
 /// # Errors
 ///
+/// As [`rewrite_with_log`].
+pub fn rewrite(from: &Path, into: &Path, written: u64) -> Result<Reclaimed> {
+    rewrite_with_log(from, into, written, None)
+}
+
+/// As [`rewrite`], with the log region a length of the caller's choosing.
+///
+/// `log` of `None` carries the source's length across, which is what [`rewrite`]
+/// asks for. `Some` gives the new store that length instead, rounded up to a
+/// page the way any other store creation rounds it.
+///
+/// This is the only way a store's log length changes, and it can go either way.
+/// A smaller one is the reason to reach for this, since a log picked for the
+/// largest corpus a run might see is most of the file when the corpus that
+/// arrived was small.
+///
+/// # Errors
+///
 /// Returns [`Trouble::Format`] with [`Error::LogNotConsumed`] if the source
 /// still has log records no commit has consumed, and with whatever the source
 /// is wrong about if it does not open or a tombstone set does not belong to the
 /// segment it is filed under. Returns [`Trouble::Io`] if `into` already exists,
 /// cannot be created, or a write or a sync fails.
-pub fn rewrite(from: &Path, into: &Path, written: u64) -> Result<Reclaimed> {
+pub fn rewrite_with_log(
+    from: &Path,
+    into: &Path,
+    written: u64,
+    log: Option<u64>,
+) -> Result<Reclaimed> {
     let source = Store::open(from)?;
     let committed = source.manifest();
     if committed.wal_head != committed.wal_tail {
@@ -109,7 +145,11 @@ pub fn rewrite(from: &Path, into: &Path, written: u64) -> Result<Reclaimed> {
     }
 
     let block = source.superblock();
-    let mut fresh = Store::create_with_log(into, block.store, block.created, block.wal_len)?;
+    // The source's unless somebody said otherwise. Not the default, because a
+    // store that came back with a log nobody chose would be a store whose size
+    // changed for a reason not in the command that ran.
+    let wal_len = log.unwrap_or(block.wal_len);
+    let mut fresh = Store::create_with_log(into, block.store, block.created, wal_len)?;
     // Held across the loop rather than taken per segment, because it is one
     // mapping of the whole source file and taking it again for each segment
     // would be a mapping per segment of a file that is not changing.
@@ -196,9 +236,15 @@ mod tests {
         out
     }
 
+    /// The log every source here is made with.
+    ///
+    /// Not the default, so that a rewrite which quietly used the default rather
+    /// than the source's would be caught rather than agreed with.
+    const LOG: u64 = 8 << 20;
+
     /// A store of one segment per entry, each entry saying how many documents.
     fn stored(path: &Path, parts: &[usize]) -> Store {
-        let mut store = Store::create(path, STORE, 1_700_000_000).expect("a store");
+        let mut store = Store::create_with_log(path, STORE, 1_700_000_000, LOG).expect("a store");
         let mut manifest = store.manifest().clone();
         let mut from = 0;
         for (n, &count) in parts.iter().enumerate() {
@@ -361,6 +407,75 @@ mod tests {
             .map(|segment| segment.level)
             .collect();
         assert_eq!(was, now, "a rewrite worked the levels out again");
+        drop(store);
+        let _ = std::fs::remove_file(&from);
+        let _ = std::fs::remove_file(&into);
+    }
+
+    #[test]
+    fn a_rewrite_carries_the_log_across_unless_it_is_given_one() {
+        let from = path("log-kept-source");
+        let kept = path("log-kept");
+        let cut = path("log-cut");
+        let store = stored(&from, &[6]);
+        let was = store.superblock().wal_len;
+        assert_eq!(was, LOG, "the fixture did not get the log it asked for");
+        assert_ne!(
+            was,
+            crate::manifest::DEFAULT_WAL_LEN,
+            "the fixture's log is the default, so this test cannot tell the two apart"
+        );
+        drop(store);
+
+        rewrite(&from, &kept, 1_700_000_003).expect("a rewrite");
+        assert_eq!(
+            Store::open(&kept).expect("a store").superblock().wal_len,
+            was,
+            "a rewrite asked for nothing changed the log anyway"
+        );
+
+        rewrite_with_log(&from, &cut, 1_700_000_003, Some(64 << 10)).expect("a rewrite");
+        let smaller = Store::open(&cut).expect("a store");
+        assert_eq!(smaller.superblock().wal_len, 64 << 10);
+        // The whole point of asking, so it is asserted rather than left to be
+        // read off the two lengths by somebody trusting the arithmetic.
+        assert!(
+            smaller.superblock().segments_offset < was,
+            "the segments still start past where the old log ended"
+        );
+        // And it is still a store, since a log is a region the segments are
+        // placed after and getting that arithmetic wrong would put them
+        // somewhere the manifest does not say.
+        let before: Vec<_> = {
+            let one = Store::open(&kept).expect("a store");
+            WORDS.iter().map(|word| hits(&one, word)).collect()
+        };
+        let after: Vec<_> = WORDS.iter().map(|word| hits(&smaller, word)).collect();
+        assert_eq!(before, after);
+        drop(smaller);
+        for path in [&from, &kept, &cut] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn a_log_a_rewrite_shrank_is_a_ring_the_new_store_can_still_write_to() {
+        let from = path("log-usable-source");
+        let into = path("log-usable");
+        let store = stored(&from, &[6]);
+        drop(store);
+
+        rewrite_with_log(&from, &into, 1_700_000_003, Some(1 << 20)).expect("a rewrite");
+        let mut store = Store::open(&into).expect("a store");
+        assert!(
+            store.log().is_empty(),
+            "the new ring came back with records"
+        );
+        store
+            .append(1, b"a record the smaller ring has to hold")
+            .expect("appended");
+        store.sync().expect("synced");
+        assert!(!store.log().is_empty());
         drop(store);
         let _ = std::fs::remove_file(&from);
         let _ = std::fs::remove_file(&into);

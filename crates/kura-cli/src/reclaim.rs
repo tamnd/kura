@@ -17,6 +17,23 @@
 //! whoever ran this. A run that dies halfway leaves a partial file nothing points
 //! at and a store nobody has written to.
 //!
+//! # The log is the one thing it will change on purpose
+//!
+//! `--log` gives the new store a log region of a size somebody chose, and this
+//! is the only command that can, because a log is fixed when a store is made and
+//! the segments start where it ends.
+//!
+//! It is here because the log is often most of a small store. A run picks a size
+//! for the largest corpus it might index and then indexes one that fits in a
+//! fraction of it, and what comes out is a file that is nine parts log. That
+//! makes the reclaim look like it has failed when it has done everything it
+//! could, so the report names the log and the segments separately and a `--log`
+//! is how the other nine tenths come off.
+//!
+//! A log the run is shrinking is a log with nothing in it, because a rewrite is
+//! refused unless the log is already consumed. A log it is growing costs the
+//! difference in file length and nothing else.
+//!
 //! # It says what it will save before it does anything
 //!
 //! The report is printed from the manifest first: how much of the file the
@@ -76,13 +93,22 @@ impl Outcome {
 /// `now` goes into the new store's manifest as the time of the commit, and is
 /// passed in rather than read here so that the caller holds the one clock.
 ///
+/// `log` of `None` carries the source's log length across, and `Some` gives the
+/// new store that one instead.
+///
 /// # Errors
 ///
 /// Returns [`kura_core::file::Trouble`] if the source cannot be read or is not a
 /// file this build opens, if a tombstone set does not belong to the segment it
 /// is filed under, or if the write, the sync or the commit fails. A store that
 /// is refused is a result and not an error.
-pub fn reclaim(from: &Path, into: &Path, now: u64, out: &mut impl Write) -> Result<Outcome> {
+pub fn reclaim(
+    from: &Path,
+    into: &Path,
+    now: u64,
+    log: Option<u64>,
+    out: &mut impl Write,
+) -> Result<Outcome> {
     if from == into {
         writeln!(out, "  the file to write is the file to read")?;
         return Ok(Outcome::Refused);
@@ -144,6 +170,11 @@ pub fn reclaim(from: &Path, into: &Path, now: u64, out: &mut impl Write) -> Resu
         .map(|segment| round(segment.len, page) + round(u64::from(segment.tombstones_len), page))
         .sum();
     let stranded = was.saturating_sub(front).saturating_sub(named);
+    // Where the segments will start in the file this is about to write, which is
+    // the same place unless a log was asked for. Rounded here the way a store
+    // creation rounds it, so the prediction is the length the file will have
+    // rather than the number that was typed.
+    let ahead = log.map_or(front, |asked| manifest::WAL_OFFSET + round(asked, page));
 
     said(out, "segments", committed.segments.len() as u64)?;
     said(out, "documents", committed.total)?;
@@ -153,9 +184,15 @@ pub fn reclaim(from: &Path, into: &Path, now: u64, out: &mut impl Write) -> Resu
     said(out, "  superblock and log", front)?;
     said(out, "  segments", named)?;
     said(out, "  stranded", stranded)?;
+    if ahead != front {
+        said(out, "  log becomes", ahead)?;
+    }
     drop(store);
 
-    if stranded == 0 {
+    // Two reasons to write, and either one on its own is enough. A store with
+    // nothing stranded still shrinks if its log does, and a store with plenty
+    // stranded shrinks whether the log moves or not.
+    if stranded == 0 && ahead == front {
         writeln!(out)?;
         writeln!(
             out,
@@ -165,17 +202,43 @@ pub fn reclaim(from: &Path, into: &Path, now: u64, out: &mut impl Write) -> Resu
         return Ok(Outcome::Nothing);
     }
 
+    // The file that comes out is its front, then what the segments account for,
+    // and the segments are the same either way. So what the two files differ by
+    // is the old front and what was stranded past it against the new front, and
+    // that is the whole of the prediction whichever way the log went.
+    let losing = front + stranded;
     writeln!(out)?;
-    writeln!(
-        out,
-        "  writing {} and giving back about {stranded} bytes",
-        into.display()
-    )?;
+    if losing >= ahead {
+        writeln!(
+            out,
+            "  writing {} and giving back about {} bytes",
+            into.display(),
+            losing - ahead
+        )?;
+    } else {
+        writeln!(
+            out,
+            "  writing {} with a longer log, so it comes out about {} bytes larger",
+            into.display(),
+            ahead - losing
+        )?;
+    }
 
     let start = Instant::now();
-    let done = reclaim::rewrite(from, into, now)?;
-    let took = start.elapsed();
+    let done = reclaim::rewrite_with_log(from, into, now, log)?;
+    came_to(out, start.elapsed(), &done)?;
+    Ok(Outcome::Wrote(done))
+}
 
+/// The half of the report that is written after the file is.
+///
+/// Under the prediction rather than instead of it, so that the two are read
+/// together and a run whose arithmetic was wrong says so on its own output.
+fn came_to(
+    out: &mut impl Write,
+    took: std::time::Duration,
+    done: &reclaim::Reclaimed,
+) -> std::io::Result<()> {
     writeln!(out)?;
     writeln!(
         out,
@@ -196,9 +259,7 @@ pub fn reclaim(from: &Path, into: &Path, now: u64, out: &mut impl Write) -> Resu
     writeln!(
         out,
         "  that destroys something and it belongs to whoever decided to do this"
-    )?;
-
-    Ok(Outcome::Wrote(done))
+    )
 }
 
 /// `n` taken up to the next multiple of `page`, or `n` if the page is nothing.
@@ -280,7 +341,7 @@ mod tests {
         let into = a_path("folded-out");
 
         let mut out = Vec::new();
-        let done = reclaim(&path, &into, WHEN, &mut out).expect("reclaims");
+        let done = reclaim(&path, &into, WHEN, None, &mut out).expect("reclaims");
         let report = String::from_utf8(out).expect("the report is text");
         let Outcome::Wrote(done) = done else {
             panic!("nothing was written: {report}");
@@ -317,7 +378,7 @@ mod tests {
         let into = a_path("predicted-out");
 
         let mut out = Vec::new();
-        let done = reclaim(&path, &into, WHEN, &mut out).expect("reclaims");
+        let done = reclaim(&path, &into, WHEN, None, &mut out).expect("reclaims");
         let report = String::from_utf8(out).expect("the report is text");
         let Outcome::Wrote(done) = done else {
             panic!("nothing was written: {report}");
@@ -340,7 +401,7 @@ mod tests {
         let path = a_store("tight", 3);
         let into = a_path("tight-out");
         let mut out = Vec::new();
-        let done = reclaim(&path, &into, WHEN, &mut out).expect("reclaims");
+        let done = reclaim(&path, &into, WHEN, None, &mut out).expect("reclaims");
         let report = String::from_utf8(out).expect("the report is text");
         assert_eq!(done, Outcome::Nothing, "{report}");
         assert!(done.settled(), "{report}");
@@ -368,7 +429,7 @@ mod tests {
         let into = a_path("deleted-out");
 
         let mut out = Vec::new();
-        let done = reclaim(&path, &into, WHEN, &mut out).expect("reclaims");
+        let done = reclaim(&path, &into, WHEN, None, &mut out).expect("reclaims");
         let report = String::from_utf8(out).expect("the report is text");
         assert!(matches!(done, Outcome::Wrote(_)), "{report}");
 
@@ -396,7 +457,7 @@ mod tests {
         let into = a_path("logged-out");
 
         let mut out = Vec::new();
-        let done = reclaim(&path, &into, WHEN, &mut out).expect("reclaims");
+        let done = reclaim(&path, &into, WHEN, None, &mut out).expect("reclaims");
         let report = String::from_utf8(out).expect("the report is text");
         assert_eq!(done, Outcome::Refused, "{report}");
         assert!(!done.settled(), "{report}");
@@ -409,17 +470,87 @@ mod tests {
         let path = a_store("clobber", 2);
         let into = a_store("clobber-target", 1);
         let mut out = Vec::new();
-        let done = reclaim(&path, &into, WHEN, &mut out).expect("reclaims");
+        let done = reclaim(&path, &into, WHEN, None, &mut out).expect("reclaims");
         let report = String::from_utf8(out).expect("the report is text");
         assert_eq!(done, Outcome::Refused, "{report}");
         assert!(report.contains("never writes over a file"), "{report}");
+    }
+
+    /// How long the log of the store at `path` is.
+    fn log_of(path: &std::path::Path) -> u64 {
+        Store::open(path).expect("a store").superblock().wal_len
+    }
+
+    #[test]
+    fn a_log_nobody_asked_about_is_the_one_the_store_came_with() {
+        let path = a_store("log-kept", 6);
+        {
+            let mut store = Store::open(&path).expect("a store");
+            store.compact(0..6, WHEN, 1).expect("a fold");
+        }
+        let into = a_path("log-kept-out");
+        let mut out = Vec::new();
+        let done = reclaim(&path, &into, WHEN, None, &mut out).expect("reclaims");
+        let report = String::from_utf8(out).expect("the report is text");
+        assert!(matches!(done, Outcome::Wrote(_)), "{report}");
+        assert_eq!(log_of(&into), 1 << 20);
+        // A run that changed nothing about the log should not be reporting on it.
+        assert!(!report.contains("log becomes"), "{report}");
+    }
+
+    #[test]
+    fn a_shorter_log_is_reason_enough_to_write_when_nothing_is_stranded() {
+        // The whole of the case this exists for. A store with three segments and
+        // no fold behind it has nothing stranded, so the run before --log would
+        // have said so and stopped, and the file would have stayed nine parts
+        // log.
+        let path = a_store("log-only", 3);
+        let into = a_path("log-only-out");
+        let was = length(&path);
+
+        let mut out = Vec::new();
+        let done = reclaim(&path, &into, WHEN, Some(64 << 10), &mut out).expect("reclaims");
+        let report = String::from_utf8(out).expect("the report is text");
+        assert!(matches!(done, Outcome::Wrote(_)), "{report}");
+        assert!(report.contains("log becomes"), "{report}");
+        assert!(report.contains("giving back about"), "{report}");
+        assert_eq!(log_of(&into), 64 << 10);
+        assert!(length(&into) < was, "{was} became {}", length(&into));
+
+        // And it is still a store holding what the one it came from held.
+        let store = Store::open(&into).expect("the store that came out");
+        let view = store.view().expect("a view");
+        for round in 0..3 {
+            for id in 0..5 {
+                let key = format!("segment-{round}-{id}");
+                assert!(
+                    view.document(key.as_bytes()).expect("a lookup").is_some(),
+                    "{key} went missing"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_longer_log_says_the_file_will_come_out_larger_and_it_does() {
+        let path = a_store("log-grown", 2);
+        let into = a_path("log-grown-out");
+        let was = length(&path);
+
+        let mut out = Vec::new();
+        let done = reclaim(&path, &into, WHEN, Some(8 << 20), &mut out).expect("reclaims");
+        let report = String::from_utf8(out).expect("the report is text");
+        assert!(matches!(done, Outcome::Wrote(_)), "{report}");
+        assert!(report.contains("comes out about"), "{report}");
+        assert_eq!(log_of(&into), 8 << 20);
+        assert!(length(&into) > was, "{was} became {}", length(&into));
     }
 
     #[test]
     fn it_will_not_write_the_file_it_is_reading() {
         let path = a_store("itself", 2);
         let mut out = Vec::new();
-        let done = reclaim(&path, &path, WHEN, &mut out).expect("reclaims");
+        let done = reclaim(&path, &path, WHEN, None, &mut out).expect("reclaims");
         let report = String::from_utf8(out).expect("the report is text");
         assert_eq!(done, Outcome::Refused, "{report}");
         assert!(report.contains("the file to read"), "{report}");
