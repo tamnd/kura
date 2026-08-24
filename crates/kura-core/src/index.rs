@@ -17,6 +17,8 @@
 //! size that is the difference between an indexer that fits in memory and one
 //! that does not.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use crate::analysis::Analyzer;
 use crate::codec::{get_u32, get_u64, get_uvarint, put_u32, put_u64, put_uvarint};
 use crate::error::{Error, Result};
@@ -759,6 +761,53 @@ impl Writer {
     ///
     /// The same as [`Writer::concat`].
     pub fn build(parts: Vec<Self>) -> Result<SegmentWriter> {
+        Self::build_on(parts, 1)
+    }
+
+    /// The same fold, with the merge itself spread over `threads` threads.
+    ///
+    /// The merge is the largest single thing an index run does after the
+    /// analysis, and until this it was the one part of a run that used one core.
+    /// On a corpus of half a gigabyte, ten parts and ten cores, the fold was
+    /// nearly a third of the wall time of a phase whose other stages were
+    /// already wide, which is what put the parallelism of a whole index run at
+    /// twice rather than at nine or ten.
+    ///
+    /// # How it splits
+    ///
+    /// Every part already knows its own vocabulary in order, so the merged
+    /// vocabulary can be cut into ranges of terms and each range merged on its
+    /// own. A worker takes the terms in one range out of every part, merges them
+    /// exactly as one thread would, and produces a piece of the posting blob
+    /// with its dictionary entries and its ceilings beside it. What is left is a
+    /// concatenation: the pieces go end to end in term order and every offset in
+    /// a piece is shifted by where that piece landed.
+    ///
+    /// The cuts are taken at even strides through the largest part's vocabulary
+    /// and found in the others by binary search. That makes the ranges equal in
+    /// terms, which is not equal in work, because a handful of terms carry most
+    /// of the postings in any corpus. So there are several ranges per thread and
+    /// a worker takes the next one that nobody has started, which is what turns
+    /// a range that costs ten times its neighbours into a tail rather than into
+    /// the wall time.
+    ///
+    /// # What it does not change
+    ///
+    /// The segment. The merged order is decided by the term order and the part
+    /// order, both of which are the same whatever cuts the ranges take, so the
+    /// bytes this writes are the bytes one thread writes, and the tests hold it
+    /// to that rather than to a looser equivalence.
+    ///
+    /// It costs one copy of the posting blob, because the pieces are built
+    /// separately and joined at the end. That is the postings only, which on a
+    /// corpus with stored fields is a small share of the segment, and it is
+    /// transient.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Writer::concat`].
+    pub fn build_on(parts: Vec<Self>, threads: usize) -> Result<SegmentWriter> {
+        let threads = threads.max(1);
         // Where each part's documents start once they are all in one segment.
         let mut base = Vec::with_capacity(parts.len());
         let mut documents = 0u32;
@@ -774,57 +823,32 @@ impl Writer {
         // which is why the total is summed here rather than where the norms are
         // laid out below.
         let total: u64 = parts.iter().map(|part| part.total).sum();
-        let mut ceilings = bound::Writer::new(K1, B, average(total, documents));
+        let mean = average(total, documents);
 
-        let order: Vec<Vec<u32>> = parts.iter().map(|part| part.postings.sorted()).collect();
-        let mut front = vec![0usize; parts.len()];
+        let order = sort_vocabularies(&parts, threads);
+        // Several ranges per thread rather than one, because the postings are
+        // not spread evenly over the terms.
+        let pieces = if threads == 1 { 1 } else { threads * RANGES };
+        let cuts = cut_points(&parts, &order, pieces);
+        let pieces = merge_ranges(&parts, &order, &base, &cuts, mean, threads)?;
+
+        let mut ceilings = bound::Writer::new(K1, B, mean);
         let mut dictionary = terms::Writer::new();
-        let mut blob = Vec::new();
-        // One list writer for the whole vocabulary. A segment has as many lists
-        // as terms and most of them are a few bytes long, so a writer per term
-        // would be an allocation per term for nothing.
-        let mut list = posting::Writer::new();
-
-        loop {
-            // The next term is the smallest at the front of any part. There are
-            // as many parts as there are threads, so finding it by looking at
-            // all of them costs less than the heap that would avoid it.
-            let mut next: Option<&[u8]> = None;
-            for (index, part) in parts.iter().enumerate() {
-                if let Some(&id) = order[index].get(front[index]) {
-                    let term = part.postings.vocabulary.term(id);
-                    if next.is_none_or(|held| term < held) {
-                        next = Some(term);
-                    }
-                }
+        let mut blob = Vec::with_capacity(pieces.iter().map(|piece| piece.blob.len()).sum());
+        for piece in pieces {
+            let at = blob.len() as u64;
+            for (term, entry) in piece.entries {
+                dictionary.push(
+                    term,
+                    terms::Entry {
+                        docs: entry.docs,
+                        offset: entry.offset + at,
+                        len: entry.len,
+                    },
+                )?;
             }
-            let Some(term) = next else { break };
-
-            let mut docs = 0u32;
-            for index in 0..parts.len() {
-                let Some(&id) = order[index].get(front[index]) else {
-                    continue;
-                };
-                let part = &parts[index];
-                if part.postings.vocabulary.term(id) != term {
-                    continue;
-                }
-                part.postings
-                    .walk(id, base[index], &part.lengths, &mut list, &mut ceilings)?;
-                docs += part.postings.chains[id as usize].documents;
-                front[index] += 1;
-            }
-            let offset = blob.len() as u64;
-            list.finish_into(&mut blob);
-            ceilings.finish_term(offset);
-            dictionary.push(
-                term,
-                terms::Entry {
-                    docs,
-                    offset,
-                    len: blob.len() as u64 - offset,
-                },
-            )?;
+            ceilings.append(&piece.ceilings, at);
+            blob.extend_from_slice(&piece.blob);
         }
 
         let mut norms = Vec::with_capacity(16 + documents as usize * 4);
@@ -885,6 +909,230 @@ impl Writer {
         }
         Ok(segment)
     }
+}
+
+/// How many ranges each thread of a fold is given, rather than one apiece.
+///
+/// The postings of a corpus are not spread evenly over its terms, so ranges cut
+/// at even strides through the vocabulary are not equal in work. More ranges
+/// than threads, taken by whichever worker is free, turns the expensive ones
+/// into a tail rather than into the wall time. Four is enough to smooth the
+/// usual skew and few enough that the join stays a handful of concatenations.
+const RANGES: usize = 4;
+
+/// One range of the merged vocabulary, merged.
+///
+/// It is a segment's three posting sections in miniature: the lists, the
+/// dictionary entries that name them, and the ceilings beside them. Every offset
+/// in it is against its own blob, so joining two is a concatenation and a shift.
+struct Piece<'a> {
+    blob: Vec<u8>,
+    entries: Vec<(&'a [u8], terms::Entry)>,
+    ceilings: bound::Writer,
+}
+
+/// Every part's vocabulary in term order, sorted on `threads` threads.
+///
+/// A part's sort has nothing to do with any other part's, so this is the one
+/// place in a fold where going wide needs no agreement about anything. On ten
+/// parts of a corpus of half a gigabyte it is a fifth of a second on one thread
+/// and a fiftieth on ten.
+fn sort_vocabularies(parts: &[Writer], threads: usize) -> Vec<Vec<u32>> {
+    if threads == 1 || parts.len() == 1 {
+        return parts.iter().map(|part| part.postings.sorted()).collect();
+    }
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = parts
+            .iter()
+            .map(|part| scope.spawn(move || part.postings.sorted()))
+            .collect();
+        workers
+            .into_iter()
+            .map(|worker| match worker.join() {
+                Ok(order) => order,
+                Err(panicked) => std::panic::resume_unwind(panicked),
+            })
+            .collect()
+    })
+}
+
+/// Where to cut the merged vocabulary, as a front per part per boundary.
+///
+/// The returned list is one longer than the number of ranges: the first entry is
+/// every part at its start and the last is every part at its end, so range `n`
+/// is what lies between entry `n` and entry `n + 1`.
+///
+/// The cuts are terms rather than positions, because a position in one part is
+/// nothing in another. They are taken at even strides through the largest part's
+/// vocabulary, which is the part most likely to have a term near any given place
+/// in the merged one, and found in the rest by binary search.
+///
+/// A cut that lands in the same place as the one before it is dropped. That
+/// happens when there are more ranges than terms, and an empty range is a worker
+/// taking a piece of work to find there is none.
+fn cut_points(parts: &[Writer], order: &[Vec<u32>], pieces: usize) -> Vec<Vec<usize>> {
+    let start = vec![0usize; parts.len()];
+    let end: Vec<usize> = order.iter().map(Vec::len).collect();
+    let Some(sampler) = (0..parts.len()).max_by_key(|&at| order[at].len()) else {
+        return vec![start, end];
+    };
+    if pieces <= 1 || order[sampler].is_empty() {
+        return vec![start, end];
+    }
+
+    let mut cuts = Vec::with_capacity(pieces + 1);
+    cuts.push(start);
+    let len = order[sampler].len();
+    for piece in 1..pieces {
+        let Some(&id) = order[sampler].get(len * piece / pieces) else {
+            continue;
+        };
+        let term = parts[sampler].postings.vocabulary.term(id);
+        let front: Vec<usize> = order
+            .iter()
+            .zip(parts)
+            .map(|(ids, part)| ids.partition_point(|&id| part.postings.vocabulary.term(id) < term))
+            .collect();
+        if cuts.last().is_some_and(|last| *last == front) {
+            continue;
+        }
+        cuts.push(front);
+    }
+    cuts.push(end);
+    cuts
+}
+
+/// Merges every range, on `threads` threads, and hands the pieces back in term
+/// order.
+///
+/// A worker takes the next range nobody has started rather than a share decided
+/// up front, because the ranges are equal in terms and not in postings.
+fn merge_ranges<'a>(
+    parts: &'a [Writer],
+    order: &[Vec<u32>],
+    base: &[DocId],
+    cuts: &[Vec<usize>],
+    mean: f32,
+    threads: usize,
+) -> Result<Vec<Piece<'a>>> {
+    let ranges = cuts.len().saturating_sub(1);
+    if threads == 1 || ranges <= 1 {
+        return (0..ranges)
+            .map(|at| merge_range(parts, order, base, &cuts[at], &cuts[at + 1], mean))
+            .collect();
+    }
+
+    let next = AtomicUsize::new(0);
+    let mut done = std::thread::scope(|scope| -> Result<Vec<(usize, Piece<'a>)>> {
+        let workers: Vec<_> = (0..threads.min(ranges))
+            .map(|_| {
+                let next = &next;
+                scope.spawn(move || -> Result<Vec<(usize, Piece<'a>)>> {
+                    let mut mine = Vec::new();
+                    loop {
+                        let at = next.fetch_add(1, Ordering::Relaxed);
+                        if at >= ranges {
+                            return Ok(mine);
+                        }
+                        let piece =
+                            merge_range(parts, order, base, &cuts[at], &cuts[at + 1], mean)?;
+                        mine.push((at, piece));
+                    }
+                })
+            })
+            .collect();
+        let mut all = Vec::with_capacity(ranges);
+        for worker in workers {
+            match worker.join() {
+                Ok(mine) => all.extend(mine?),
+                Err(panicked) => std::panic::resume_unwind(panicked),
+            }
+        }
+        Ok(all)
+    })?;
+    // The ranges were taken in whatever order the workers got to them and the
+    // segment wants them in term order.
+    done.sort_unstable_by_key(|(at, _)| *at);
+    Ok(done.into_iter().map(|(_, piece)| piece).collect())
+}
+
+/// Merges the terms between two fronts, which is the fold itself.
+///
+/// This is the loop the whole of `build` used to be, with an end as well as a
+/// start. Everything it produces is against its own blob, so it knows nothing
+/// about the ranges before it and needs nothing from them.
+fn merge_range<'a>(
+    parts: &'a [Writer],
+    order: &[Vec<u32>],
+    base: &[DocId],
+    from: &[usize],
+    to: &[usize],
+    mean: f32,
+) -> Result<Piece<'a>> {
+    let mut front = from.to_vec();
+    let mut piece = Piece {
+        blob: Vec::new(),
+        entries: Vec::new(),
+        ceilings: bound::Writer::new(K1, B, mean),
+    };
+    // One list writer for the whole range. A segment has as many lists as terms
+    // and most of them are a few bytes long, so a writer per term would be an
+    // allocation per term for nothing.
+    let mut list = posting::Writer::new();
+
+    loop {
+        // The next term is the smallest at the front of any part. There are as
+        // many parts as there are threads, so finding it by looking at all of
+        // them costs less than the heap that would avoid it.
+        let mut next: Option<&'a [u8]> = None;
+        for (index, part) in parts.iter().enumerate() {
+            if front[index] >= to[index] {
+                continue;
+            }
+            if let Some(&id) = order[index].get(front[index]) {
+                let term = part.postings.vocabulary.term(id);
+                if next.is_none_or(|held| term < held) {
+                    next = Some(term);
+                }
+            }
+        }
+        let Some(term) = next else { break };
+
+        let mut docs = 0u32;
+        for index in 0..parts.len() {
+            if front[index] >= to[index] {
+                continue;
+            }
+            let Some(&id) = order[index].get(front[index]) else {
+                continue;
+            };
+            let part = &parts[index];
+            if part.postings.vocabulary.term(id) != term {
+                continue;
+            }
+            part.postings.walk(
+                id,
+                base[index],
+                &part.lengths,
+                &mut list,
+                &mut piece.ceilings,
+            )?;
+            docs += part.postings.chains[id as usize].documents;
+            front[index] += 1;
+        }
+        let offset = piece.blob.len() as u64;
+        list.finish_into(&mut piece.blob);
+        piece.ceilings.finish_term(offset);
+        piece.entries.push((
+            term,
+            terms::Entry {
+                docs,
+                offset,
+                len: piece.blob.len() as u64 - offset,
+            },
+        ));
+    }
+    Ok(piece)
 }
 
 /// Adds the block ceilings to a segment, at both of the widths they are kept at.
@@ -2729,5 +2977,87 @@ mod tests {
                 kind: kind::KEY_FILTER
             })
         ));
+    }
+
+    /// Parts varied enough for a fold to have work to do: terms only one part
+    /// holds, terms every part holds, and lists long enough to cross a block.
+    fn parts(count: usize) -> Vec<Writer> {
+        let mut parts = Vec::with_capacity(count);
+        for part in 0..count {
+            let mut writer = Writer::new();
+            for doc in 0..200 {
+                let text = format!(
+                    "shared term-{} only-{part}-{} the {}",
+                    doc % 37,
+                    doc % 11,
+                    "common ".repeat(doc % 5)
+                );
+                let key = format!("part-{part}-doc-{doc}");
+                writer
+                    .add_keyed_with_fields(key.as_bytes(), &text, [("path", key.as_bytes())])
+                    .expect("a small document fits");
+            }
+            parts.push(writer);
+        }
+        parts
+    }
+
+    /// The claim the parallel fold makes. Not that it answers the same
+    /// questions, which a fold that lost a posting could still do, but that it
+    /// writes the same segment, byte for byte, whatever the cuts fall on.
+    #[test]
+    fn a_fold_on_several_threads_writes_the_segment_one_thread_writes() {
+        let one = Writer::build(parts(6)).expect("the parts fold").finish();
+        assert!(!one.is_empty(), "there is a segment to compare against");
+        for threads in [1, 2, 3, 4, 8, 16] {
+            let many = Writer::build_on(parts(6), threads)
+                .expect("the parts fold")
+                .finish();
+            assert_eq!(many, one, "on {threads} threads");
+        }
+    }
+
+    /// One part is the shape every caller that commits a batch uses, and it has
+    /// no merging in it at all, only the walk. The ranges still have to line up.
+    #[test]
+    fn a_fold_of_one_part_on_several_threads_writes_what_one_thread_writes() {
+        let one = Writer::build(parts(1)).expect("the part folds").finish();
+        for threads in [2, 5, 16] {
+            let many = Writer::build_on(parts(1), threads)
+                .expect("the part folds")
+                .finish();
+            assert_eq!(many, one, "on {threads} threads");
+        }
+    }
+
+    /// More workers than there are terms to give them, which is where the cuts
+    /// land on top of each other and a range comes out empty.
+    #[test]
+    fn a_fold_with_more_threads_than_terms_keeps_every_term() {
+        let mut first = Writer::new();
+        first.add("alpha beta").expect("a document fits");
+        let mut second = Writer::new();
+        second.add("beta gamma").expect("a document fits");
+
+        let one = Writer::build(vec![first, second]).expect("the parts fold");
+        let one = one.finish();
+        let mut first = Writer::new();
+        first.add("alpha beta").expect("a document fits");
+        let mut second = Writer::new();
+        second.add("beta gamma").expect("a document fits");
+        let many = Writer::build_on(vec![first, second], 32).expect("the parts fold");
+        assert_eq!(many.finish(), one);
+
+        let segment = Segment::open(&one).expect("the segment decodes");
+        let reader = Reader::open(&segment).expect("the sections decode");
+        for term in ["alpha", "beta", "gamma"] {
+            assert!(
+                reader
+                    .postings(term.as_bytes())
+                    .expect("the list decodes")
+                    .is_some(),
+                "{term} survived the fold"
+            );
+        }
     }
 }
