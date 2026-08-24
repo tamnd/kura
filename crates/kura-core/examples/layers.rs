@@ -56,6 +56,30 @@
 //! the first query after a commit really costs, and that first touch is part of
 //! what it really costs, which is why it is left in.
 //!
+//! The ladder says a segment is a fixed toll rather than a share of the work,
+//! and the second table is what the toll is made of. A query does one
+//! dictionary lookup per segment before it decodes anything, and the lookup
+//! either lands or it does not, so the toll divides three ways and the three
+//! have different fixes. A lookup that lands is a binary search over the block
+//! index and a scan inside a block, and making it cheaper is a format question.
+//! A list header read is what the entry it found points at, and it is probably
+//! near the floor already. A miss is the whole of the lookup spent to find out
+//! that the segment holds nothing, and the fix for it is a filter in front of
+//! the dictionary rather than a faster dictionary.
+//!
+//! Three terms measure them. One every segment holds, taken from the top of the
+//! corpus vocabulary, so a lookup for it lands everywhere. One nothing holds,
+//! so a lookup for it misses everywhere. And one a single document holds, so a
+//! lookup for it lands once and misses everywhere else, which is the shape a
+//! real query for a rare term has. The third is a check on the other two rather
+//! than a fourth number: it should come out at a miss in every segment but one
+//! plus a landing in that one, and if it does not then the split is wrong.
+//!
+//! The columns are totals over the whole view rather than per segment figures,
+//! because what a query pays is the total. The per segment figures are in the
+//! lines under the table, and they are what the toll in the ladder above is to
+//! be read against.
+//!
 //! The file size is in the table because the ladder is built by folding, and a
 //! fold appends the segment it made rather than replacing the ones it read, so
 //! a rung with fewer segments sits in a longer file. Nothing reads the stranded
@@ -95,6 +119,14 @@ const RUNGS: [usize; 6] = [1, 2, 4, 8, 16, 24];
 /// The ranks in the corpus vocabulary the queries are taken from.
 const RANKS: [usize; 5] = [1, 10, 100, 1_000, 10_000];
 
+/// Candidates for a term the corpus does not hold.
+///
+/// A miss has to be a miss in the dictionary rather than a term the analyser
+/// throws away, so these are ordinary letters in an order no language puts
+/// them in, and the first one the vocabulary does not hold is the one used. A
+/// corpus that holds all of them is a corpus this refuses to guess about.
+const ABSENT: [&str; 3] = ["qzvwxkjf", "qzvwxkjfg", "qzvwxkjfgh"];
+
 /// How many times each query is asked, after a warming pass.
 const ASKS: usize = 200;
 
@@ -127,16 +159,22 @@ fn run(corpus: &Path, directory: &Path) -> Result<(), String> {
     }
 
     let base = directory.join("kura-layers-base.kura");
-    let (queries, documents, most) = fill(&base, &files)?;
+    let filled = fill(&base, &files)?;
+    let (documents, most) = (filled.documents, filled.most);
     println!("corpus        {}", corpus.display());
     println!("documents     {documents} in {most} segments before any folding");
     println!(
         "queries       {}",
-        queries
+        filled
+            .queries
             .iter()
             .map(String::as_str)
             .collect::<Vec<_>>()
             .join(", ")
+    );
+    println!(
+        "terms         {} in every segment, {} in one, {} in none",
+        filled.picked.common, filled.picked.rare, filled.picked.absent
     );
     println!();
     println!(
@@ -153,20 +191,18 @@ fn run(corpus: &Path, directory: &Path) -> Result<(), String> {
         "postings"
     );
 
-    let mut floor = None;
+    let mut ladder = Vec::with_capacity(RUNGS.len());
     for rung in RUNGS {
         if rung > most {
             continue;
         }
-        let measured = rung_of(&base, directory, rung, &queries)?;
+        let measured = rung_of(&base, directory, rung, &filled)?;
         measured.tell(rung);
-        if floor.is_none() {
-            floor = Some(measured);
-        }
+        ladder.push((rung, measured));
     }
     std::fs::remove_file(&base).ok();
 
-    if let Some(floor) = floor {
+    if let Some((_, floor)) = ladder.first() {
         println!();
         println!(
             "one segment answers in {:.1} µs and opens in {:.1} µs, and everything above is what the extra segments cost",
@@ -182,7 +218,58 @@ fn run(corpus: &Path, directory: &Path) -> Result<(), String> {
             floor.again
         );
     }
+    tolls(&ladder);
     Ok(())
+}
+
+/// The second table, and what the ladder is to be read against.
+fn tolls(ladder: &[(usize, Rung)]) {
+    println!();
+    println!(
+        "{:>9} {:>11} {:>11} {:>11} {:>11} {:>11}",
+        "segments", "landing", "header", "missing", "rare", "rare holds"
+    );
+    for (rung, measured) in ladder {
+        let toll = &measured.toll;
+        println!(
+            "{rung:>9} {:>8.2} µs {:>8.2} µs {:>8.2} µs {:>8.2} µs {:>11}",
+            toll.landing, toll.header, toll.missing, toll.rare, toll.holds
+        );
+    }
+
+    let Some((top, measured)) = ladder.last() else {
+        return;
+    };
+    let toll = &measured.toll;
+    let each = *top as f64;
+    println!();
+    println!(
+        "at {top} segments a lookup that lands costs {:.0} ns a segment, the list header it found {:.0} ns, and a lookup that misses {:.0} ns",
+        toll.landing / each * 1_000.0,
+        toll.header / each * 1_000.0,
+        toll.missing / each * 1_000.0
+    );
+    // The rare term is the check rather than a fourth measurement, so what is
+    // printed is the difference between what it cost and what the split above
+    // says it should have cost. A split that is wrong shows up here as a figure
+    // that is not near zero.
+    let predicted = toll.missing / each * (each - 1.0) + toll.landing / each;
+    println!(
+        "a term one segment holds costs {:.2} µs against the {:.2} µs that split predicts, so the split is out by {:.2} µs",
+        toll.rare,
+        predicted,
+        toll.rare - predicted
+    );
+    if let Some((bottom, floor)) = ladder.first()
+        && top > bottom
+    {
+        let per = (measured.median() - floor.median()) / (each - *bottom as f64);
+        println!(
+            "a segment costs a query {:.2} µs on this ladder, and the lookup for a term it does not hold is {:.0} percent of that",
+            per,
+            toll.missing / each / per * 100.0
+        );
+    }
 }
 
 /// Every file under a directory.
@@ -213,11 +300,31 @@ fn text_of(path: &Path) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
+/// The three terms the toll table is measured over.
+struct Picked {
+    /// A term every segment holds, so a lookup for it lands everywhere.
+    common: String,
+    /// A term one document holds, so a lookup for it lands in one segment and
+    /// misses in the rest.
+    rare: String,
+    /// A term nothing holds, so a lookup for it misses everywhere.
+    absent: String,
+}
+
+/// What the corpus came to, and what is to be asked of it.
+struct Filled {
+    /// The queries the ladder is timed over.
+    queries: Vec<String>,
+    /// The three terms the toll table is timed over.
+    picked: Picked,
+    /// How many documents went in.
+    documents: usize,
+    /// How many segments they landed in, which is the top of the ladder.
+    most: usize,
+}
+
 /// Indexes the corpus into a store of many segments and picks the queries.
-///
-/// Returns the queries, how many documents went in and how many segments they
-/// landed in, which is the top of the ladder.
-fn fill(path: &Path, files: &[PathBuf]) -> Result<(Vec<String>, usize, usize), String> {
+fn fill(path: &Path, files: &[PathBuf]) -> Result<Filled, String> {
     std::fs::remove_file(path).ok();
     let mut store =
         Store::create(path, STORE, 1_700_000_000).map_err(|problem| problem.to_string())?;
@@ -259,12 +366,84 @@ fn fill(path: &Path, files: &[PathBuf]) -> Result<(Vec<String>, usize, usize), S
 
     let mut vocabulary: Vec<_> = counts.into_iter().collect();
     vocabulary.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-    let queries = RANKS
+    let queries: Vec<String> = RANKS
         .iter()
         .filter_map(|rank| vocabulary.get(rank - 1))
         .filter_map(|(term, _)| String::from_utf8(term.clone()).ok())
         .collect();
-    Ok((queries, documents, most))
+    let picked = pick(&vocabulary)?;
+    Ok(Filled {
+        queries,
+        picked,
+        documents,
+        most,
+    })
+}
+
+/// Whether a term is the shape the toll table wants to probe with.
+///
+/// The three columns are read against each other, so the three terms have to
+/// be alike in everything except how many segments hold them. A dictionary
+/// lookup compares the first four bytes of a term against the block index and
+/// then scans inside a block, so a one byte term and a twelve byte one are not
+/// the same probe, and a term of characters no other term shares a prefix with
+/// is not either. Plain lowercase letters of a middling length are what the
+/// absent term has to be, since it has to be a term nothing holds, so it is
+/// what the other two are held to as well.
+fn plain(term: &[u8]) -> bool {
+    (4..=12).contains(&term.len()) && term.iter().all(u8::is_ascii_lowercase)
+}
+
+/// The three terms the toll table is measured over.
+///
+/// The vocabulary is in count order, so the common term is the front of it and
+/// the rare one is the back. Both ends are walked rather than taken outright,
+/// because what is wanted at the front is the most frequent term of the right
+/// shape and at the back a term of the right shape that appears exactly once.
+fn pick(vocabulary: &[(Vec<u8>, u64)]) -> Result<Picked, String> {
+    let common = vocabulary
+        .iter()
+        .filter(|(term, _)| plain(term))
+        .find_map(|(term, _)| String::from_utf8(term.clone()).ok())
+        .ok_or_else(|| "the corpus has no common term of the shape this wanted".to_owned())?;
+    let rare = vocabulary
+        .iter()
+        .rev()
+        .filter(|(term, count)| *count == 1 && plain(term))
+        .find_map(|(term, _)| String::from_utf8(term.clone()).ok())
+        .ok_or_else(|| {
+            "the corpus holds no term of the shape this wanted exactly once".to_owned()
+        })?;
+    let held: std::collections::HashSet<&[u8]> =
+        vocabulary.iter().map(|(term, _)| term.as_slice()).collect();
+    let absent = ABSENT
+        .iter()
+        .find(|candidate| !held.contains(candidate.as_bytes()))
+        .map(|candidate| (*candidate).to_owned())
+        .ok_or_else(|| "the corpus holds every term meant to be missing from it".to_owned())?;
+    Ok(Picked {
+        common,
+        rare,
+        absent,
+    })
+}
+
+/// What a term lookup costs across the segments of one rung.
+///
+/// Totals over the whole view rather than per segment figures, because a query
+/// asks every segment and what it pays is the total.
+struct Toll {
+    /// Looking up a term every segment holds.
+    landing: f64,
+    /// Taking the posting lists the entries of that lookup point at.
+    header: f64,
+    /// Looking up a term no segment holds.
+    missing: f64,
+    /// Looking up a term one segment holds, which is one landing and the rest
+    /// misses, and is the check on the other two.
+    rare: f64,
+    /// How many of the segments hold the rare term, which should be one.
+    holds: usize,
 }
 
 /// What one rung of the ladder came to.
@@ -286,6 +465,8 @@ struct Rung {
     bytes: u64,
     /// How many bytes of the file the live segments hold.
     live: u64,
+    /// What a term lookup cost across the segments of this rung.
+    toll: Toll,
 }
 
 impl Rung {
@@ -327,7 +508,7 @@ fn rung_of(
     base: &Path,
     directory: &Path,
     segments: usize,
-    queries: &[String],
+    filled: &Filled,
 ) -> Result<Rung, String> {
     let path = directory.join(format!("kura-layers-{segments}.kura"));
     std::fs::remove_file(&path).ok();
@@ -357,7 +538,7 @@ fn rung_of(
         .iter()
         .map(|segment| segment.len)
         .sum();
-    let measured = ask(&store, queries)?;
+    let measured = ask(&store, &filled.queries, &filled.picked)?;
     drop(store);
     std::fs::remove_file(&path).ok();
     Ok(Rung {
@@ -392,8 +573,81 @@ fn unchecked(view: &View) -> Result<Vec<Reader<'_>>, String> {
     Ok(readers)
 }
 
+/// The middle of [`ASKS`] runs of something, in microseconds.
+fn timed(mut once: impl FnMut() -> Result<(), String>) -> Result<f64, String> {
+    let mut times = Vec::with_capacity(ASKS);
+    for _ in 0..ASKS {
+        let started = Instant::now();
+        once()?;
+        times.push(started.elapsed().as_secs_f64() * 1_000_000.0);
+    }
+    times.sort_by(f64::total_cmp);
+    Ok(times[times.len() / 2])
+}
+
+/// Looks a term up in every segment, the way a query does before it decodes
+/// anything.
+fn lookup(readers: &[Reader<'_>], term: &[u8]) -> Result<(), String> {
+    for reader in readers {
+        let found = reader.entry(term).map_err(|problem| problem.to_string())?;
+        std::hint::black_box(found);
+    }
+    Ok(())
+}
+
+/// What a term lookup costs across a set of readers that are already open.
+fn toll_of(readers: &[Reader<'_>], picked: &Picked) -> Result<Toll, String> {
+    // Found outside the timer, because what the header column is about is what
+    // the list costs once the dictionary has already said where it sits.
+    let mut entries = Vec::with_capacity(readers.len());
+    for reader in readers {
+        if let Some(entry) = reader
+            .entry(picked.common.as_bytes())
+            .map_err(|problem| problem.to_string())?
+        {
+            entries.push((reader, entry));
+        }
+    }
+    if entries.len() != readers.len() {
+        return Err(format!(
+            "the common term is in {} of {} segments, so it is not the term this wanted",
+            entries.len(),
+            readers.len()
+        ));
+    }
+    let mut holds = 0;
+    for reader in readers {
+        if reader
+            .entry(picked.rare.as_bytes())
+            .map_err(|problem| problem.to_string())?
+            .is_some()
+        {
+            holds += 1;
+        }
+    }
+
+    let landing = timed(|| lookup(readers, picked.common.as_bytes()))?;
+    let missing = timed(|| lookup(readers, picked.absent.as_bytes()))?;
+    let rare = timed(|| lookup(readers, picked.rare.as_bytes()))?;
+    let header = timed(|| {
+        for (reader, entry) in &entries {
+            let list = reader.list(*entry).map_err(|problem| problem.to_string())?;
+            std::hint::black_box(&list);
+        }
+        Ok(())
+    })?;
+
+    Ok(Toll {
+        landing,
+        header,
+        missing,
+        rare,
+        holds,
+    })
+}
+
 /// Times the queries against a store that is already open.
-fn ask(store: &Store, queries: &[String]) -> Result<Rung, String> {
+fn ask(store: &Store, queries: &[String], picked: &Picked) -> Result<Rung, String> {
     let view = store.view().map_err(|problem| problem.to_string())?;
 
     // Warmed first, so that the times are of the query rather than of the page
@@ -447,6 +701,7 @@ fn ask(store: &Store, queries: &[String]) -> Result<Rung, String> {
     skipped.sort_by(f64::total_cmp);
 
     let readers = view.readers().map_err(|problem| problem.to_string())?;
+    let toll = toll_of(readers, picked)?;
     let searcher = Searcher::over(readers).map_err(|problem| problem.to_string())?;
     let mut times = Vec::with_capacity(ASKS * queries.len());
     let mut postings = 0;
@@ -475,5 +730,6 @@ fn ask(store: &Store, queries: &[String]) -> Result<Rung, String> {
         postings,
         bytes: 0,
         live: 0,
+        toll,
     })
 }
