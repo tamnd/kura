@@ -167,6 +167,20 @@ pub enum Error {
         at: usize,
     },
 
+    /// The log still holds records the committed manifest has not consumed, and
+    /// something was asked of the store that only makes sense once it has.
+    ///
+    /// Those records are documents somebody was promised, and they name the
+    /// segments they were written against by position, so a rewrite that moved
+    /// the segments would leave the log pointing at documents that are not
+    /// where it says. Recovering the store first is the answer.
+    LogNotConsumed {
+        /// How far the committed manifest says the log has been consumed.
+        head: u64,
+        /// How far it says the log has been written.
+        tail: u64,
+    },
+
     /// A batch counted positions into segments the store no longer holds where
     /// it held them.
     ///
@@ -404,6 +418,13 @@ impl fmt::Display for Error {
             }
             Self::RepeatedSegment { at } => {
                 write!(f, "one commit names segment {at} twice")
+            }
+            Self::LogNotConsumed { head, tail } => {
+                write!(
+                    f,
+                    "the log holds records from {head} to {tail} that no commit has consumed, \
+                     so the store has to be recovered before this"
+                )
             }
             Self::StaleView { read, committed } => {
                 write!(

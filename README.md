@@ -500,7 +500,7 @@ The other half is the commit that swaps the merged segment into the store in pla
 The file gets bigger, which is the part worth saying out loud.
 A commit appends, so the merged segment goes on the end and the sixteen it replaced stay where they are, holding 137.7 MB that nothing reads any more.
 That space comes back when the file is rewritten and not before, because a query that started before the commit is still reading out of the segments the commit replaced.
-Reclaiming it is a separate piece of work from choosing what to fold.
+Reclaiming it is a separate piece of work from choosing what to fold, and it is `kura-cli reclaim` further down.
 
 What changes immediately is what a query touches.
 The same three queries over the same store, both files warm, nine runs of each, the median of the search itself:
@@ -664,6 +664,45 @@ That took the sixteen segment merge from 97.6 ms to 91.4, and the saving grows w
 A heap is the usual answer to a merge of sorted runs and it is the wrong one here, which is worth writing down so that nobody has to find out twice.
 A heap costs a comparison per entry per level, and the entries are the terms of every source added up.
 For segments cut out of one corpus, where nearly every term is in nearly every segment, that is the same count the scan does multiplied by the depth of the heap.
+
+## Getting the space back after a fold
+
+A fold gives back the segment count and leaves the file the size it was.
+The segments it replaced stay exactly where they are, because a query that started before the commit is still reading them through offsets it took at the time, so a store that is written to and folded often is a store that is mostly bytes nothing will read again.
+`reclaim` writes it out again beside itself holding only what the manifest names.
+
+The store below is the Go toolchain source at go1.26.6, indexed six times over into the same store on an M4 of ten cores, which is what a directory that is watched rather than indexed once looks like.
+Every run after the first replaced all 10,884 documents, so 58,106 were written and 10,884 of them are live, and the store folded itself five times along the way to stay under the level zero cap.
+
+```sh
+kura-cli compact /tmp/go.kura
+kura-cli reclaim /tmp/go.kura -o /tmp/go-fresh.kura
+```
+
+```
+  file bytes              349589709
+    superblock and log    134352896
+    segments               16343040
+    stranded              198893773
+
+  writing /tmp/go-fresh.kura and giving back about 198893773 bytes
+
+  rewrite wall                 0.03 s
+  was                     349589709
+  now                     150692045
+  saved                   198897664
+```
+
+349.6 MB to 150.7 MB in thirty milliseconds, and the prediction printed before it wrote anything was 3,891 bytes out, which is less than a page.
+The command prints what the file is made of first and refuses a store with anything in its log, so the run that decides whether to do this is a run that wrote nothing.
+
+The 16.3 MB line is the index and the 134.4 MB above it is the superblock, the two manifest slots and the log ring, which `kura-cli` sizes at 128 MB.
+So the floor a rewrite can reach is the log rather than the postings, and on a store this small the log is nine tenths of what comes out.
+That is the honest number and it is the argument for the log being a size somebody chooses rather than a constant.
+
+What comes out is the same store.
+It carries the same identifier, the same creation time and the same log size, its segments keep the level a fold gave them and the generation a reader tells deletions apart by, `verify` reads it through with everything passing, and the queries it answers come back with the same documents in the same order at the same scores.
+Nothing is renamed and nothing is deleted, because the rename is the step that destroys something and it belongs to whoever decided to do this.
 
 ## What a query costs while the store is being written to
 

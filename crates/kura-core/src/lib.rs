@@ -45,6 +45,8 @@ pub mod mapping;
 pub mod migrate;
 pub mod policy;
 pub mod posting;
+#[cfg(feature = "fs")]
+pub mod reclaim;
 pub mod residency;
 pub mod search;
 pub mod segment;

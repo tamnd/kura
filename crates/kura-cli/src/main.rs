@@ -1,6 +1,6 @@
 //! Command line access to a kura index.
 //!
-//! Ten commands, in three groups.
+//! Eleven commands, in three groups.
 //!
 //! `index` builds an index out of a directory so there is something to ask
 //! questions of. `search` runs a query and prints what came back. `explain`
@@ -19,16 +19,19 @@
 //! file against judgments, and between them a ranking change stops being a
 //! matter of opinion. See [`eval`] for what the numbers mean.
 //!
-//! `verify`, `dump`, `compact`, `repair` and `migrate` are the third group, and
-//! they are for the file rather than for the answers. `verify` reads an index
-//! all the way through and says whether it is intact. `dump` prints what is in
-//! it, one record to a line, for the questions that start with somebody not
-//! believing what came back. `compact` folds the segments of a store into one,
-//! which is what a store that has been written to a hundred times needs before
-//! it is read a hundred thousand times. `repair` is what comes after a `verify`
-//! that failed, and it does the one repair a store supports, which is committing
-//! a manifest that leaves out the segments that no longer read. `migrate` reads
-//! a file written by an older build and writes today's format beside it.
+//! `verify`, `dump`, `compact`, `reclaim`, `repair` and `migrate` are the third
+//! group, and they are for the file rather than for the answers. `verify` reads
+//! an index all the way through and says whether it is intact. `dump` prints
+//! what is in it, one record to a line, for the questions that start with
+//! somebody not believing what came back. `compact` folds the segments of a
+//! store into one, which is what a store that has been written to a hundred
+//! times needs before it is read a hundred thousand times. `reclaim` is the
+//! other half of that: a fold gives back the segment count and leaves the file
+//! the size it was, and this writes the store again beside itself holding only
+//! what the manifest names. `repair` is what comes after a `verify` that failed,
+//! and it does the one repair a store supports, which is committing a manifest
+//! that leaves out the segments that no longer read. `migrate` reads a file
+//! written by an older build and writes today's format beside it.
 //!
 //! There are no dependencies here for the same reason there are none in the
 //! engine. Argument parsing is forty lines and a crate is forever.
@@ -37,6 +40,7 @@ mod dump;
 mod eval;
 mod fold;
 mod migrate;
+mod reclaim;
 mod repair;
 mod report;
 mod verify;
@@ -127,12 +131,13 @@ usage:
   kura-cli verify <index>                    read an index through and report what is wrong
   kura-cli dump <index>                      print what is in an index, one record to a line
   kura-cli compact <store>                   fold the segments of a store into one
+  kura-cli reclaim <store> -o <new>          write a store out at the size of what it holds
   kura-cli repair <store>                    drop the segments that no longer read
   kura-cli migrate <index> -o <new>          write an older index out in today's format
 
 options:
   -k <n>        how many results, for search and explain (default 10)
-  -o <file>     where to write, for index, topics and migrate
+  -o <file>     where to write, for index, topics, reclaim and migrate
   --store       for index, add a segment to a store rather than write a bare one
   --memory <size>       for index into a store, start a new segment once the
                 writer holds this much, or none to let it hold everything
@@ -241,6 +246,13 @@ gives back straight away is the segment count, which is what every lookup and
 every search pays per question. --keep leaves the newest few alone, which is
 what to do on a store something else is still writing to.
 
+a reclaim is the other half of a compact. It never writes in place and never
+writes over a file that is there: it reads one store and writes another holding
+only what the manifest names, with the same identifier, the same creation time
+and the same log size, and it leaves the rename to whoever ran it. It prints
+what the file is made of and what it will give back before it writes anything,
+and a store with nothing stranded in it is told so and left alone.
+
 a repair prints what it would do and writes nothing until it is given --commit,
 because what it does is throw documents away. It never touches a segment, only
 the manifest that names them, and the manifest it replaces stays in the store
@@ -264,6 +276,7 @@ fn run() -> Result<(), Failure> {
         "verify" => check(&rest),
         "dump" => show(&rest),
         "compact" => squash(&rest),
+        "reclaim" => shrink(&rest),
         "repair" => mend(&rest),
         "migrate" => forward(&rest),
         "-h" | "--help" | "help" => {
@@ -427,6 +440,48 @@ fn squash(args: &[String]) -> Result<(), Failure> {
     done.map_err(|trouble| Failure::Store(path.to_path_buf(), trouble))?;
     out.flush().map_err(Failure::Stdout)?;
     Ok(())
+}
+
+/// Writes a store again beside itself holding only what its manifest names.
+///
+/// The exit code answers one question, which is whether the space has been
+/// accounted for. A store that was rewritten and a store that had nothing
+/// stranded in it both succeed, because both leave the person who asked knowing
+/// where the file went. A refusal fails, because the store is still whatever it
+/// was and a script should not carry on from a rewrite that did not happen. See
+/// [`reclaim`] for what it refuses and why the rename is not its job.
+fn shrink(args: &[String]) -> Result<(), Failure> {
+    let mut positional = Vec::new();
+    let mut into: Option<PathBuf> = None;
+    let mut at = 0;
+    while at < args.len() {
+        match args[at].as_str() {
+            "-o" => {
+                at += 1;
+                into = Some(PathBuf::from(want(args, at, "-o wants a file")?));
+            }
+            other if other.starts_with("--") => {
+                return Err(Failure::usage(format!("unknown option {other}")));
+            }
+            other => positional.push(other),
+        }
+        at += 1;
+    }
+    let [path] = positional[..] else {
+        return Err(Failure::usage("wanted one store file"));
+    };
+    let path = Path::new(path);
+    let into = into.ok_or_else(|| Failure::usage("reclaim wants -o, and never writes in place"))?;
+
+    let mut out = BufWriter::new(std::io::stdout());
+    let outcome = reclaim::reclaim(path, &into, now(), &mut out)
+        .map_err(|trouble| Failure::Store(path.to_path_buf(), trouble))?;
+    out.flush().map_err(Failure::Stdout)?;
+
+    if outcome.settled() {
+        return Ok(());
+    }
+    Err(Failure::Refused(path.to_path_buf()))
 }
 
 /// Drops the segments of a store that no longer read.
@@ -2383,7 +2438,8 @@ enum Failure {
     Store(PathBuf, Trouble),
     /// An index was read through and found to be damaged, and how badly.
     Damaged(PathBuf, usize),
-    /// A migration would not touch the file, and the report said why.
+    /// A command that writes a second file would not touch this one, and the
+    /// report above said why.
     Refused(PathBuf),
 }
 
